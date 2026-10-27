@@ -513,11 +513,17 @@ function buildStates(log) {
       positions = { ...positions }; moves = { ...moves };
       for (const a in d.agents) {
         const m = d.agents[a];
-        if (m && m.to) { positions[a] = m.to; moves[a] = m; }
+        if (!m || !m.to) continue;
+        positions[a] = m.to;
+        const prev = moves[a];
+        if (!m.jump && !m.fall && prev && prev.jump && typeof prev.arrive_t === 'number' && e.t <= prev.arrive_t + 1e-9) {
+          // a block placed into the jumper's feet cell mid-hop: keep the hop, land on top of the new block
+          moves[a] = { ...prev, to: m.to, landZ: m.to[2], raiseAt: e.t, arrive_t: m.arrive_t ?? prev.arrive_t };
+        } else moves[a] = m;
       }
     }
-    // failed calls while walking "use nothing up" (log v3); every other action-cost call counts, even failed ones
-    const walkingFail = !e.ok && typeof e.message === 'string' && e.message.startsWith('walking:');
+    // failed calls while walking / airborne "use nothing up" (log v3); every other action-cost call counts, even failed ones
+    const walkingFail = !e.ok && typeof e.message === 'string' && /^(walking|airborne):/.test(e.message);
     if (e.cost === 'action' && !walkingFail) actions = { ...actions, [e.agent]: (actions[e.agent] || 0) + 1 };
     if (e.tool === 'declare_done' && e.ok && !votes.includes(e.agent)) votes = [...votes, e.agent];
     pushState(i + 1);
@@ -580,7 +586,10 @@ function describeEvent(e) {
   const pos = ('x' in a) ? `(${a.x}, ${a.y}, ${a.z})` : '';
   const target = a.agent ?? a.to ?? a.target ?? a.recipient;
   switch (e.tool) {
-    case 'place': return `place ${a.type ?? '?'} at ${pos}`;
+    case 'place': {
+      const m = e.diff.agents && e.diff.agents[e.agent];
+      return m && m.to ? `places ${a.type ?? '?'} under itself at ${pos}` : `place ${a.type ?? '?'} at ${pos}`;
+    }
     case 'remove': {
       const g = e.diff.grid[0];
       const b = g && g.before;
@@ -594,6 +603,7 @@ function describeEvent(e) {
     case 'say': return 'says (public)';
     case 'whisper': return `whispers → ${(e.chat && e.chat.to) || target || '?'}`;
     case 'note': return 'writes a note';
+    case 'jump': return 'jumps';
     case 'pillar_up': return `pillars up${a.type ? ' on ' + a.type : ''}` + (e.diff.agents && e.diff.agents[e.agent] && e.diff.agents[e.agent].to ? ` to (${e.diff.agents[e.agent].to.join(', ')})` : '');
     case 'move_to': {
       const m = e.diff.agents && e.diff.agents[e.agent];
@@ -606,7 +616,17 @@ function describeEvent(e) {
   }
 }
 /** [v3] Where an agent is at time t given its last walk (path weighted: straight 1, diagonal sqrt 2). Returns [x, y, z] floats. */
+const HOP_HEIGHT = 1.25;
 function walkPosition(m, t) {
+  if (m.jump) {
+    // small parabolic hop in place; if a block was placed underneath mid-hop, land on top of it
+    const f = m.arrive_t > m.depart_t ? Math.min(1, Math.max(0, (t - m.depart_t) / (m.arrive_t - m.depart_t))) : 1;
+    if (f >= 1) return m.to;
+    const base = m.from || m.to;
+    let z = base[2] + 4 * HOP_HEIGHT * f * (1 - f);
+    if (typeof m.landZ === 'number' && t >= m.raiseAt) z = Math.max(z, m.landZ);
+    return [base[0], base[1], z];
+  }
   const path = m.path && m.path.length ? m.path : [m.from || m.to, m.to];
   if (!(typeof m.depart_t === 'number' && typeof m.arrive_t === 'number') || t >= m.arrive_t || path.length < 2) return m.to;
   if (t <= m.depart_t) return path[0];
@@ -1161,7 +1181,7 @@ function renderInvs() {
     const items = Object.entries(inv).filter(([, v]) => v).map(([t, v]) => `<span class="chip"><span class="sw" style="background:${typeColor(t)}"></span>${esc(t)} ${v}</span>`).join('');
     const pos = st.positions[a], mv = st.moves[a];
     const walking = mv && typeof mv.arrive_t === 'number' && R.time < mv.arrive_t;
-    const posLine = pos ? `<div class="cnt" style="margin:1px 0 2px">at (${pos.join(', ')})${walking ? ` · <b style="color:${agentColor(a)}">walking until t = ${mv.arrive_t.toFixed(1)} s</b>` : ''}</div>` : '';
+    const posLine = pos ? `<div class="cnt" style="margin:1px 0 2px">at (${pos.join(', ')})${walking ? ` · <b style="color:${agentColor(a)}">${mv.jump ? 'airborne' : mv.fall ? 'falling' : 'walking'} until t = ${mv.arrive_t.toFixed(1)} s</b>` : ''}</div>` : '';
     const actBar = maxAct ? `<div class="bar" style="height:4px;margin:2px 0 3px"><i style="width:${Math.min(1, used / maxAct) * 100}%;background:${agentColor(a)}"></i></div>` : '';
     return `<div class="inv"><div style="display:flex;align-items:center;gap:6px"><span class="who">${agentTag(a)}</span>
       ${done ? '<span class="badge" style="background:#12805c22;color:var(--ok)">voted done</span>' : ''}

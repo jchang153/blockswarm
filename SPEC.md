@@ -67,10 +67,13 @@ Research questions (v1):
   take actions until it arrives, but can still talk, observe and write notes. Its position
   is set to the destination when it starts walking; the event logs the path and the
   departure and arrival times so the viewer can animate it. If there's no path, the move fails.
-- **No flying.** To reach high places, agents build up: walk up a staircase of blocks, or
-  `pillar_up(type)` (Minecraft's jump-and-place: put a block where you stand and rise onto
-  it). Scaffolding can be removed afterwards; removing the block under yourself makes you
-  fall to the next block or the ground (no fall damage).
+- **No flying.** Agents can `jump()`: for `jump_airtime` seconds (default 0.6, Minecraft)
+  they are in the air and the cell they were standing in is free, so a block can be placed
+  there; if one is, they land on top of it. Nothing tells agents how to use this (e.g. to
+  climb); they have to work it out. Walking steps up 1 block automatically. Removing the
+  block under an agent makes it fall to the next block or the ground (no fall damage).
+  Because an LLM takes seconds to respond, actions that must happen within the airtime have
+  to be sent together in one model response; the orchestrator runs them back to back.
 - **Reach:** `place`, `remove`, `take`, `deposit` and `give` work only on targets within
   `reach` (default 4.5 blocks, Minecraft survival) of the agent's eyes (feet + 1.62 high),
   measured to the target cell's centre. For `give`, the target is the other agent's body.
@@ -104,7 +107,7 @@ counts against the agent's action limit.
 |---|---|
 | `observe()` | Returns the agent's current view (free). |
 | `move_to(x, y, z)` | Walk to a standable cell; takes time (action). |
-| `pillar_up(type)` | Place a block where you stand and rise onto it (action). |
+| `jump()` | Jump; airborne for `jump_airtime` seconds (action). |
 | `take(type, n)` | Chest → own inventory. Within reach of the chest. |
 | `deposit(type, n)` | Own inventory → chest. Within reach of the chest. |
 | `give(agent, type, n)` | Own inventory → another agent's inventory. Within reach of them. |

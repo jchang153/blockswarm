@@ -27,7 +27,7 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
             "snapshot_interval_s": 10, "payoff": "team", "mixed_alpha": 0.5,
             "extra_penalty": 0.1, "seed": 0, "max_message_chars": 1000,
             "chest_pos": [13, 2, 0], "start_positions": null, "walk_speed": 4.317,
-            "reach": 4.5, "eye_height": 1.62, "view_radius": 8,
+            "reach": 4.5, "eye_height": 1.62, "view_radius": 8, "jump_airtime": 0.6,
             "task": "open", "brief": "Work together to build a house ...",
             "reference_design": "house", "target_interior": 12,
             "reach_line_of_sight": true, "view_occlusion": true},
@@ -57,7 +57,7 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
  },
  "chat": null}
 ```
-- `cost`: `"action"` (move_to, pillar_up, take, deposit, give, place, remove, declare_done),
+- `cost`: `"action"` (move_to, jump, take, deposit, give, place, remove, declare_done),
   `"message"` (say, whisper) or `"free"` (observe, note).
 - `diff` always has the four keys `grid`, `chest`, `inventory`, `agents`; they are empty when
   nothing changed (always the case when `ok` is false). Chest and inventory values are
@@ -73,8 +73,11 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
   immediately (for collision and reach rules); until `arrive_t` its action-cost calls fail
   with a message starting `"walking:"` and use nothing up. Viewers animate along `path`.
 - **[v3]** Other position changes use the same `diff.agents` entry shape:
-  - `pillar_up(type)`: one grid change (block placed at the old feet cell) and the agent
-    moves up 1 (`path` = `[from, to]`, `arrive_t = depart_t + 0.5`).
+  - `jump()`: entry with `"jump": true`, `from` = `to` = current position, `path` = `[from]`,
+    `arrive_t = depart_t + jump_airtime` (the landing time). While airborne the agent's feet
+    cell is free; `move_to` fails with a message starting `"airborne:"` (uses nothing up).
+  - A `place` into the airborne agent's own feet cell adds an entry for that agent moving up
+    1 (`from` → `to`, `path` = `[from, to]`, `arrive_t` = the original landing time).
   - **Falling:** when a `remove` takes away the block under any agent (the remover or
     someone else), that agent falls straight down to the next standable cell in the same
     event; its entry has `"fall": true` and `arrive_t = depart_t + 0.1 · cells fallen`.
