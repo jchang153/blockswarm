@@ -1,0 +1,1513 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BlockSwarm Replay</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  --bg: #f4f5f7;
+  --panel: #ffffff;
+  --panel-2: #f7f8fa;
+  --border: #e1e4e8;
+  --text: #1f2328;
+  --muted: #667085;
+  --accent: #2f6fdf;
+  --accent-soft: #e6eefc;
+  --danger: #d92d20;
+  --warn: #b54708;
+  --ok: #12805c;
+  --scene-bg: #eef1f5;
+  --chip: #eef0f3;
+  --shadow: 0 1px 3px rgba(16,24,40,.08), 0 1px 2px rgba(16,24,40,.04);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111418;
+    --panel: #181c21;
+    --panel-2: #1e2329;
+    --border: #2c333b;
+    --text: #e6e9ed;
+    --muted: #8b95a1;
+    --accent: #6ea0ff;
+    --accent-soft: #1c2b44;
+    --danger: #ff6b5e;
+    --warn: #f0a44b;
+    --ok: #4cc38a;
+    --scene-bg: #161a1f;
+    --chip: #252b32;
+    --shadow: 0 1px 3px rgba(0,0,0,.4);
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg); color: var(--text);
+  font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  overflow: hidden;
+}
+button, select, input { font: inherit; color: inherit; }
+button {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 9px; cursor: pointer; line-height: 1.3;
+}
+button:hover { border-color: var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+select { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px; }
+#app {
+  display: grid; height: 100vh;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+#stage { position: relative; grid-column: 1; grid-row: 1; min-height: 0; overflow: hidden; background: var(--scene-bg); }
+#stage canvas { display: block; width: 100%; height: 100%; }
+#panel {
+  grid-column: 2; grid-row: 1 / span 2; border-left: 1px solid var(--border); background: var(--panel);
+  display: flex; flex-direction: column; min-height: 0; overflow-y: auto;
+}
+#timeline {
+  grid-column: 1; grid-row: 2; background: var(--panel); border-top: 1px solid var(--border);
+  padding: 6px 12px 8px; display: flex; flex-direction: column; gap: 5px; min-width: 0;
+}
+#timeline .ctl { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+#timeline .label { font-variant-numeric: tabular-nums; min-width: 190px; font-weight: 600; margin-left: 6px; }
+#stripWrap { position: relative; width: 100%; }
+#strip { display: block; width: 100%; height: 60px; cursor: pointer; touch-action: none; }
+#stripTip { position: absolute; bottom: 100%; display: none; pointer-events: none; font-size: 12px; padding: 4px 7px; margin-bottom: 4px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px; box-shadow: var(--shadow); white-space: nowrap; max-width: 420px; overflow: hidden; text-overflow: ellipsis; z-index: 6; }
+.warnbadge { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 9px; background: #b5470822; color: var(--warn); border: 1px solid var(--warn); cursor: help; }
+.kbd { color: var(--muted); font-size: 11px; }
+
+/* overlays on the 3D stage */
+.card {
+  position: absolute; background: color-mix(in srgb, var(--panel) 92%, transparent);
+  border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); padding: 8px 10px;
+  backdrop-filter: blur(4px);
+}
+#viewCtl { top: 10px; left: 10px; display: flex; flex-direction: column; gap: 5px; max-width: 250px; }
+#viewCtl label { display: flex; align-items: center; gap: 6px; cursor: pointer; white-space: nowrap; }
+#viewCtl .row { display: flex; gap: 6px; align-items: center; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.seg button { border: none; border-radius: 0; padding: 3px 8px; background: transparent; }
+.seg button.on { background: var(--accent); color: #fff; }
+#legend { bottom: 10px; left: 10px; max-width: 46%; font-size: 12px; }
+#legend .items { display: flex; flex-wrap: wrap; gap: 4px 10px; }
+#legend .flags { margin-top: 5px; display: flex; flex-wrap: wrap; gap: 4px 10px; color: var(--muted); }
+.sw { display: inline-block; width: 11px; height: 11px; border-radius: 3px; vertical-align: -1px; margin-right: 4px; border: 1px solid rgba(0,0,0,.25); }
+.sw.outline { background: transparent !important; border-width: 2px; }
+#caption { bottom: 10px; right: 10px; max-width: 48%; font-size: 12px; }
+#caption:empty { display: none; }
+#tooltip {
+  position: absolute; pointer-events: none; display: none; font-size: 12px; padding: 5px 8px; z-index: 5;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px; box-shadow: var(--shadow); max-width: 280px;
+}
+
+/* side panel */
+.sec { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.sec h3 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+#titlebar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+#titlebar h1 { font-size: 15px; margin: 0; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+.kv .k { color: var(--muted); }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip { background: var(--chip); border-radius: 10px; padding: 1px 8px; font-size: 12px; white-space: nowrap; }
+.agentdot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 4px; vertical-align: 0; }
+.bigscore { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+.bigscore .v { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.bar { height: 7px; background: var(--chip); border-radius: 4px; overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--accent); border-radius: 4px; }
+.barrow { display: grid; grid-template-columns: 70px 1fr 54px; gap: 8px; align-items: center; font-size: 12px; margin: 2px 0; font-variant-numeric: tabular-nums; }
+.barrow .n { text-align: right; color: var(--muted); }
+.inv { margin: 3px 0; }
+.inv .who { font-weight: 600; font-size: 12px; }
+.inv .cnt { color: var(--muted); font-size: 11px; margin-left: 4px; }
+.muted { color: var(--muted); }
+.warnbox { color: var(--warn); font-size: 12px; }
+.okbox { color: var(--ok); font-size: 12px; }
+#feedSec { flex: 1 0 280px; display: flex; flex-direction: column; min-height: 280px; border-bottom: none; }
+#feed { flex: 1; overflow-y: auto; position: relative; margin: 0 -14px; padding: 0 8px 8px; min-height: 160px; }
+.ev { padding: 4px 6px 4px 9px; border-left: 3px solid var(--c, var(--border)); margin: 3px 0; border-radius: 4px; cursor: pointer; font-size: 12px; }
+.ev:hover { background: var(--panel-2); }
+.ev .meta { color: var(--muted); font-size: 11px; }
+.ev .who { font-weight: 600; color: var(--c); }
+.ev.fail { opacity: .55; }
+.ev.fail .err { color: var(--danger); }
+.ev.cur { background: var(--accent-soft); outline: 1px solid var(--accent); }
+.ev.chat .bubble { margin-top: 3px; padding: 5px 8px; border-radius: 8px; background: var(--panel-2); border: 1px solid var(--border); font-size: 13px; white-space: pre-wrap; word-break: break-word; }
+.ev.chat.private .bubble { border-style: dashed; background: transparent; }
+.badge { display: inline-block; font-size: 10px; padding: 0 5px; border-radius: 8px; background: var(--chip); color: var(--muted); margin-left: 4px; vertical-align: 1px; }
+.badge.priv { background: #7c3aed22; color: #8b5cf6; }
+.badge.pub { background: #2f6fdf22; color: var(--accent); }
+.badge.bad { background: #d92d2022; color: var(--danger); }
+.ev.move { padding-top: 1px; padding-bottom: 1px; }
+.ev.move .meta { display: inline; margin-right: 6px; }
+.ev .note { font-style: italic; color: var(--muted); white-space: pre-wrap; word-break: break-word; }
+.roundsep { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 6px 4px 0; }
+
+/* empty state, errors, drop */
+#empty {
+  position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 20;
+  background: var(--bg);
+}
+#empty .box { max-width: 520px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 26px 30px; box-shadow: var(--shadow); }
+#empty h2 { margin: 0 0 6px; font-size: 20px; }
+#empty ol { padding-left: 18px; }
+#empty code { background: var(--chip); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+#empty .actions { display: flex; gap: 8px; margin-top: 14px; }
+#err { color: var(--danger); white-space: pre-wrap; margin-top: 12px; display: none; font-size: 12px; }
+#banner { position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 30; display: none; background: var(--panel); border: 1px solid var(--danger); color: var(--danger); border-radius: 8px; padding: 8px 12px; box-shadow: var(--shadow); max-width: 70vw; white-space: pre-wrap; }
+#drop { position: fixed; inset: 0; z-index: 40; display: none; align-items: center; justify-content: center; background: color-mix(in srgb, var(--accent) 18%, transparent); border: 3px dashed var(--accent); font-size: 20px; font-weight: 600; color: var(--accent); pointer-events: none; }
+body.dragging #drop { display: flex; }
+
+@media (max-width: 900px) {
+  #app { grid-template-columns: minmax(0, 1fr) 300px; }
+  #legend, #caption { max-width: 90%; }
+}
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <div id="viewCtl" class="card">
+      <div class="row"><span class="muted">Color</span>
+        <span class="seg"><button id="cmType" class="on">by type</button><button id="cmAgent">by agent</button></span></div>
+      <label><input type="checkbox" id="optGhost" checked> <span id="optGhostLbl">Blueprint ghost (missing cells)</span></label>
+      <label><input type="checkbox" id="optFlags" checked> <span id="optFlagsLbl">Flag wrong-type / extra blocks</span></label>
+      <label><input type="checkbox" id="optHighlight" checked> Highlight current event</label>
+      <div class="row"><span class="muted">Max height</span>
+        <input type="range" id="cut" min="0" max="7" value="7" style="flex:1;width:90px"><span id="cutLbl" style="min-width:42px">all</span></div>
+      <label id="optAgentsRow"><input type="checkbox" id="optAgents" checked> Agents &amp; chest</label>
+      <div class="row" id="reachRow"><span class="muted">Reach / view of</span>
+        <select id="reachSel" style="flex:1"><option value="">nobody</option></select></div>
+      <div class="row"><button id="resetCam">Reset camera</button></div>
+    </div>
+    <div id="legend" class="card"><div class="items" id="legendItems"></div><div class="flags" id="legendFlags"></div></div>
+    <div id="caption" class="card"></div>
+    <div id="tooltip"></div>
+  </div>
+
+  <div id="timeline">
+    <div class="ctl">
+      <button id="bBack10" title="Back 10 seconds (Shift+Left)">−10s</button>
+      <button id="bPrev" title="Previous event (Left)">&#x25C0;</button>
+      <button id="bPlay" class="primary" title="Play / pause (Space)" style="min-width:64px">Play</button>
+      <button id="bNext" title="Next event (Right)">&#x25B6;</button>
+      <button id="bFwd10" title="Forward 10 seconds (Shift+Right)">+10s</button>
+      <select id="speed" title="Playback speed (multiple of episode time)">
+        <option value="1">1×</option><option value="2">2×</option><option value="5" selected>5×</option>
+        <option value="10">10×</option><option value="30">30×</option>
+      </select>
+      <span class="label" id="posLbl">t = 0.0 s · event 0/0</span>
+      <span class="kbd">Space play · ←/→ event · Shift+←/→ 10 s</span>
+    </div>
+    <div id="stripWrap" title="">
+      <canvas id="strip"></canvas>
+      <div id="stripTip"></div>
+    </div>
+  </div>
+
+  <aside id="panel">
+    <div class="sec" id="titlebar">
+      <h1>BlockSwarm Replay</h1>
+      <span id="checkBadge"></span>
+      <button id="openBtn" title="Open another log file">Open log…</button>
+    </div>
+    <div class="sec"><h3>Episode</h3><div id="info"></div></div>
+    <div class="sec"><h3>Score <span id="scoreNote" style="text-transform:none;letter-spacing:0"></span></h3><div id="scores"></div></div>
+    <div class="sec"><h3>Chest <span class="muted" style="text-transform:none;letter-spacing:0">now / start</span></h3><div id="chest"></div></div>
+    <div class="sec"><h3>Agents <span class="muted" style="text-transform:none;letter-spacing:0">actions used · done vote · inventory</span></h3><div id="invs"></div></div>
+    <div class="sec" id="feedSec">
+      <h3>Events <select id="feedFilter" style="font-size:11px;text-transform:none;letter-spacing:0"></select></h3>
+      <div id="feed"></div>
+    </div>
+  </aside>
+</div>
+
+<div id="empty">
+  <div class="box">
+    <h2>BlockSwarm replay viewer</h2>
+    <p class="muted">Load an episode log (<code>.jsonl</code>, see <code>docs/log-format.md</code>) to watch the build unfold.</p>
+    <ol>
+      <li><b>Pick a file</b> with the button below, or <b>drag and drop</b> a <code>.jsonl</code> file anywhere on this page (works when opened directly from disk).</li>
+      <li>Or serve it: <code>python3 scripts/serve_viewer.py runs/demo/house_exact.jsonl</code> — this opens the viewer with <code>?log=…</code> in the URL.</li>
+    </ol>
+    <div class="actions">
+      <button class="primary" id="pickBtn">Choose log file…</button>
+      <button id="sampleBtn" title="Loads viewer/sample-episode.jsonl (needs http, not file://)">Load sample episode</button>
+    </div>
+    <div id="err"></div>
+  </div>
+</div>
+<div id="banner"></div>
+<div id="drop">Drop the .jsonl log to load it</div>
+<input type="file" id="fileInput" accept=".jsonl,.json,.txt,application/json" style="display:none">
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ===LOGIC-START=== (pure functions; no DOM / three.js; tested headlessly with node)
+const TYPE_COLORS = {
+  wood: '#9a6a3f', stone: '#9aa1a8', brick: '#b8533c', glass: '#8fd3f4',
+  plank: '#dcb878', roof: '#3d5f91', door: '#2e9a74',
+};
+const AGENT_COLORS = ['#3b7dd8', '#f28e2b', '#4bab5a', '#d1495b', '#9467bd', '#17a2b8', '#e0b000', '#e377c2'];
+const EXTRA_TYPE_COLORS = ['#c2185b', '#7cb342', '#5e35b1', '#00897b', '#f4511e', '#6d4c41'];
+
+const key = (x, y, z) => x + ',' + y + ',' + z;
+
+/** Parse JSONL text -> {header, events, snapshots, episodeEnd, warnings}. Throws Error with a readable message. */
+function parseLog(text) {
+  const lines = text.split(/\r?\n/);
+  let header = null, episodeEnd = null;
+  const events = [], snapshots = [], warnings = [];
+  let lastId = -Infinity, lastT = -Infinity;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let rec;
+    try { rec = JSON.parse(line); }
+    catch (e) {
+      const snippet = line.length > 80 ? line.slice(0, 80) + '…' : line;
+      throw new Error(`Line ${i + 1} is not valid JSON (${e.message}).\n  ${snippet}`);
+    }
+    if (!rec || typeof rec !== 'object' || Array.isArray(rec)) throw new Error(`Line ${i + 1}: expected a JSON object.`);
+    if (!header && rec.type !== 'header') throw new Error(`Line ${i + 1}: the first record must have "type": "header" (found ${JSON.stringify(rec.type)}).`);
+    switch (rec.type) {
+      case 'header':
+        if (header) { warnings.push(`Line ${i + 1}: extra header ignored.`); break; }
+        header = rec; break;
+      case 'event': {
+        if (typeof rec.event_id === 'number' && rec.event_id <= lastId) warnings.push(`Line ${i + 1}: event_id ${rec.event_id} is not increasing.`);
+        if (typeof rec.event_id === 'number') lastId = rec.event_id;
+        if (typeof rec.t !== 'number') {
+          // tolerate logs without t (e.g. log v1): fall back to one event per second
+          rec.t = Number.isFinite(lastT) ? lastT + 1 : 0;
+          if (!warnings.some(w => w.includes('no "t"'))) warnings.push(`Line ${i + 1}: event has no "t"; using 1 s per event.`);
+        }
+        if (rec.t < lastT) { warnings.push(`Line ${i + 1}: t decreases (${rec.t} < ${lastT}).`); rec.t = lastT; }
+        lastT = rec.t;
+        rec.diff = rec.diff || {};
+        rec.diff.grid = rec.diff.grid || [];
+        rec.diff.chest = rec.diff.chest || {};
+        rec.diff.inventory = rec.diff.inventory || {};
+        rec.diff.agents = rec.diff.agents || {};
+        rec.args = rec.args || {};
+        events.push(rec); break;
+      }
+      case 'snapshot': snapshots.push(rec); break;
+      case 'episode_end': episodeEnd = rec; break;
+      default: break; // unknown record types are ignored by contract
+    }
+  }
+  if (!header) throw new Error('The file is empty or has no header record.');
+  const g = header.grid || header.config || {};
+  if (!(g.width > 0 && g.depth > 0 && g.height > 0)) throw new Error('Header has no valid grid size (grid.width/depth/height).');
+  const task = taskOf(header);
+  if (task.kind === 'blueprint' && !Array.isArray(task.blueprint.cells)) throw new Error('Header blueprint has no cells list.');
+  return { header, task, events, snapshots, episodeEnd, warnings };
+}
+
+function addDelta(obj, t, d) {
+  const v = (obj[t] || 0) + d;
+  if (v === 0) delete obj[t]; else obj[t] = v;
+}
+
+/** Normalise the task: header.task {kind, brief, blueprint} (newer) or top-level header.blueprint (older). */
+function taskOf(header) {
+  const t = header.task && typeof header.task === 'object' ? header.task : null;
+  const c = header.config || {};
+  const blueprint = (t && t.blueprint) || header.blueprint || null;
+  let kind = t && t.kind ? t.kind : (blueprint ? 'blueprint' : (c.task || 'open'));
+  if (kind === 'blueprint' && !blueprint) kind = 'open';
+  return { kind, brief: (t && t.brief) || c.brief || null, blueprint: kind === 'blueprint' ? blueprint : null,
+    targetInterior: typeof c.target_interior === 'number' ? c.target_interior : 12 };
+}
+
+function blueprintStats(grid, bp, agents, extraPenalty) {
+  let correct = 0, wrong = 0, extra = 0;
+  const perAgent = {};
+  for (const a of agents) perAgent[a] = 0;
+  for (const [k, b] of grid) {
+    const want = bp.get(k);
+    if (want === undefined) extra++;
+    else if (want === b.type) { correct++; perAgent[b.placed_by] = (perAgent[b.placed_by] || 0) + 1; }
+    else wrong++;
+  }
+  const n = bp.size;
+  const team = n ? Math.max(0, (correct - extraPenalty * extra) / n) : 0;
+  return { kind: 'blueprint', correct, wrong, extra, perAgent, team: Math.round(team * 1e6) / 1e6, blueprintCells: n };
+}
+
+/** Open task scoring (docs/log-format.md › Scoring › open). dims = {width, depth, height}; chestKey = "x,y,z" or null. */
+function openStats(grid, dims, chestKey, agents, targetInterior) {
+  const W = dims.width, D = dims.depth, H = dims.height;
+  const idx = (x, y, z) => (z * D + y) * W + x;
+  const N = W * D * H;
+  const solid = new Uint8Array(N);
+  for (const k of grid.keys()) {
+    const [x, y, z] = k.split(',').map(Number);
+    if (x >= 0 && x < W && y >= 0 && y < D && z >= 0 && z < H) solid[idx(x, y, z)] = 1;
+  }
+  if (chestKey) {
+    const [x, y, z] = chestKey.split(',').map(Number);
+    if (x >= 0 && x < W && y >= 0 && y < D && z >= 0 && z < H) solid[idx(x, y, z)] = 1;
+  }
+  const NB = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+  // outside air: flood from empty boundary cells (x/y faces and the top layer; z = 0 sits on the ground)
+  const outside = new Uint8Array(N);
+  const stack = [];
+  for (let z = 0; z < H; z++) for (let y = 0; y < D; y++) for (let x = 0; x < W; x++) {
+    if (x === 0 || y === 0 || x === W - 1 || y === D - 1 || z === H - 1) {
+      const i = idx(x, y, z);
+      if (!solid[i] && !outside[i]) { outside[i] = 1; stack.push(x, y, z); }
+    }
+  }
+  while (stack.length) {
+    const z = stack.pop(), y = stack.pop(), x = stack.pop();
+    for (const [dx, dy, dz] of NB) {
+      const nx = x + dx, ny = y + dy, nz = z + dz;
+      if (nx < 0 || ny < 0 || nz < 0 || nx >= W || ny >= D || nz >= H) continue;
+      const j = idx(nx, ny, nz);
+      if (!solid[j] && !outside[j]) { outside[j] = 1; stack.push(nx, ny, nz); }
+    }
+  }
+  // enclosed empty regions; interior = the largest (ties: first found in x, y, z scan order)
+  const seen = new Uint8Array(N);
+  let best = [];
+  for (let z = 0; z < H; z++) for (let y = 0; y < D; y++) for (let x = 0; x < W; x++) {
+    const i = idx(x, y, z);
+    if (solid[i] || outside[i] || seen[i]) continue;
+    const region = []; seen[i] = 1; const st = [x, y, z];
+    while (st.length) {
+      const cz = st.pop(), cy = st.pop(), cx = st.pop();
+      region.push([cx, cy, cz]);
+      for (const [dx, dy, dz] of NB) {
+        const nx = cx + dx, ny = cy + dy, nz = cz + dz;
+        if (nx < 0 || ny < 0 || nz < 0 || nx >= W || ny >= D || nz >= H) continue;
+        const j = idx(nx, ny, nz);
+        if (!solid[j] && !outside[j] && !seen[j]) { seen[j] = 1; st.push(nx, ny, nz); }
+      }
+    }
+    if (region.length > best.length) best = region;
+  }
+  const enclosed = best.length >= 2;
+  const interiorSet = new Set(enclosed ? best.map(([x, y, z]) => key(x, y, z)) : []);
+  const shell = new Set(), leftovers = new Set();
+  let doors = 0, windows = 0;
+  const perAgent = {};
+  for (const a of agents) perAgent[a] = 0;
+  for (const [k, b] of grid) {
+    const [x, y, z] = k.split(',').map(Number);
+    // shell: any of the 26 neighbours is interior
+    let inShell = false;
+    for (let dx = -1; dx <= 1 && !inShell; dx++) for (let dy = -1; dy <= 1 && !inShell; dy++) for (let dz = -1; dz <= 1; dz++) {
+      if ((dx || dy || dz) && interiorSet.has(key(x + dx, y + dy, z + dz))) { inShell = true; break; }
+    }
+    if (!inShell) { leftovers.add(k); continue; }
+    shell.add(k);
+    perAgent[b.placed_by] = (perAgent[b.placed_by] || 0) + 1;
+    if (b.type !== 'door' && b.type !== 'glass') continue;
+    // door / window: face contact with both interior and outside air
+    let faceInterior = false, faceOutside = false;
+    for (const [dx, dy, dz] of NB) {
+      const nx = x + dx, ny = y + dy, nz = z + dz;
+      if (interiorSet.has(key(nx, ny, nz))) faceInterior = true;
+      if (nx >= 0 && ny >= 0 && nz >= 0 && nx < W && ny < D && nz < H) { if (outside[idx(nx, ny, nz)]) faceOutside = true; }
+      else if (nz >= H && nx >= 0 && ny >= 0 && nx < W && ny < D) faceOutside = true; // open sky above the top layer
+    }
+    if (faceInterior && faceOutside) { if (b.type === 'door') doors++; else windows++; }
+  }
+  let team = 0;
+  if (enclosed) {
+    team = 0.5 + 0.2 * (doors >= 1 ? 1 : 0) + 0.15 * Math.min(windows, 2) / 2
+      + 0.15 * Math.min(1, best.length / (targetInterior || 1)) - 0.01 * leftovers.size;
+    team = Math.round(Math.min(1, Math.max(0, team)) * 1e6) / 1e6;
+  }
+  return { kind: 'open', enclosed, interior: [...interiorSet], interiorCells: interiorSet.size, shellCells: shell.size,
+    doors, windows, leftovers: leftovers.size, leftoverSet: leftovers, team, perAgent, targetInterior };
+}
+
+/** Build states[0..N] (state after the first p events) by applying diffs; snapshots are only checked against. */
+function buildStates(log) {
+  const { header, events, snapshots } = log;
+  const agents = header.agents || (header.config && header.config.agents) || [];
+  const extraPenalty = header.config && typeof header.config.extra_penalty === 'number' ? header.config.extra_penalty : 0;
+  const task = log.task || taskOf(header);
+  const bp = new Map();
+  if (task.blueprint) for (const [x, y, z, t] of task.blueprint.cells) bp.set(key(x, y, z), t);
+  const dims = header.grid || header.config;
+  const cp = header.chest_pos || (header.config && header.config.chest_pos);
+  const chestKey = Array.isArray(cp) ? key(cp[0], cp[1], cp[2]) : null;
+  const computeStats = (grid) => task.kind === 'open'
+    ? openStats(grid, dims, chestKey, agents, task.targetInterior)
+    : blueprintStats(grid, bp, agents, extraPenalty);
+
+  // position p (= number of events applied) at which each snapshot applies
+  const idToPos = new Map();
+  events.forEach((e, i) => idToPos.set(e.event_id, i + 1));
+  const snapsAtPos = new Map();
+  const unmatched = [];
+  for (const s of snapshots) {
+    const p = s.after_event_id === -1 ? 0 : idToPos.get(s.after_event_id);
+    if (p === undefined) { unmatched.push(s); continue; }
+    if (!snapsAtPos.has(p)) snapsAtPos.set(p, []);
+    snapsAtPos.get(p).push(s);
+  }
+
+  let grid = new Map();
+  let chest = { ...(header.chest || {}) };
+  let inv = {};
+  for (const a of agents) inv[a] = { ...((header.inventories || {})[a] || {}) };
+  for (const a in (header.inventories || {})) if (!inv[a]) inv[a] = { ...header.inventories[a] };
+  let votes = [];
+  let actions = {};
+  for (const a of agents) actions[a] = 0;
+  // [v3] bodies: current cell per agent (position jumps to `to` immediately) + last walk for animation
+  let positions = { ...(header.positions || {}) };
+  let moves = {};
+  const states = [];
+  const mismatches = [];  // [{pos, t, seq, problems}]
+  let verified = 0;
+  const pushState = (p) => {
+    const st = { grid, chest, inv, votes, actions, positions, moves, stats: computeStats(grid) };
+    states.push(st);
+    for (const s of snapsAtPos.get(p) || []) {
+      const problems = checkSnapshot(s, st);
+      if (problems.length) mismatches.push({ pos: p, t: s.t, seq: s.seq, problems });
+      else verified++;
+    }
+  };
+  pushState(0);
+  events.forEach((e, i) => {
+    const d = e.diff;
+    if (d.grid.length) {
+      grid = new Map(grid);
+      for (const g of d.grid) {
+        const [x, y, z] = g.pos;
+        if (g.after) grid.set(key(x, y, z), g.after); else grid.delete(key(x, y, z));
+      }
+    }
+    if (Object.keys(d.chest).length) {
+      chest = { ...chest };
+      for (const t in d.chest) chest[t] = (chest[t] || 0) + d.chest[t];
+    }
+    if (Object.keys(d.inventory).length) {
+      inv = { ...inv };
+      for (const a in d.inventory) {
+        inv[a] = { ...(inv[a] || {}) };
+        for (const t in d.inventory[a]) addDelta(inv[a], t, d.inventory[a][t]);
+      }
+    }
+    if (Object.keys(d.agents).length) {
+      positions = { ...positions }; moves = { ...moves };
+      for (const a in d.agents) {
+        const m = d.agents[a];
+        if (m && m.to) { positions[a] = m.to; moves[a] = m; }
+      }
+    }
+    // failed calls while walking "use nothing up" (log v3); every other action-cost call counts, even failed ones
+    const walkingFail = !e.ok && typeof e.message === 'string' && e.message.startsWith('walking:');
+    if (e.cost === 'action' && !walkingFail) actions = { ...actions, [e.agent]: (actions[e.agent] || 0) + 1 };
+    if (e.tool === 'declare_done' && e.ok && !votes.includes(e.agent)) votes = [...votes, e.agent];
+    pushState(i + 1);
+  });
+  for (const s of unmatched) mismatches.push({ pos: null, t: s.t, seq: s.seq, problems: [`snapshot refers to unknown event_id ${s.after_event_id}`] });
+  return { states, bp, task, agents, mismatches, verified, snapshotCount: snapshots.length, snapsAtPos };
+}
+
+function checkSnapshot(snap, st) {
+  const out = [];
+  if (Array.isArray(snap.blocks)) {
+    const seen = new Set();
+    for (const [x, y, z, t, by] of snap.blocks) {
+      const k = key(x, y, z); seen.add(k);
+      const b = st.grid.get(k);
+      if (!b) out.push(`block ${t} at (${k}) missing in replay`);
+      else if (b.type !== t || (by !== undefined && b.placed_by !== by)) out.push(`block at (${k}): replay ${b.type}/${b.placed_by}, snapshot ${t}/${by}`);
+    }
+    for (const k of st.grid.keys()) if (!seen.has(k)) out.push(`replay has a block at (${k}) the snapshot lacks`);
+  }
+  const norm = o => { const r = {}; for (const t in (o || {})) if (o[t]) r[t] = o[t]; return r; };
+  const cmp = (label, a, b) => {
+    const A = norm(a), B = norm(b);
+    for (const t of new Set([...Object.keys(A), ...Object.keys(B)]))
+      if ((A[t] || 0) !== (B[t] || 0)) out.push(`${label} ${t}: replay ${A[t] || 0}, snapshot ${B[t] || 0}`);
+  };
+  if (snap.chest) cmp('chest', st.chest, snap.chest);
+  if (snap.inventories) for (const a in snap.inventories) cmp(`${a} inventory`, st.inv[a], snap.inventories[a]);
+  if (snap.actions_used) cmp('actions used by', st.actions, snap.actions_used);
+  if (Array.isArray(snap.done_votes)) {
+    const A = [...st.votes].sort().join(','), B = [...snap.done_votes].sort().join(',');
+    if (A !== B) out.push(`done votes: replay [${A}], snapshot [${B}]`);
+  }
+  if (snap.positions) for (const a in snap.positions) {
+    const A = (st.positions[a] || []).join(','), B = (snap.positions[a] || []).join(',');
+    if (A !== B) out.push(`${a} position: replay (${A}), snapshot (${B})`);
+  }
+  // scores: our own computation vs. what the engine logged
+  const S = st.stats, det = snap.score_details || {};
+  const num = k => (typeof det[k] === 'number' || typeof det[k] === 'boolean') ? det[k] : snap[k];
+  const want = S.kind === 'open'
+    ? { enclosed: S.enclosed, interior_cells: S.interiorCells, shell_cells: S.shellCells, doors: S.doors, windows: S.windows, leftovers: S.leftovers }
+    : { correct_cells: S.correct, extra_cells: S.extra };
+  for (const k in want) { const v = num(k); if (v !== undefined && v !== want[k]) out.push(`${k}: replay ${want[k]}, logged ${v}`); }
+  if (typeof snap.team_score === 'number' && Math.abs(snap.team_score - S.team) > 1e-5) out.push(`team_score: replay ${S.team}, logged ${snap.team_score}`);
+  if (snap.individual_scores) for (const a in snap.individual_scores)
+    if ((S.perAgent[a] || 0) !== snap.individual_scores[a]) out.push(`individual score ${a}: replay ${S.perAgent[a] || 0}, logged ${snap.individual_scores[a]}`);
+  return out.slice(0, 8);
+}
+
+/** Number of events with t <= time (binary search; events sorted by t). */
+function posAtTime(events, time) {
+  let lo = 0, hi = events.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (events[m].t <= time + 1e-9) lo = m + 1; else hi = m; }
+  return lo;
+}
+
+function describeEvent(e) {
+  const a = e.args || {};
+  const pos = ('x' in a) ? `(${a.x}, ${a.y}, ${a.z})` : '';
+  const target = a.agent ?? a.to ?? a.target ?? a.recipient;
+  switch (e.tool) {
+    case 'place': return `place ${a.type ?? '?'} at ${pos}`;
+    case 'remove': {
+      const g = e.diff.grid[0];
+      const b = g && g.before;
+      const falls = Object.entries(e.diff.agents || {}).filter(([, m]) => m && m.fall && m.from && m.to)
+        .map(([who, m]) => `${who} fell ${m.from[2] - m.to[2]}`);
+      return `remove ${b ? b.type + ' ' : ''}at ${pos}` + (b && b.placed_by && b.placed_by !== e.agent ? ` (placed by ${b.placed_by})` : '') + (falls.length ? ` — ${falls.join(', ')}` : '');
+    }
+    case 'take': return `take ${a.n ?? ''} ${a.type ?? ''} from chest`;
+    case 'deposit': return `deposit ${a.n ?? ''} ${a.type ?? ''} into chest`;
+    case 'give': return `give ${a.n ?? ''} ${a.type ?? ''} → ${target ?? '?'}`;
+    case 'say': return 'says (public)';
+    case 'whisper': return `whispers → ${(e.chat && e.chat.to) || target || '?'}`;
+    case 'note': return 'writes a note';
+    case 'pillar_up': return `pillars up${a.type ? ' on ' + a.type : ''}` + (e.diff.agents && e.diff.agents[e.agent] && e.diff.agents[e.agent].to ? ` to (${e.diff.agents[e.agent].to.join(', ')})` : '');
+    case 'move_to': {
+      const m = e.diff.agents && e.diff.agents[e.agent];
+      const to = m && m.to ? m.to : ('x' in a ? [a.x, a.y, a.z] : null);
+      return `walks to ${to ? '(' + to.join(', ') + ')' : JSON.stringify(a)}` + (m && typeof m.arrive_t === 'number' && typeof m.depart_t === 'number' ? ` (${(m.arrive_t - m.depart_t).toFixed(1)} s)` : '');
+    }
+    case 'observe': return 'observes';
+    case 'declare_done': return 'declares done';
+    default: return `${e.tool} ${Object.keys(a).length ? JSON.stringify(a) : ''}`;
+  }
+}
+/** [v3] Where an agent is at time t given its last walk (path weighted: straight 1, diagonal sqrt 2). Returns [x, y, z] floats. */
+function walkPosition(m, t) {
+  const path = m.path && m.path.length ? m.path : [m.from || m.to, m.to];
+  if (!(typeof m.depart_t === 'number' && typeof m.arrive_t === 'number') || t >= m.arrive_t || path.length < 2) return m.to;
+  if (t <= m.depart_t) return path[0];
+  const segLen = [];
+  let total = 0;
+  for (let i = 1; i < path.length; i++) {
+    const d = Math.hypot(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1], path[i][2] - path[i - 1][2]);
+    segLen.push(d); total += d;
+  }
+  let dist = total * (t - m.depart_t) / (m.arrive_t - m.depart_t);
+  for (let i = 0; i < segLen.length; i++) {
+    if (dist <= segLen[i] || i === segLen.length - 1) {
+      const f = segLen[i] ? Math.min(1, dist / segLen[i]) : 1, A = path[i], B = path[i + 1];
+      return [A[0] + (B[0] - A[0]) * f, A[1] + (B[1] - A[1]) * f, A[2] + (B[2] - A[2]) * f];
+    }
+    dist -= segLen[i];
+  }
+  return m.to;
+}
+// ===LOGIC-END===
+
+// ---------- DOM helpers ----------
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+let typeColorCache = {};
+function typeColor(t) {
+  if (TYPE_COLORS[t]) return TYPE_COLORS[t];
+  if (!typeColorCache[t]) {
+    let h = 0; for (const c of String(t)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+    typeColorCache[t] = EXTRA_TYPE_COLORS[h % EXTRA_TYPE_COLORS.length];
+  }
+  return typeColorCache[t];
+}
+let agentColorMap = {};
+const agentColor = a => agentColorMap[a] || '#888888';
+
+// ---------- three.js scene ----------
+const stage = $('stage');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+stage.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 500);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.12;
+controls.maxPolarAngle = Math.PI * 0.495;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8a96a3, 1.7));
+const sun = new THREE.DirectionalLight(0xffffff, 1.9); sun.position.set(12, 20, -8); scene.add(sun);
+const fill = new THREE.DirectionalLight(0xffffff, 0.6); fill.position.set(-10, 8, 14); scene.add(fill);
+
+function applyTheme() {
+  scene.background = new THREE.Color(cssVar('--scene-bg') || '#eef1f5');
+  if (world.gridLines) world.gridLines.material.color.set(isDark() ? '#3a424c' : '#c3c9d1');
+  if (world.ground) world.ground.material.color.set(isDark() ? '#1b2026' : '#f8f9fb');
+}
+const isDark = () => window.matchMedia('(prefers-color-scheme: dark)').matches;
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { applyTheme(); refreshScene(); drawStrip(); });
+
+// log (x, y, z), right-handed with z up -> three (x, z, -y) with y up (still right-handed, not mirrored).
+// Cubes are centered on cells; feetToThree is for agents standing in a cell (feet at the cell's bottom).
+const toThree = (x, y, z) => new THREE.Vector3(x + 0.5, z + 0.5, -(y + 0.5));
+const feetToThree = (x, y, z, lift = 0) => new THREE.Vector3(x + 0.5, z + lift, -(y + 0.5));
+
+const boxGeo = new THREE.BoxGeometry(1, 1, 1);
+const edgeGeo = new THREE.EdgesGeometry(boxGeo);
+const matCache = new Map();
+function blockMat(color, glass) {
+  const k = color + (glass ? 'g' : '');
+  if (!matCache.has(k)) {
+    matCache.set(k, glass
+      ? new THREE.MeshStandardMaterial({ color, roughness: 0.15, metalness: 0, transparent: true, opacity: 0.42, depthWrite: false })
+      : new THREE.MeshStandardMaterial({ color, roughness: 0.85, metalness: 0 }));
+  }
+  return matCache.get(k);
+}
+const lineMatCache = new Map();
+function lineMat(color, opacity = 1) {
+  const k = color + '|' + opacity;
+  if (!lineMatCache.has(k)) lineMatCache.set(k, new THREE.LineBasicMaterial({ color, transparent: opacity < 1, opacity, depthWrite: opacity >= 1 }));
+  return lineMatCache.get(k);
+}
+const FLAG_WRONG = '#e800ff', FLAG_EXTRA = '#ff9f0a', HL_PLACE = '#00d5ff', HL_REMOVE = '#ff3b30', HL_FAIL = '#9aa0a6';
+
+const world = { bodies: null, avatars: new Map(), group: null, blocks: new Map(), ghosts: new Map(), hl: new THREE.Group(), gridLines: null, ground: null, pickables: [] };
+scene.add(world.hl);
+
+function buildStaticScene() {
+  if (world.group) scene.remove(world.group);
+  world.group = new THREE.Group(); scene.add(world.group);
+  world.blocks.clear(); world.ghosts.clear(); world.pickables = [];
+  const { width: W, depth: D } = gridDims();
+  const pts = [];
+  for (let x = 0; x <= W; x++) pts.push(x, 0, 0, x, 0, -D);
+  for (let y = 0; y <= D; y++) pts.push(0, 0, -y, W, 0, -y);
+  const gg = new THREE.BufferGeometry(); gg.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  world.gridLines = new THREE.LineSegments(gg, new THREE.LineBasicMaterial({ color: '#c3c9d1' }));
+  world.gridLines.position.y = 0.002;
+  world.group.add(world.gridLines);
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(W, D), new THREE.MeshStandardMaterial({ color: '#f8f9fb', roughness: 1 }));
+  ground.rotation.x = -Math.PI / 2; ground.position.set(W / 2, -0.001, -D / 2);
+  world.ground = ground; world.group.add(ground);
+  // blueprint footprint (z = 0 outline) to orient yourself
+  // axis labels
+  const lbl = (text, pos, color) => {
+    const c = document.createElement('canvas'); c.width = 128; c.height = 64;
+    const g = c.getContext('2d'); g.font = 'bold 40px sans-serif'; g.fillStyle = color; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, 64, 32);
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c) }));
+    s.scale.set(1.6, 0.8, 1); s.position.copy(pos); world.group.add(s);
+  };
+  const ax = (to, color) => {
+    const g = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0.01, 0), to]);
+    world.group.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color })));
+  };
+  ax(new THREE.Vector3(W, 0.01, 0), '#e5484d'); ax(new THREE.Vector3(0, 0.01, -D), '#30a46c');
+  lbl('x →', new THREE.Vector3(W + 1.2, 0.2, 0), '#e5484d');
+  lbl('y ↑', new THREE.Vector3(0, 0.2, -(D + 1.2)), '#30a46c');
+  lbl('0', new THREE.Vector3(-0.6, 0.2, 0.6), '#8b95a1');
+  buildBodies();
+  applyTheme();
+}
+
+// ---------- [v3] chest + agent figures ----------
+function textSprite(text, color, h = 0.36) {
+  const c = document.createElement('canvas'); const g = c.getContext('2d');
+  g.font = 'bold 36px -apple-system, Segoe UI, sans-serif';
+  const w = Math.ceil(g.measureText(text).width) + 24; c.width = w; c.height = 52;
+  g.font = 'bold 36px -apple-system, Segoe UI, sans-serif';
+  g.fillStyle = 'rgba(255,255,255,0.88)'; g.beginPath(); g.roundRect(0, 0, w, 52, 14); g.fill();
+  g.fillStyle = color; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, w / 2, 27);
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
+  sp.scale.set(h * w / 52, h, 1); sp.renderOrder = 20;
+  return sp;
+}
+function cfgNum(name, dflt) {
+  const c = R.log.header.config || {};
+  return typeof c[name] === 'number' ? c[name] : dflt;
+}
+function buildBodies() {
+  if (world.bodies) scene.remove(world.bodies);
+  world.bodies = new THREE.Group(); scene.add(world.bodies);
+  world.avatars.clear();
+  const h = R.log.header;
+  const cp = h.chest_pos || (h.config && h.config.chest_pos);
+  if (Array.isArray(cp)) {
+    const g = new THREE.Group(); g.position.copy(toThree(cp[0], cp[1], cp[2]));
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.62, 0.9), new THREE.MeshStandardMaterial({ color: '#8a5a2b', roughness: 0.8 }));
+    body.position.y = -0.19; g.add(body);
+    const lid = new THREE.Mesh(new THREE.BoxGeometry(0.92, 0.26, 0.92), new THREE.MeshStandardMaterial({ color: '#6e4520', roughness: 0.8 }));
+    lid.position.y = 0.25; g.add(lid);
+    const band = new THREE.Mesh(new THREE.BoxGeometry(0.94, 0.07, 0.94), new THREE.MeshStandardMaterial({ color: '#d4a63a', metalness: 0.4, roughness: 0.4 }));
+    band.position.y = 0.12; g.add(band);
+    const lock = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.2, 0.06), new THREE.MeshStandardMaterial({ color: '#e3bb4f', metalness: 0.5, roughness: 0.35 }));
+    lock.position.set(0, 0.1, 0.47); // faces south (-y), towards the default camera g.add(lock);
+    const e = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(0.92, 0.88, 0.92)), lineMat('#3a2410', 0.6));
+    e.position.y = -0.06; g.add(e);
+    const l = textSprite('chest', '#6e4520', 0.32); l.position.y = 0.75; g.add(l);
+    world.bodies.add(g);
+  }
+  const reach = cfgNum('reach', 4.5), view = cfgNum('view_radius', 8), eye = cfgNum('eye_height', 1.62);
+  for (const a of R.built.agents) {
+    const col = agentColor(a);
+    const g = new THREE.Group();
+    const mat = new THREE.MeshStandardMaterial({ color: col, roughness: 0.6 });
+    const legs = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.75, 0.26), new THREE.MeshStandardMaterial({ color: new THREE.Color(col).multiplyScalar(0.6), roughness: 0.7 }));
+    legs.position.y = 0.375; g.add(legs);
+    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.65, 0.3), mat); torso.position.y = 1.07; g.add(torso);
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 0.4), new THREE.MeshStandardMaterial({ color: '#f1d3b3', roughness: 0.7 }));
+    head.position.y = 1.6; g.add(head);
+    const band = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.1, 0.42), mat); band.position.y = 1.78; g.add(band);
+    const label = textSprite(a, col); label.position.y = 2.25; g.add(label);
+    // reach sphere (around the eye) + view radius ring on the ground
+    const reachM = new THREE.Mesh(new THREE.SphereGeometry(reach, 32, 16), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.07, depthWrite: false }));
+    reachM.position.y = eye; reachM.visible = false; g.add(reachM);
+    const reachW = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.SphereGeometry(reach, 16, 8), 20), lineMat(col, 0.25));
+    reachW.position.y = eye; reachW.visible = false; g.add(reachW);
+    const ringPts = []; for (let i = 0; i <= 96; i++) { const t = i / 96 * Math.PI * 2; ringPts.push(new THREE.Vector3(Math.cos(t) * view, 0.03, Math.sin(t) * view)); }
+    const ring = new THREE.Line(new THREE.BufferGeometry().setFromPoints(ringPts), new THREE.LineDashedMaterial({ color: col, dashSize: 0.4, gapSize: 0.25, transparent: true, opacity: 0.8 }));
+    ring.computeLineDistances(); ring.visible = false; g.add(ring);
+    const trail = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.55, depthTest: false }));
+    trail.renderOrder = 9; trail.visible = false; world.bodies.add(trail);
+    g.visible = false;
+    world.bodies.add(g);
+    world.avatars.set(a, { g, reachM, reachW, ring, trail, trailFor: null });
+  }
+}
+/** Place figures at playback time R.time (called every frame). */
+function updateBodies() {
+  if (!R.log || !world.bodies) return;
+  world.bodies.visible = R.showAgents;
+  const st = R.built.states[R.pos];
+  for (const [a, av] of world.avatars) {
+    const m = st.moves[a];
+    const p = m ? walkPosition(m, R.time) : st.positions[a];
+    if (!p) { av.g.visible = false; av.trail.visible = false; continue; }
+    av.g.visible = true;
+    av.g.position.copy(feetToThree(p[0], p[1], p[2]));
+    const walking = m && typeof m.arrive_t === 'number' && R.time < m.arrive_t;
+    if (walking && m.path && m.path.length > 1) {
+      if (av.trailFor !== m) {
+        av.trail.geometry.dispose();
+        av.trail.geometry = new THREE.BufferGeometry().setFromPoints(m.path.map(q => feetToThree(q[0], q[1], q[2], 0.06)));
+        av.trailFor = m;
+      }
+      av.trail.visible = true;
+      // face the walking direction
+      const d = walkPosition(m, Math.min(m.arrive_t, R.time + 0.05));
+      const dx = d[0] - p[0], dy = d[1] - p[1];
+      if (Math.abs(dx) + Math.abs(dy) > 1e-4) av.g.rotation.y = Math.atan2(dx, -dy); // three z = -y
+    } else av.trail.visible = false;
+    const sel = R.reachAgent === a;
+    av.reachM.visible = av.reachW.visible = av.ring.visible = sel;
+  }
+}
+function walkingSig() {
+  if (!R.log) return '';
+  const st = R.built.states[R.pos];
+  return R.built.agents.map(a => { const m = st.moves[a]; return m && R.time < m.arrive_t ? 1 : 0; }).join('');
+}
+
+function frameCamera() {
+  const task = R.built.task;
+  const { width: W, depth: D, height: H } = gridDims();
+  // blueprint task: the blueprint; open task: whatever was built by the end (else the whole ground)
+  let cells;
+  if (task.blueprint) cells = task.blueprint.cells;
+  else {
+    const finalGrid = R.built.states[R.built.states.length - 1].grid;
+    cells = [...finalGrid.keys()].map(k => k.split(',').map(Number));
+    if (!cells.length) cells = [[0, 0, 0], [W - 1, D - 1, Math.min(H - 1, 3)]];
+  }
+  let min = new THREE.Vector3(Infinity, Infinity, Infinity), max = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+  const h = R.log.header;
+  const extraPts = [h.chest_pos || (h.config || {}).chest_pos, ...Object.values(h.positions || {})].filter(Array.isArray);
+  if (cells.length) for (const [x, y, z] of [...cells, ...extraPts]) { const p = toThree(x, y, z); min.min(p); max.max(p); }
+  else { min.set(0, 0, -D); max.set(W, H, 0); }
+  min.subScalar(0.5); max.addScalar(0.5);
+  const center = min.clone().add(max).multiplyScalar(0.5);
+  const size = max.clone().sub(min).length();
+  const r = Math.max(size, 6);
+  controls.target.copy(center);
+  // view from the south-east (low log y, where the door usually is), slightly above; x runs left -> right
+  camera.position.set(center.x + r * 0.55, center.y + r * 0.95, center.z + r * 1.6);
+  camera.near = 0.1; camera.far = r * 40; camera.updateProjectionMatrix();
+  controls.update();
+}
+
+function gridDims() {
+  const h = R.log.header; const g = h.grid || h.config;
+  return { width: g.width, depth: g.depth, height: g.height };
+}
+
+// ---------- app state ----------
+// pos = number of events applied (0 = before any event); time = playback clock in episode seconds.
+const R = { log: null, built: null, pos: 0, time: 0, tEnd: 0, playing: false,
+  colorMode: 'type', showAgents: true, reachAgent: '', walkSig: '', showGhost: true, showFlags: true, showHL: true, cut: 7, filter: 'all', feedItems: [] };
+
+function loadText(text, sourceName) {
+  let log, built;
+  try { log = parseLog(text); built = buildStates(log); }
+  catch (e) { showError(`Could not load ${sourceName || 'log'}:\n${e.message}`); console.warn(e); return; }
+  stop();
+  R.log = log; R.built = built;
+  const lastT = log.events.length ? log.events[log.events.length - 1].t : 0;
+  R.tEnd = Math.max(lastT, log.episodeEnd && typeof log.episodeEnd.t === 'number' ? log.episodeEnd.t : 0, 0.001);
+  agentColorMap = {}; built.agents.forEach((a, i) => { agentColorMap[a] = AGENT_COLORS[i % AGENT_COLORS.length]; });
+  typeColorCache = {};
+  const { height: H } = gridDims();
+  $('cut').max = H - 1; $('cut').value = H - 1; R.cut = H - 1; updateCutLabel();
+  $('empty').style.display = 'none'; $('err').style.display = 'none'; hideBanner();
+  document.title = `${log.header.episode_id || sourceName || 'episode'} · BlockSwarm Replay`;
+  buildStaticScene();
+  frameCamera();
+  const hasBodies = !!(log.header.positions || log.header.chest_pos || (log.header.config || {}).chest_pos);
+  $('optAgentsRow').style.display = $('reachRow').style.display = hasBodies ? '' : 'none';
+  $('reachSel').innerHTML = '<option value="">nobody</option>' + built.agents.map(a => `<option value="${esc(a)}">${esc(a)}</option>`).join('');
+  R.reachAgent = ''; R.walkSig = '';
+  const isOpen = built.task.kind === 'open';
+  $('optGhostLbl').textContent = isOpen ? 'Show interior (enclosed air)' : 'Blueprint ghost (missing cells)';
+  $('optFlagsLbl').textContent = isOpen ? 'Flag leftover blocks (not in shell)' : 'Flag wrong-type / extra blocks';
+  renderInfo(); buildFeedFilter(); buildFeed(); renderLegend(); sizeStrip();
+  if (log.warnings.length) console.warn('Log warnings:', log.warnings);
+  if (built.mismatches.length) console.warn('Replay/snapshot mismatches:', built.mismatches);
+  setPos(0, true);
+}
+
+function showError(msg) {
+  if (R.log) { const b = $('banner'); b.textContent = msg + '\n(click to dismiss)'; b.style.display = 'block'; }
+  else { const e = $('err'); e.textContent = msg; e.style.display = 'block'; }
+}
+function hideBanner() { $('banner').style.display = 'none'; }
+$('banner').addEventListener('click', hideBanner);
+
+// ---------- render per position ----------
+const evT = p => (p > 0 ? R.log.events[p - 1].t : 0);
+
+/** Jump to "after event p" (time snaps to that event's t). */
+function setPos(p, force) {
+  if (!R.log) return;
+  const N = R.log.events.length;
+  p = Math.max(0, Math.min(N, p | 0));
+  R.time = evT(p);
+  applyPos(p, force);
+}
+/** Seek to time t (seconds); shows all events with t' <= t. */
+function setTime(t) {
+  if (!R.log) return;
+  R.time = Math.max(0, Math.min(R.tEnd, t));
+  applyPos(posAtTime(R.log.events, R.time), false);
+}
+function applyPos(p, force) {
+  const changed = p !== R.pos || force;
+  R.pos = p;
+  if (changed) {
+    refreshScene();
+    renderScores(); renderChest(); renderInvs(); updateFeed(); renderCaption();
+    const N = R.log.events.length;
+    $('bPrev').disabled = p === 0; $('bNext').disabled = p === N;
+  }
+  const ws = walkingSig();
+  if (!changed && ws !== R.walkSig) renderInvs();
+  R.walkSig = ws;
+  renderTimelineLabel(); drawStrip();
+}
+
+function renderTimelineLabel() {
+  const N = R.log.events.length;
+  $('posLbl').textContent = `t = ${R.time.toFixed(1)} s / ${R.tEnd.toFixed(1)} s · event ${R.pos}/${N}`;
+}
+
+function blockSig(b, want, k, stats) {
+  const color = R.colorMode === 'agent' ? agentColor(b.placed_by) : typeColor(b.type);
+  const glass = R.colorMode === 'type' && b.type === 'glass';
+  let flag = null;
+  if (R.showFlags) {
+    if (stats.kind === 'open') flag = stats.enclosed && stats.leftoverSet.has(k) ? 'extra' : null;
+    else flag = want === undefined ? 'extra' : (want !== b.type ? 'wrong' : null);
+  }
+  return { color, glass, flag, s: color + glass + flag };
+}
+
+const interiorMat = new THREE.MeshBasicMaterial({ color: '#ffc83d', transparent: true, opacity: 0.38, depthWrite: false });
+function refreshScene() {
+  if (!R.log) return;
+  const st = R.built.states[R.pos];
+  const bp = R.built.bp;
+  const cut = R.cut;
+  const darkEdge = isDark() ? '#05070a' : '#22262b';
+  // blocks
+  for (const [k, obj] of world.blocks) {
+    if (!st.grid.has(k)) { world.group.remove(obj.g); world.blocks.delete(k); }
+  }
+  for (const [k, b] of st.grid) {
+    const want = bp.get(k);
+    const sig = blockSig(b, want, k, st.stats);
+    let obj = world.blocks.get(k);
+    if (obj && obj.sig !== sig.s + darkEdge) { world.group.remove(obj.g); world.blocks.delete(k); obj = null; }
+    if (!obj) {
+      const [x, y, z] = k.split(',').map(Number);
+      const g = new THREE.Group(); g.position.copy(toThree(x, y, z));
+      const mesh = new THREE.Mesh(boxGeo, blockMat(sig.color, sig.glass));
+      mesh.userData = { key: k };
+      if (sig.glass) mesh.renderOrder = 2;
+      g.add(mesh);
+      const edges = new THREE.LineSegments(edgeGeo, lineMat(sig.flag === 'wrong' ? FLAG_WRONG : sig.flag === 'extra' ? FLAG_EXTRA : darkEdge, sig.flag ? 1 : 0.55));
+      if (sig.flag) {
+        edges.scale.setScalar(1.045);
+        // diagonal cross on top face makes flagged blocks readable from above
+        const cg = new THREE.BufferGeometry();
+        cg.setAttribute('position', new THREE.Float32BufferAttribute([-.5, .51, -.5, .5, .51, .5, -.5, .51, .5, .5, .51, -.5], 3));
+        g.add(new THREE.LineSegments(cg, lineMat(sig.flag === 'wrong' ? FLAG_WRONG : FLAG_EXTRA)));
+      } else edges.scale.setScalar(1.001);
+      g.add(edges);
+      g.userData.z = z;
+      world.group.add(g);
+      obj = { g, mesh, sig: sig.s + darkEdge };
+      world.blocks.set(k, obj);
+    }
+    obj.g.visible = obj.g.userData.z <= cut;
+  }
+  world.pickables = [...world.blocks.values()].filter(o => o.g.visible).map(o => o.mesh);
+  // ghosts: missing blueprint cells (blueprint task) or the detected interior air (open task)
+  const wantGhost = new Set();
+  const open = st.stats.kind === 'open';
+  if (R.showGhost) {
+    if (open) for (const k of st.stats.interior) wantGhost.add(k);
+    else for (const [k, t] of bp) if (!st.grid.has(k)) wantGhost.add(k);
+  }
+  for (const [k, gh] of world.ghosts) if (!wantGhost.has(k)) { world.group.remove(gh); world.ghosts.delete(k); }
+  for (const k of wantGhost) {
+    let gh = world.ghosts.get(k);
+    if (!gh) {
+      const [x, y, z] = k.split(',').map(Number);
+      if (open) {
+        gh = new THREE.Mesh(boxGeo, interiorMat);
+        gh.scale.setScalar(0.98); gh.renderOrder = 3;
+      } else {
+        gh = new THREE.LineSegments(edgeGeo, lineMat(typeColor(bp.get(k)), isDark() ? 0.6 : 0.7));
+        gh.scale.setScalar(0.86);
+      }
+      gh.position.copy(toThree(x, y, z)); gh.userData.z = z;
+      world.group.add(gh); world.ghosts.set(k, gh);
+    }
+    gh.visible = gh.userData.z <= cut;
+  }
+  // highlight of current event
+  world.hl.clear();
+  if (R.showHL && R.pos > 0) {
+    const e = R.log.events[R.pos - 1];
+    const marks = [];
+    for (const g of e.diff.grid) marks.push({ pos: g.pos, color: g.after ? HL_PLACE : HL_REMOVE, fill: !g.after });
+    if (!e.ok && e.args && 'x' in e.args && 'y' in e.args && 'z' in e.args) marks.push({ pos: [e.args.x, e.args.y, e.args.z], color: HL_FAIL, fill: true });
+    for (const m of marks) {
+      const [x, y, z] = m.pos;
+      if (z > cut) continue;
+      const g = new THREE.Group(); g.position.copy(toThree(x, y, z));
+      const l = new THREE.LineSegments(edgeGeo, new THREE.LineBasicMaterial({ color: m.color, depthTest: false, transparent: true }));
+      l.scale.setScalar(1.14); l.renderOrder = 10; g.add(l);
+      const l2 = l.clone(); l2.scale.setScalar(1.2); g.add(l2);
+      if (m.fill) {
+        const f = new THREE.Mesh(boxGeo, new THREE.MeshBasicMaterial({ color: m.color, transparent: true, opacity: 0.22, depthWrite: false }));
+        f.scale.setScalar(0.98); g.add(f);
+      }
+      world.hl.add(g);
+    }
+  }
+}
+
+// ---------- side panel ----------
+function agentTag(a) { return `<span style="white-space:nowrap"><span class="agentdot" style="background:${agentColor(a)}"></span>${esc(a)}</span>`; }
+const fmt = v => (typeof v === 'number' ? (Math.round(v * 1000) / 1000).toString() : '–');
+const fmtT = t => (typeof t === 'number' ? t.toFixed(1) + ' s' : '–');
+
+function renderInfo() {
+  const h = R.log.header, c = h.config || {}, end = R.log.episodeEnd;
+  const g = gridDims();
+  const payoff = c.payoff === 'mixed' ? `mixed (α = ${c.mixed_alpha})` : (c.payoff ?? '–');
+  const rows = [
+    ['Episode', esc(h.episode_id ?? '–')],
+    R.built.task.kind === 'open'
+      ? ['Task', `open-ended${c.reference_design ? ` <span class="muted">(reference design: ${esc(c.reference_design)})</span>` : ''}<div style="margin-top:3px;padding:6px 8px;border-radius:6px;background:var(--panel-2);border:1px solid var(--border);white-space:pre-wrap">${esc(R.built.task.brief || '(no brief in log)')}</div>`]
+      : ['Blueprint', `${esc(R.built.task.blueprint.name ?? c.blueprint ?? '–')} <span class="muted">(${R.built.task.blueprint.cells.length} cells)</span>`],
+    ['Scarcity', esc(c.scarcity ?? '–')],
+    ['Payoff', esc(payoff) + (c.extra_penalty != null ? ` <span class="muted">· extra penalty ${c.extra_penalty}</span>` : '')],
+    ['Agents', `<div class="chips">${R.built.agents.map(agentTag).join(' ')}</div>`],
+    ['World', `${g.width}×${g.depth}×${g.height} · ${R.log.events.length} events · ${fmtT(R.tEnd)}${h.clock ? ` <span class="muted">(${esc(h.clock)} clock)</span>` : ''}`],
+  ];
+  const lim = [];
+  if (c.max_seconds != null) lim.push(`${c.max_seconds} s`);
+  if (c.max_actions_per_agent != null) lim.push(`${c.max_actions_per_agent} actions/agent`);
+  if (c.inventory_cap != null) lim.push(`inventory ${c.inventory_cap}`);
+  if (c.action_cooldown_s) lim.push(`cooldown ${c.action_cooldown_s} s`);
+  if (c.walk_speed != null) lim.push(`walk ${c.walk_speed} blocks/s · reach ${c.reach} · view ${c.view_radius}`);
+  if (lim.length) rows.push(['Limits', lim.join(' · ')]);
+  if (end) rows.push(['Ended', `${esc(end.reason)} at ${fmtT(end.t)} · team score ${fmt(end.team_score)}`]);
+  else rows.push(['Ended', '<span class="warnbox">no episode_end record (incomplete log?)</span>']);
+  const B = R.built, m = B.mismatches;
+  let check;
+  if (m.length) check = `<span class="warnbox">${m.length} snapshot${m.length > 1 ? 's' : ''} disagree with the replayed events (engine bug?). First at t = ${fmtT(m[0].t)}: ${esc(m[0].problems.slice(0, 3).join('; '))}</span>`;
+  else if (B.snapshotCount) check = `<span class="okbox">replay matches all ${B.verified} snapshot${B.verified === 1 ? '' : 's'}</span>`;
+  else check = '<span class="muted">no snapshots in log</span>';
+  rows.push(['Replay check', check]);
+  if (R.log.warnings.length) rows.push(['Warnings', `<span class="warnbox">${esc(R.log.warnings.slice(0, 3).join(' '))}</span>`]);
+  $('info').innerHTML = `<div class="kv">${rows.map(([k, v]) => `<div class="k">${k}</div><div>${v}</div>`).join('')}</div>`;
+  $('checkBadge').innerHTML = m.length
+    ? `<span class="warnbadge" title="${esc(m.map(x => `t=${fmtT(x.t)}: ${x.problems.join('; ')}`).join('\n'))}">snapshot mismatch</span>` : '';
+}
+
+/** Snapshot taken exactly after this position (to show the engine's logged score next to ours). */
+function snapshotAt(p) { const l = R.built.snapsAtPos.get(p); return l ? l[l.length - 1] : null; }
+
+function lastSnapshotUpTo(p) {
+  let best = null;
+  for (const [sp, list] of R.built.snapsAtPos) if (sp <= p && (!best || sp >= best.pos)) best = { pos: sp, snap: list[list.length - 1] };
+  return best;
+}
+function fmtDetail(v) {
+  if (Array.isArray(v)) return `${v.length} item${v.length === 1 ? '' : 's'}`;
+  if (v && typeof v === 'object') return esc(JSON.stringify(v));
+  return esc(typeof v === 'number' ? fmt(v) : String(v));
+}
+
+function renderScores() {
+  const s = R.built.states[R.pos].stats;
+  const maxA = Math.max(1, ...Object.values(s.perAgent));
+  let html;
+  if (s.kind === 'open') {
+    const pct = Math.min(1, s.interiorCells / (s.targetInterior || 1));
+    const tick = (ok, label) => `<span class="chip" style="${ok ? 'outline:1.5px solid var(--ok)' : 'opacity:.6'}">${ok ? '✓' : '✗'} ${label}</span>`;
+    html = `<div class="bigscore"><span class="v">${s.team.toFixed(3)}</span><span class="muted">team score</span>
+      <span style="margin-left:auto">${s.enclosed ? '<b style="color:var(--ok)">enclosed</b>' : '<b class="muted">not enclosed</b>'}</span></div>
+      <div class="chips" style="margin-bottom:6px">${tick(s.enclosed, 'enclosed')} ${tick(s.doors >= 1, `door${s.doors === 1 ? '' : 's'} ${s.doors}`)} ${tick(s.windows >= 1, `window${s.windows === 1 ? '' : 's'} ${s.windows}`)}</div>
+      <div class="barrow" style="grid-template-columns:90px 1fr 54px"><span>interior air</span><div class="bar"><i style="width:${pct * 100}%;background:#e0a800"></i></div><span class="n">${s.interiorCells} / ${s.targetInterior}</span></div>
+      <div class="muted" style="margin:4px 0 6px">shell blocks: <b>${s.shellCells}</b> · leftovers: <b style="color:${s.leftovers ? FLAG_EXTRA : 'inherit'}">${s.leftovers}</b> <span title="0 if not enclosed, else 0.5 + 0.2·[door] + 0.15·min(windows,2)/2 + 0.15·min(1, interior/target) − 0.01·leftovers">(?)</span></div>
+      <div class="muted" style="font-size:11px;margin-bottom:2px">Shell blocks per agent (individual score)</div>`;
+  } else {
+    const pct = s.blueprintCells ? s.correct / s.blueprintCells : 0;
+    html = `<div class="bigscore"><span class="v">${s.correct}/${s.blueprintCells}</span><span class="muted">correct (${(pct * 100).toFixed(0)}%)</span>
+      <span style="margin-left:auto">team <b>${s.team.toFixed(3)}</b></span></div>
+      <div class="bar" style="margin-bottom:6px"><i style="width:${pct * 100}%;background:var(--ok)"></i></div>
+      <div class="muted" style="margin-bottom:6px">extra (outside blueprint): <b style="color:${s.extra ? FLAG_EXTRA : 'inherit'}">${s.extra}</b> · wrong type: <b style="color:${s.wrong ? FLAG_WRONG : 'inherit'}">${s.wrong}</b></div>
+      <div class="muted" style="font-size:11px;margin-bottom:2px">Correct blocks per agent (individual score)</div>`;
+  }
+  for (const a of R.built.agents) {
+    const v = s.perAgent[a] || 0;
+    html += `<div class="barrow"><span>${agentTag(a)}</span><div class="bar"><i style="width:${v / maxA * 100}%;background:${agentColor(a)}"></i></div><span class="n">${v}</span></div>`;
+  }
+  // engine's own numbers from the latest snapshot up to here (score_details shown generically)
+  const last = lastSnapshotUpTo(R.pos);
+  if (last) {
+    const sn = last.snap, det = sn.score_details || {};
+    const keys = Object.keys(det);
+    const legacy = ['correct_cells', 'blueprint_cells', 'extra_cells'].filter(k => k in sn && !(k in det));
+    const rows = [['team_score', sn.team_score], ...keys.map(k => [k, det[k]]), ...legacy.map(k => [k, sn[k]])]
+      .map(([k, v]) => `<div class="k">${esc(k)}</div><div>${fmtDetail(v)}</div>`).join('');
+    html += `<details style="margin-top:6px"><summary class="muted" style="cursor:pointer;font-size:12px">Engine snapshot at t = ${fmtT(sn.t)}${last.pos === R.pos ? ' (this event)' : ''}</summary>
+      <div class="kv" style="font-size:12px;margin-top:4px">${rows}</div></details>`;
+  }
+  const open = $('scores').querySelector('details')?.open;
+  $('scores').innerHTML = html;
+  if (open && $('scores').querySelector('details')) $('scores').querySelector('details').open = true;
+  const snap = snapshotAt(R.pos);
+  $('scoreNote').innerHTML = snap && typeof snap.team_score === 'number' ? `<span class="muted">engine logged ${fmt(snap.team_score)} here</span>` : '';
+}
+
+function renderChest() {
+  const st = R.built.states[R.pos], init = R.log.header.chest || {};
+  const types = [...new Set([...(R.log.header.block_types || []), ...Object.keys(init), ...Object.keys(st.chest)])]
+    .filter(t => (init[t] || 0) > 0 || (st.chest[t] || 0) !== 0);
+  if (!types.length) { $('chest').innerHTML = '<span class="muted">empty</span>'; return; }
+  $('chest').innerHTML = types.map(t => {
+    const cur = st.chest[t] || 0, ini = init[t] || 0, den = Math.max(ini, cur, 1);
+    return `<div class="barrow"><span><span class="sw" style="background:${typeColor(t)}"></span>${esc(t)}</span>
+      <div class="bar"><i style="width:${Math.max(0, cur) / den * 100}%;background:${typeColor(t)}"></i></div><span class="n">${cur} / ${ini}</span></div>`;
+  }).join('');
+}
+
+function renderInvs() {
+  const st = R.built.states[R.pos];
+  const c = R.log.header.config || {};
+  const cap = c.inventory_cap, maxAct = c.max_actions_per_agent;
+  const agents = [...new Set([...R.built.agents, ...Object.keys(st.inv)])];
+  $('invs').innerHTML = agents.map(a => {
+    const inv = st.inv[a] || {};
+    const total = Object.values(inv).reduce((s, v) => s + v, 0);
+    const used = st.actions[a] || 0;
+    const done = st.votes.includes(a);
+    const items = Object.entries(inv).filter(([, v]) => v).map(([t, v]) => `<span class="chip"><span class="sw" style="background:${typeColor(t)}"></span>${esc(t)} ${v}</span>`).join('');
+    const pos = st.positions[a], mv = st.moves[a];
+    const walking = mv && typeof mv.arrive_t === 'number' && R.time < mv.arrive_t;
+    const posLine = pos ? `<div class="cnt" style="margin:1px 0 2px">at (${pos.join(', ')})${walking ? ` · <b style="color:${agentColor(a)}">walking until t = ${mv.arrive_t.toFixed(1)} s</b>` : ''}</div>` : '';
+    const actBar = maxAct ? `<div class="bar" style="height:4px;margin:2px 0 3px"><i style="width:${Math.min(1, used / maxAct) * 100}%;background:${agentColor(a)}"></i></div>` : '';
+    return `<div class="inv"><div style="display:flex;align-items:center;gap:6px"><span class="who">${agentTag(a)}</span>
+      ${done ? '<span class="badge" style="background:#12805c22;color:var(--ok)">voted done</span>' : ''}
+      <span class="cnt" style="margin-left:auto">actions ${used}${maxAct ? ' / ' + maxAct : ''}</span></div>${actBar}${posLine}
+      <div class="chips"><span class="cnt" style="margin:0 4px 0 0">holding ${total}${cap != null ? ' / ' + cap : ''}</span>${items || '<span class="muted" style="font-size:12px">nothing</span>'}</div></div>`;
+  }).join('');
+}
+
+function buildFeedFilter() {
+  const sel = $('feedFilter');
+  sel.innerHTML = `<option value="all">all events</option><option value="chat">chat only</option><option value="fail">failed only</option><option value="grid">block changes</option>` +
+    R.built.agents.map(a => `<option value="agent:${esc(a)}">only ${esc(a)}</option>`).join('');
+  sel.value = 'all'; R.filter = 'all';
+}
+
+function buildFeed() {
+  const feed = $('feed'); feed.innerHTML = '';
+  R.feedItems = [];
+  R.log.events.forEach((e, i) => {
+    const el = document.createElement('div');
+    const isChat = !!e.chat;
+    el.className = 'ev' + (e.ok ? '' : ' fail') + (isChat ? ' chat ' + (e.chat.channel === 'private' ? 'private' : 'public') : '');
+    el.style.setProperty('--c', agentColor(e.agent));
+    let body = `<span class="who">${esc(e.agent)}</span> ${esc(describeEvent(e))}`;
+    if (isChat) {
+      const badge = e.chat.channel === 'private' ? `<span class="badge priv">private → ${esc(e.chat.to)}</span>` : '<span class="badge pub">public</span>';
+      body = `<span class="who">${esc(e.chat.from || e.agent)}</span> ${badge}<div class="bubble">${esc(e.chat.text)}</div>`;
+    } else if (e.tool === 'move_to') {
+      el.classList.add('move');
+    } else if (e.tool === 'note' && e.args.text != null) {
+      body += `<div class="note">“${esc(e.args.text)}”</div>`;
+    }
+    if (!e.ok) body += `<span class="badge bad">failed</span><div class="err">${esc(e.message)}</div>`;
+    if (e.ok && e.tool === 'remove') { const b = e.diff.grid[0] && e.diff.grid[0].before; if (b && b.placed_by && b.placed_by !== e.agent) body += `<span class="badge bad">other's block</span>`; }
+    el.innerHTML = `<div class="meta">t = ${e.t.toFixed(2)} s · #${e.event_id ?? i}${e.cost ? ' · ' + esc(e.cost) : ''}</div>${body}`;
+    el.addEventListener('click', () => { stop(); setPos(i + 1); });
+    feed.appendChild(el);
+    R.feedItems.push({ el, i, e });
+  });
+}
+
+function passesFilter(e) {
+  const f = R.filter;
+  if (f === 'all') return true;
+  if (f === 'chat') return !!e.chat;
+  if (f === 'fail') return !e.ok;
+  if (f === 'grid') return e.diff.grid.length > 0;
+  if (f.startsWith('agent:')) return e.agent === f.slice(6);
+  return true;
+}
+
+function updateFeed() {
+  const p = R.pos;
+  let cur = null, lastVis = null;
+  for (const it of R.feedItems) {
+    const vis = it.i < p && passesFilter(it.e);
+    it.el.style.display = vis ? '' : 'none';
+    it.el.classList.toggle('cur', it.i === p - 1);
+    if (vis) lastVis = it.el;
+    if (it.i === p - 1 && vis) cur = it.el;
+  }
+  const feed = $('feed');
+  const target = cur || lastVis;
+  if (target) {
+    const top = target.offsetTop, bottom = top + target.offsetHeight;
+    if (top < feed.scrollTop || bottom > feed.scrollTop + feed.clientHeight) feed.scrollTop = bottom - feed.clientHeight + 8;
+  }
+  let ph = feed.querySelector('.placeholder');
+  if (!lastVis) {
+    if (!ph) { ph = document.createElement('div'); ph.className = 'placeholder muted'; ph.style.padding = '8px'; feed.prepend(ph); }
+    ph.textContent = p === 0 ? 'Start of episode — press Play or → to step through events.' : 'No events match this filter yet.';
+  } else if (ph) ph.remove();
+}
+
+function renderCaption() {
+  if (R.pos === 0) { $('caption').innerHTML = '<span class="muted">Start · nothing placed yet</span>'; return; }
+  const e = R.log.events[R.pos - 1];
+  let t = `<span class="muted">t = ${e.t.toFixed(1)} s</span> <b style="color:${agentColor(e.agent)}">${esc(e.agent)}</b> ${esc(describeEvent(e))}`;
+  if (e.chat) t += `: “${esc(e.chat.text.length > 140 ? e.chat.text.slice(0, 140) + '…' : e.chat.text)}”`;
+  if (!e.ok) t += ` <span style="color:var(--danger)">— failed: ${esc(e.message)}</span>`;
+  $('caption').innerHTML = t;
+}
+
+function renderLegend() {
+  let items;
+  if (R.colorMode === 'agent') items = R.built.agents.map(a => `<span><span class="sw" style="background:${agentColor(a)}"></span>${esc(a)}</span>`);
+  else {
+    const types = [...new Set([...(R.log.header.block_types || []), ...(R.built.task.blueprint ? R.built.task.blueprint.cells.map(c => c[3]) : [])])];
+    items = types.map(t => `<span><span class="sw" style="background:${typeColor(t)};${t === 'glass' ? 'opacity:.6' : ''}"></span>${esc(t)}</span>`);
+  }
+  $('legendItems').innerHTML = items.join('');
+  const flags = [];
+  const isOpen = R.built.task.kind === 'open';
+  if (R.showGhost) flags.push(isOpen ? `<span><span class="sw" style="background:#ffc83d66"></span>interior air</span>`
+    : `<span><span class="sw outline" style="border-color:var(--muted);border-style:dashed"></span>missing (wireframe)</span>`);
+  if (R.showFlags) flags.push(...(isOpen ? [`<span><span class="sw outline" style="border-color:${FLAG_EXTRA}"></span>leftover (not in shell)</span>`]
+    : [`<span><span class="sw outline" style="border-color:${FLAG_WRONG}"></span>wrong type</span>`, `<span><span class="sw outline" style="border-color:${FLAG_EXTRA}"></span>extra (outside blueprint)</span>`]));
+  if (R.showHL) flags.push(`<span><span class="sw outline" style="border-color:${HL_PLACE}"></span>placed now</span>`, `<span><span class="sw outline" style="border-color:${HL_REMOVE}"></span>removed now</span>`, `<span><span class="sw outline" style="border-color:${HL_FAIL}"></span>failed target</span>`);
+  if (R.log.header.chest_pos || (R.log.header.config || {}).chest_pos) flags.push(`<span><span class="sw" style="background:#8a5a2b;border-color:#d4a63a"></span>chest</span>`);
+  $('legendFlags').innerHTML = flags.join('');
+}
+
+// ---------- activity strip (one lane per agent, ticks at event times; doubles as the scrubber) ----------
+const strip = $('strip');
+const STRIP = { gutter: 64, axisH: 14, padR: 10, laneH: 10 };
+function sizeStrip() {
+  const n = R.log ? Math.max(1, R.built.agents.length) : 3;
+  STRIP.laneH = Math.max(6, Math.min(12, Math.floor(72 / n)));
+  strip.style.height = (n * STRIP.laneH + STRIP.axisH + 6) + 'px';
+  drawStrip();
+}
+const stripX = (t, w) => STRIP.gutter + (t / R.tEnd) * (w - STRIP.gutter - STRIP.padR);
+const stripT = (x, w) => ((x - STRIP.gutter) / (w - STRIP.gutter - STRIP.padR)) * R.tEnd;
+function drawStrip() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = strip.clientWidth, h = strip.clientHeight;
+  if (!w || !h) return;
+  if (strip.width !== Math.round(w * dpr) || strip.height !== Math.round(h * dpr)) { strip.width = Math.round(w * dpr); strip.height = Math.round(h * dpr); }
+  const g = strip.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  if (!R.log) return;
+  const agents = R.built.agents, lane = STRIP.laneH, top = 2;
+  const muted = cssVar('--muted'), border = cssVar('--border'), text = cssVar('--text');
+  g.font = '10px -apple-system, Segoe UI, sans-serif'; g.textBaseline = 'middle';
+  agents.forEach((a, i) => {
+    const y = top + i * lane;
+    g.fillStyle = i % 2 ? 'rgba(127,127,127,.05)' : 'rgba(127,127,127,.10)';
+    g.fillRect(STRIP.gutter, y, w - STRIP.gutter - STRIP.padR, lane);
+    g.fillStyle = agentColor(a);
+    g.fillText(a.length > 10 ? a.slice(0, 9) + '…' : a, 2, y + lane / 2);
+  });
+  const laneOf = new Map(agents.map((a, i) => [a, i]));
+  // [v3] walking spans: thin bar from depart_t to arrive_t
+  for (const e of R.log.events) {
+    const li = laneOf.get(e.agent);
+    const m = e.diff.agents && e.diff.agents[e.agent];
+    if (li === undefined || !m || typeof m.arrive_t !== 'number') continue;
+    const x0 = stripX(m.depart_t ?? e.t, w), x1 = stripX(m.arrive_t, w), y = top + li * lane;
+    g.globalAlpha = 0.35; g.fillStyle = agentColor(e.agent);
+    g.fillRect(x0, y + lane / 2 - 1.5, Math.max(1, x1 - x0), 3);
+  }
+  g.globalAlpha = 1;
+  // ticks
+  R.log.events.forEach((e, idx) => {
+    if (e.tool === 'move_to' && e.ok) return; // drawn as a walking span
+    const li = laneOf.get(e.agent); if (li === undefined) return;
+    const x = Math.round(stripX(e.t, w)) + 0.5, y = top + li * lane;
+    const past = idx < R.pos;
+    g.globalAlpha = (e.ok ? 1 : 0.28) * (past ? 1 : 0.45);
+    g.fillStyle = agentColor(e.agent);
+    if (e.chat) {
+      // chat: small diamond (filled = public, hollow = private)
+      const cy = y + lane / 2, r = Math.max(2.5, lane / 2 - 1);
+      g.beginPath(); g.moveTo(x, cy - r); g.lineTo(x + r, cy); g.lineTo(x, cy + r); g.lineTo(x - r, cy); g.closePath();
+      if (e.chat.channel === 'private') { g.strokeStyle = agentColor(e.agent); g.lineWidth = 1.2; g.stroke(); } else g.fill();
+    } else {
+      const full = e.diff.grid.length > 0 || !e.ok && e.tool === 'place';
+      const hh = full ? lane - 2 : Math.max(2, (lane - 2) / 2);
+      g.fillRect(x - 0.75, y + 1 + (lane - 2 - hh) / 2, 1.5, hh);
+      if (!e.ok) { g.globalAlpha = past ? 0.9 : 0.4; g.fillStyle = '#d92d20'; g.fillRect(x - 1, y + lane - 2, 2, 2); }
+    }
+  });
+  g.globalAlpha = 1;
+  // axis
+  const axisY = top + agents.length * lane + 2;
+  g.strokeStyle = border; g.lineWidth = 1; g.beginPath(); g.moveTo(STRIP.gutter, axisY + .5); g.lineTo(w - STRIP.padR, axisY + .5); g.stroke();
+  const span = R.tEnd, targetTicks = Math.max(2, Math.floor((w - STRIP.gutter) / 70));
+  const steps = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600];
+  const step = steps.find(s => span / s <= targetTicks) || 3600;
+  g.fillStyle = muted; g.textBaseline = 'top'; g.textAlign = 'center';
+  for (let t = 0; t <= span + 1e-9; t += step) {
+    const x = stripX(t, w);
+    g.fillRect(x, axisY, 1, 3);
+    g.fillText(step >= 60 && t >= 60 ? `${Math.floor(t / 60)}m${t % 60 ? (t % 60) + 's' : ''}` : `${+t.toFixed(1)}s`, x, axisY + 3);
+  }
+  g.textAlign = 'left';
+  // played region + playhead
+  const px = stripX(R.time, w);
+  g.fillStyle = 'rgba(127,127,127,.10)'; g.fillRect(STRIP.gutter, top, px - STRIP.gutter, agents.length * lane);
+  g.fillStyle = cssVar('--accent') || '#2f6fdf';
+  g.fillRect(px - 1, 0, 2, axisY + 2);
+  g.beginPath(); g.arc(px, axisY, 4.5, 0, Math.PI * 2); g.fill();
+}
+let stripDrag = false;
+function stripSeek(ev) {
+  const r = strip.getBoundingClientRect();
+  const x = ev.clientX - r.left;
+  stop();
+  setTime(stripT(x, r.width));
+}
+strip.addEventListener('pointerdown', ev => { if (!R.log) return; stripDrag = true; strip.setPointerCapture(ev.pointerId); stripSeek(ev); });
+strip.addEventListener('pointermove', ev => {
+  if (!R.log) return;
+  if (stripDrag) { stripSeek(ev); return; }
+  // hover: nearest event in the hovered lane
+  const r = strip.getBoundingClientRect(), x = ev.clientX - r.left, y = ev.clientY - r.top;
+  const li = Math.floor((y - 2) / STRIP.laneH), a = R.built.agents[li];
+  const tip = $('stripTip');
+  if (!a || x < STRIP.gutter) { tip.style.display = 'none'; return; }
+  let best = null, bd = 6;
+  for (const e of R.log.events) {
+    if (e.agent !== a) continue;
+    const d = Math.abs(stripX(e.t, r.width) - x);
+    if (d < bd) { bd = d; best = e; }
+  }
+  if (!best) { tip.style.display = 'none'; return; }
+  tip.innerHTML = `<span class="muted">t = ${best.t.toFixed(2)} s</span> <b style="color:${agentColor(a)}">${esc(a)}</b> ${esc(describeEvent(best))}${best.chat ? ': ' + esc(best.chat.text) : ''}${best.ok ? '' : ` <span style="color:var(--danger)">failed: ${esc(best.message)}</span>`}`;
+  tip.style.display = 'block';
+  tip.style.left = Math.max(0, Math.min(x - 40, r.width - 300)) + 'px';
+});
+strip.addEventListener('pointerup', () => { stripDrag = false; });
+strip.addEventListener('pointerleave', () => { $('stripTip').style.display = 'none'; });
+new ResizeObserver(drawStrip).observe(strip);
+
+// ---------- controls ----------
+function play() {
+  if (!R.log) return;
+  if (R.time >= R.tEnd - 1e-9) setTime(0);
+  R.playing = true; $('bPlay').textContent = 'Pause';
+}
+function stop() { R.playing = false; $('bPlay').textContent = 'Play'; }
+function togglePlay() { R.playing ? stop() : play(); }
+const jump = dt => { stop(); setTime(R.time + dt); };
+
+$('bPlay').onclick = togglePlay;
+$('bPrev').onclick = () => { stop(); setPos(R.pos - 1); };
+$('bNext').onclick = () => { stop(); setPos(R.pos + 1); };
+$('bBack10').onclick = () => jump(-10);
+$('bFwd10').onclick = () => jump(10);
+$('speed').addEventListener('change', e => e.target.blur());
+$('feedFilter').addEventListener('change', e => { R.filter = e.target.value; updateFeed(); e.target.blur(); });
+$('cmType').onclick = () => setColorMode('type');
+$('cmAgent').onclick = () => setColorMode('agent');
+function setColorMode(m) { R.colorMode = m; $('cmType').classList.toggle('on', m === 'type'); $('cmAgent').classList.toggle('on', m === 'agent'); if (R.log) { renderLegend(); refreshScene(); } }
+$('optGhost').onchange = e => { R.showGhost = e.target.checked; if (R.log) { renderLegend(); refreshScene(); } };
+$('optFlags').onchange = e => { R.showFlags = e.target.checked; if (R.log) { renderLegend(); refreshScene(); } };
+$('optHighlight').onchange = e => { R.showHL = e.target.checked; if (R.log) { renderLegend(); refreshScene(); } };
+function updateCutLabel() { const max = +$('cut').max; $('cutLbl').textContent = R.cut >= max ? 'all' : `z ≤ ${R.cut}`; }
+$('cut').addEventListener('input', e => { R.cut = +e.target.value; updateCutLabel(); refreshScene(); });
+$('optAgents').onchange = e => { R.showAgents = e.target.checked; };
+$('reachSel').addEventListener('change', e => { R.reachAgent = e.target.value; e.target.blur(); });
+$('resetCam').onclick = () => { if (R.log) frameCamera(); };
+
+window.addEventListener('keydown', e => {
+  if (!R.log) return;
+  const tag = (e.target.tagName || '').toLowerCase();
+  if (tag === 'select' || tag === 'textarea' || (tag === 'input' && e.target.type !== 'range' && e.target.type !== 'checkbox')) return;
+  if (e.key === ' ' || e.code === 'Space') { e.preventDefault(); togglePlay(); }
+  else if (e.key === 'ArrowRight') { e.preventDefault(); e.shiftKey ? jump(10) : (stop(), setPos(R.pos + 1)); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); e.shiftKey ? jump(-10) : (stop(), setPos(R.pos - 1)); }
+  else if (e.key === 'Home') { e.preventDefault(); stop(); setPos(0); }
+  else if (e.key === 'End') { e.preventDefault(); stop(); setPos(R.log.events.length); }
+}, true);
+// buttons keep focus after clicks; stop Space from also "clicking" them
+document.addEventListener('keyup', e => { if (e.code === 'Space' && e.target.tagName === 'BUTTON') e.preventDefault(); }, true);
+
+// ---------- loading: file picker, drag & drop, ?log= ----------
+const fileInput = $('fileInput');
+$('pickBtn').onclick = () => fileInput.click();
+$('openBtn').onclick = () => fileInput.click();
+fileInput.onchange = () => { const f = fileInput.files[0]; if (f) readFile(f); fileInput.value = ''; };
+function readFile(f) { f.text().then(t => loadText(t, f.name), err => showError(`Could not read ${f.name}: ${err.message}`)); }
+let dragDepth = 0;
+window.addEventListener('dragenter', e => { e.preventDefault(); dragDepth++; document.body.classList.add('dragging'); });
+window.addEventListener('dragleave', e => { e.preventDefault(); if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dragging'); } });
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop', e => {
+  e.preventDefault(); dragDepth = 0; document.body.classList.remove('dragging');
+  const f = e.dataTransfer && e.dataTransfer.files[0]; if (f) readFile(f);
+});
+async function loadUrl(url) {
+  if (location.protocol === 'file:') { showError(`Can't fetch "${url}" when the page is opened from disk (file://).\nUse the file picker / drag and drop, or run: python3 scripts/serve_viewer.py ${url}`); return; }
+  try {
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    loadText(await res.text(), url.split('/').pop());
+  } catch (err) { showError(`Could not fetch log "${url}": ${err.message}`); }
+}
+$('sampleBtn').onclick = () => loadUrl(new URL('sample-episode.jsonl', location.href).href);
+
+// ---------- hover tooltip & double-click to jump ----------
+const raycaster = new THREE.Raycaster(); const mouse = new THREE.Vector2();
+function pick(ev) {
+  const r = renderer.domElement.getBoundingClientRect();
+  mouse.set(((ev.clientX - r.left) / r.width) * 2 - 1, -((ev.clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(mouse, camera);
+  const hit = raycaster.intersectObjects(world.pickables, false)[0];
+  return hit ? hit.object.userData.key : null;
+}
+renderer.domElement.addEventListener('pointermove', ev => {
+  const tip = $('tooltip');
+  if (!R.log || ev.buttons) { tip.style.display = 'none'; return; }
+  const k = pick(ev);
+  if (!k) { tip.style.display = 'none'; return; }
+  const b = R.built.states[R.pos].grid.get(k), want = R.built.bp.get(k);
+  if (!b) { tip.style.display = 'none'; return; }
+  const S = R.built.states[R.pos].stats;
+  const status = S.kind === 'open'
+    ? (!S.enclosed ? '<span class="muted">nothing enclosed yet</span>' : S.leftoverSet.has(k) ? `<span style="color:${FLAG_EXTRA}">leftover — not part of the shell</span>` : '<span style="color:var(--ok)">part of the shell</span>')
+    : want === undefined ? `<span style="color:${FLAG_EXTRA}">extra — not in blueprint</span>`
+    : want === b.type ? '<span style="color:var(--ok)">correct</span>' : `<span style="color:${FLAG_WRONG}">wrong type — blueprint wants ${esc(want)}</span>`;
+  tip.innerHTML = `<b>${esc(b.type)}</b> at (${k.replace(/,/g, ', ')})<br>placed by ${agentTag(b.placed_by)} at t = ${typeof b.placed_at === 'number' ? b.placed_at.toFixed(1) + ' s' : '?'}<br>${status}<br><span class="muted">double-click: jump to its placement</span>`;
+  const sr = stage.getBoundingClientRect();
+  tip.style.display = 'block';
+  tip.style.left = Math.min(ev.clientX - sr.left + 14, sr.width - 290) + 'px';
+  tip.style.top = (ev.clientY - sr.top + 14) + 'px';
+});
+renderer.domElement.addEventListener('pointerleave', () => { $('tooltip').style.display = 'none'; });
+renderer.domElement.addEventListener('dblclick', ev => {
+  if (!R.log) return;
+  const k = pick(ev); if (!k) return;
+  for (let i = R.pos - 1; i >= 0; i--) {
+    const e = R.log.events[i];
+    if (e.diff.grid.some(g => g.after && key(...g.pos) === k)) { stop(); setPos(i + 1); return; }
+  }
+});
+
+// ---------- render loop ----------
+function resize() {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  if (!w || !h) return;
+  renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(stage);
+resize();
+applyTheme();
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.25);
+  if (R.playing && R.log) {
+    const t = R.time + dt * +$('speed').value;
+    setTime(t);
+    if (t >= R.tEnd) stop();
+  }
+  // gentle pulse on the current-event highlight
+  const s = 0.6 + 0.4 * Math.abs(Math.sin(performance.now() / 300));
+  world.hl.traverse(o => { if (o.isLineSegments) o.material.opacity = s; });
+  updateBodies();
+  controls.update();
+  renderer.render(scene, camera);
+});
+
+// initial load from ?log=
+const logParam = new URLSearchParams(location.search).get('log');
+if (logParam) loadUrl(logParam);
+</script>
+</body>
+</html>
