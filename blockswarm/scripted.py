@@ -8,6 +8,10 @@ agents may have taken the blocks or filled the cell by the time it acts; those c
 (and are logged) and it re-plans. For geometry (paths, where to stand) it uses the world's
 helper queries, which an LLM agent would get as tools.
 
+Finished votes: once it believes the build is finished (or it is stuck), it says so and calls
+`declare_done`, then waits without acting. Any change to the build clears every vote, so if
+another agent places or removes a block afterwards, it looks again and votes again later.
+
 This is a test/baseline bot, not a model of good play: it only walks, takes, places and
 talks (no climbing or scaffolding). Build order: foundation, walls with the doorway left
 open, then the roof (outer ring first) from wherever a standing spot reaches it, which for
@@ -64,8 +68,17 @@ class ScriptedBuilder:
     def step(self, world: World, agent: str) -> bool:
         """Make at most one tool call. Returns False once this agent has nothing left to do."""
         mem = self.memory(agent)
-        if mem.declared or world.done:
+        if world.done:
             return False
+        if mem.declared:
+            # Voted finished: wait without acting (any change to the build would clear every
+            # vote). If someone changed the build since, my vote was cleared: look again and
+            # vote again once I believe it is finished (or stalled) again.
+            if agent in world.view(agent)["done_votes"]:
+                return True
+            mem.declared = False
+            mem.stalled_steps = 0
+            mem.view = None
         if mem.view is None or mem.view["walking_until"] is not None:
             # first step, or my last look was mid-walk: look around on arrival
             mem.view = world.view(agent)
@@ -87,7 +100,7 @@ class ScriptedBuilder:
             mem.last_change_t = fresh["t"]
         mem.fingerprint = fp
         mem.view = fresh
-        return not mem.declared
+        return True
 
     # ------------------------------------------------------------------ knowledge
 

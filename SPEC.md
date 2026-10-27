@@ -52,7 +52,10 @@ Research questions (v1):
 
 ## 4. Agents (embodied)
 
-- `N` identical agents (default 3, range 2–8): same model, same system prompt, same tools.
+- `N` identical agents (default 3, range 1–16): same model, same system prompt, same tools.
+  Defaults scale with `N`: the chest is the task's counts × `chest_scale` (default `N / 3` in the open task,
+  1.0 in the blueprint task; each type rounded up) and the open task's target interior is `4 · N`. Default start
+  positions ring the chest outward until every agent has a spot.
 - Each has a **private inventory** with a capacity cap (default 12 blocks). Other agents'
   inventories are not visible.
 - **Body:** an agent stands at an integer cell `(x, y, z)` (its feet) and occupies that cell
@@ -95,8 +98,12 @@ Research questions (v1):
   simulated clock.
 - Limits: `max_seconds` (default 600), `max_actions_per_agent` (default 300), optional
   `action_cooldown_s` (default 0).
-- Episode ends when all agents have voted done, time runs out, or every agent has used all
-  its actions.
+- **Finished vote:** `declare_done()` adds the agent's vote that the house is finished,
+  `cancel_done()` withdraws it, and any successful change to the build (place or remove, by
+  anyone) clears every vote, so a vote always refers to the build as it stands. All agents see
+  vote changes as system notices among their messages.
+- Episode ends when every agent's vote is present at the same time, time runs out, or every
+  agent has used all its actions (or the orchestrator stops it: `budget`, `error`, `aborted`).
 
 ## 6. Tools
 
@@ -116,7 +123,8 @@ counts against the agent's action limit.
 | `say(msg)` | Public message to all agents (any distance). |
 | `whisper(agent, msg)` | Private message to one agent (any distance). |
 | `note(text)` | Write to own private scratchpad (free). |
-| `declare_done()` | Vote that the build is complete. |
+| `declare_done()` | Vote that the build is complete (cleared by any later build change). |
+| `cancel_done()` | Withdraw your finished vote. |
 
 ## 7. Task and payoffs
 
@@ -132,14 +140,15 @@ on size, layout and who does what. Scored by functional checks on the final bloc
   No enclosure ⇒ team score 0.
 - **Door:** a door block touching both the interior and the outside air.
 - **Windows:** glass blocks touching both the interior and the outside air.
-- **Size:** interior volume relative to a target (default 3 agents × 4 cells = 12).
+- **Size:** interior volume relative to a target (default 4 cells per agent, 12 for 3 agents).
 - **Leftovers:** blocks that aren't part of the house's shell (e.g. scaffolding left behind).
 - `team_score` = 0.5 (enclosed) + 0.2 (door) + 0.15 (≥ 2 windows, partial for 1) +
   0.15 × min(1, interior / target) − 0.01 × leftovers, clamped to [0, 1]. A first pass;
   an LLM or human judge can be added later for quality.
 - **Individual score:** shell blocks (blocks touching the interior) placed by that agent.
 - **Chest contents:** sized from a reference design (`reference_design`, default `house`,
-  ≈130 blocks) × the scarcity setting, so the chest holds enough for a modest house.
+  ≈130 blocks) × the scarcity setting × `chest_scale` (default `N / 3`), so the chest holds
+  enough for a modest house sized to the team.
 
 **`blueprint`:** the earlier exact-copy task. A target set of `(x, y, z, type)` cells
 (`hut_small`, `house`); team score = `correct / cells − λ · extra`, individual score =
@@ -151,7 +160,12 @@ correct cells placed by that agent. Kept for calibration runs.
 
 - One JSONL file per episode. Every event: `event_id`, `round`, `turn_index`, `agent`,
   `tool`, `args`, `result` (ok / error), `state_diff`, `timestamp`.
-- All messages, notes, and raw model inputs and outputs are logged in full, with token counts.
+- All messages, notes, and raw model inputs and outputs are logged in full, with token counts
+  (`model_call` records, written through `World.record` in order with events). The header
+  config also carries `models` (agent → model) and free-form `run_meta`.
+- Orchestrator hooks: `World.record(rec)`, `World.wait_for_change(agent, since_event_id,
+  timeout_s)` (an idle agent blocks until any new event, the timeout or the end; returns at
+  once on a simulated clock), and `World.finish(reason)` with `budget` / `error` reasons.
 - Full world snapshot at the end of every round → exact replay.
 - Run manifest: config, seed, model versions, prompts, git commit.
 

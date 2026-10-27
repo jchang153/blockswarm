@@ -7,7 +7,9 @@ from pathlib import Path
 
 from blockswarm.pathing import path_length
 from blockswarm.tasks import make_task
-from blockswarm.world import AIRBORNE_MSG, COOLDOWN_MSG, LIMIT_MSG, WALKING_MSG
+from blockswarm.world import AIRBORNE_MSG, COOLDOWN_MSG, DIFF_KEYS, LIMIT_MSG, WALKING_MSG
+
+LEGACY_DIFF_KEYS = {"grid", "chest", "inventory", "agents"}  # v3 logs written before diff.votes
 
 
 def load_log(path: str | Path) -> list[dict]:
@@ -37,6 +39,10 @@ def replay(records: list[dict]) -> dict:
     """Rebuild state from the header + event diffs, asserting it matches every snapshot.
 
     Checks blocks, chest, inventories, positions, walkers, actions used, votes and scores.
+    Finished votes are recomputed from the rules (declare_done adds, cancel_done removes, any
+    successful grid change clears all) and checked against every `diff.votes` and snapshot.
+    Logs written before `diff.votes` existed (four diff keys) are replayed with the old rule
+    (declare_done adds; nothing removes).
 
     Returns the final state: blocks, chest, inventories, actions_used, done_votes,
     snapshots_checked, end. Raises AssertionError on any mismatch.
@@ -63,6 +69,7 @@ def replay(records: list[dict]) -> dict:
     snapshots_checked = 0
     next_seq = 0
     end: dict | None = None
+    legacy: bool | None = None  # decided by the first event's diff keys
 
     def scores() -> dict:
         s = task.score({p: {"type": b[0], "placed_by": b[1], "placed_at": b[2]} for p, b in blocks.items()},
@@ -106,9 +113,11 @@ def replay(records: list[dict]) -> dict:
                 raise AssertionError(f"event_id {eid} does not follow {last_event_id}")
             last_event_id = eid
             diff = rec["diff"]
-            if set(diff) != {"grid", "chest", "inventory", "agents"}:
+            if legacy is None:
+                legacy = set(diff) == LEGACY_DIFF_KEYS
+            if set(diff) != (LEGACY_DIFF_KEYS if legacy else set(DIFF_KEYS)):
                 raise AssertionError(f"event {eid}: bad diff keys {sorted(diff)}")
-            if not rec["ok"] and (diff["grid"] or diff["chest"] or diff["inventory"] or diff["agents"]):
+            if not rec["ok"] and any(diff[k] for k in diff):
                 raise AssertionError(f"event {eid}: failed event has a non-empty diff")
             for g in diff["grid"]:
                 pos = tuple(g["pos"])
@@ -145,8 +154,18 @@ def replay(records: list[dict]) -> dict:
                 positions[agent] = list(mv["to"])
             if _counted(rec):
                 actions_used[rec["agent"]] += 1
+            votes_before = sorted(done_votes)
             if rec["ok"] and rec["tool"] == "declare_done" and rec["agent"] not in done_votes:
                 done_votes.append(rec["agent"])
+            if not legacy:
+                if rec["ok"] and rec["tool"] == "cancel_done" and rec["agent"] in done_votes:
+                    done_votes.remove(rec["agent"])
+                if rec["ok"] and diff["grid"]:
+                    done_votes.clear()
+                want = ({} if sorted(done_votes) == votes_before
+                        else {"before": votes_before, "after": sorted(done_votes)})
+                if diff["votes"] != want:
+                    raise AssertionError(f"event {eid}: votes diff {diff['votes']} but the rules give {want}")
         elif kind == "snapshot":
             if rec["seq"] != next_seq:
                 raise AssertionError(f"snapshot seq {rec['seq']} expected {next_seq}")

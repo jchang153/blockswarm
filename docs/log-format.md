@@ -10,8 +10,8 @@ at a time in arrival order under a lock; that order is the `event_id` order. `t`
 since the episode started (float, rounded to milliseconds), from the world's clock. In real
 runs the clock is wall time; in scripted demos and tests it is a simulated clock.
 
-Every record has a `type`. Readers must **ignore unknown types** (later milestones add
-e.g. `model_call` records with raw LLM inputs/outputs).
+Every record has a `type`. Readers must **ignore unknown types** (e.g. `model_call` records
+with raw LLM inputs/outputs, below; the public site export strips them).
 
 Coordinates: `x ∈ [0, width)`, `y ∈ [0, depth)`, `z ∈ [0, height)`. **z is up**; `z = 0`
 is the ground layer. `event_id` is 0-based and strictly increasing; `t` never decreases.
@@ -29,8 +29,10 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
             "chest_pos": [13, 2, 0], "start_positions": null, "walk_speed": 4.317,
             "reach": 4.5, "eye_height": 1.62, "view_radius": 8, "jump_airtime": 0.6,
             "task": "open", "brief": "Work together to build a house ...",
-            "reference_design": "house", "target_interior": 12,
-            "reach_line_of_sight": true, "view_occlusion": true},
+            "reference_design": "house", "target_interior": 12, "chest_scale": 1.0,
+            "reach_line_of_sight": true, "view_occlusion": true,
+            "models": null | {"agent_1": "provider/model-name", ...},
+            "run_meta": null | {"run_id": "...", "prompt_version": "...", ...}},
  "task": {"kind": "open" | "blueprint", "brief": "..." | null,
           "blueprint": null | {"name": "house", "cells": [[4, 5, 0, "stone"], ...]}},
  "clock": "simulated" | "wall",
@@ -42,6 +44,12 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
  "chest": {"stone": 35, "brick": 52, ...},
  "inventories": {"agent_1": {}, "agent_2": {}, "agent_3": {}}}
 ```
+- Team size: 1–16 agents. `config.target_interior` and `config.chest_scale` are logged
+  **resolved**: by default they scale with N = number of agents (`target_interior` = 4·N,
+  `chest_scale` = N / 3 for the open task and 1.0 for the blueprint task, so N = 3 gives 12 and 1.0). The header `chest` is the task's counts for
+  the scarcity setting × `chest_scale`, each type rounded up (zero stays zero).
+- `config.models` (agent id → model name, any subset of the agents) and `config.run_meta`
+  (free-form JSON) are set by the LLM orchestrator and logged as given; `null` in scripted runs.
 
 ### `event` (one per tool call, including failed ones)
 ```json
@@ -53,15 +61,28 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
              "after": {"type": "stone", "placed_by": "agent_2", "placed_at": 42.137}}],
    "chest": {},
    "inventory": {"agent_2": {"stone": -1}},
-   "agents": {}
+   "agents": {},
+   "votes": {"before": ["agent_1", "agent_3"], "after": []}
  },
  "chat": null}
 ```
-- `cost`: `"action"` (move_to, jump, take, deposit, give, place, remove, declare_done),
-  `"message"` (say, whisper) or `"free"` (observe, note).
-- `diff` always has the four keys `grid`, `chest`, `inventory`, `agents`; they are empty when
-  nothing changed (always the case when `ok` is false). Chest and inventory values are
-  signed deltas.
+- `cost`: `"action"` (move_to, jump, take, deposit, give, place, remove, declare_done,
+  cancel_done), `"message"` (say, whisper) or `"free"` (observe, note).
+- `diff` always has the five keys `grid`, `chest`, `inventory`, `agents`, `votes`; they are
+  empty when nothing changed (always the case when `ok` is false). Chest and inventory values
+  are signed deltas. (Earlier v3 logs have only the first four keys; readers should then
+  derive votes the old way: every successful `declare_done` adds a vote, nothing removes one.)
+- `diff.votes` — the collective "finished" vote: `{}` when the set of voters did not change,
+  else `{"before": [...], "after": [...]}` (agent ids, sorted). Rules:
+  `declare_done` adds the caller's vote, `cancel_done` removes it (both succeed as no-ops when
+  there is nothing to change), and **any successful change to the grid** (`place`, including a
+  place under a jumping agent, or `remove`) **clears all votes**, so votes always refer to the
+  build as it stands. The episode ends with `all_done` as soon as every agent's vote is present
+  at the same time. Agents are told about vote changes through system notices in their view
+  (`{"channel": "system", "from": null, "to": null, "text": "agent_2 voted that the house is
+  finished (2 of 3 votes)"}`, "... withdrew its finished vote (1 of 3 votes)", "agent_3 changed
+  the build, so all finished votes were cleared"), which carry the event's `event_id` and `t`;
+  they are derived from these events and not logged separately.
 - **[v3]** `diff.agents` is filled by a successful `move_to`:
   ```json
   "agents": {"agent_2": {"from": [12, 3, 0], "to": [6, 4, 1],
@@ -103,14 +124,34 @@ exact replay checks and fast seeking.
 **[v3]** `positions` and `walking_until` (only agents still walking at the snapshot's `t`).
 `after_event_id` is the last event included in the state (`-1` if none yet).
 
+`done_votes` lists the current voters in the order they voted (compare as a set).
+
+### `model_call` (LLM runs only; any number, anywhere between header and episode_end)
+One model request/response, written by the orchestrator through the world's lock, so it sits
+in file order with the events (`World.record`). Not written after `episode_end`.
+```json
+{"type": "model_call", "t": 41.902, "agent": "agent_2", "call_id": "agent_2-0017",
+ "model": "provider/model-name",
+ "request": {"messages": [...], "tools": ["move_to", "place", ...]},
+ "response": {"content": "...", "reasoning": "..." | null, "tool_calls": [...]},
+ "usage": {"prompt_tokens": 5123, "completion_tokens": 211, "cost_usd": 0.0042},
+ "latency_s": 3.21, "error": null}
+```
+`t` is the episode time when the record was written (the engine adds it if missing). `error`
+is `null` or a message (then `response` may be partial or empty). Replay and the viewers
+ignore these records; the public site export strips them.
+
 ### `episode_end` (exactly one, last line)
 ```json
 {"type": "episode_end", "t": 187.402,
- "reason": "all_done" | "time_limit" | "action_limit" | "aborted",
+ "reason": "all_done" | "time_limit" | "action_limit" | "aborted" | "budget" | "error",
  "team_score": 1.0, "individual_scores": {...}, "score_details": {...},
  "actions_used": {...}}
 ```
-`action_limit` = every agent has used `max_actions_per_agent`.
+`all_done` = every agent's finished vote is present at once. `time_limit` = `max_seconds`
+reached. `action_limit` = every agent has used `max_actions_per_agent`. `aborted` = stopped
+early (e.g. every agent quit, or a runner gave up). `budget` = the orchestrator's spending
+limit (tokens / cost) was reached. `error` = the orchestrator stopped on an unrecoverable error.
 
 ## Scoring
 Computed by the task (`blockswarm/tasks.py`). Every snapshot and the `episode_end` carry

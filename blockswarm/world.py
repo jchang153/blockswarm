@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Optional, Protocol
 
@@ -51,7 +52,13 @@ TOOLS: dict[str, tuple[str, tuple[tuple[str, str], ...]]] = {
     "whisper": ("message", (("to", "agent"), ("text", "text"))),
     "note": ("free", (("text", "text"),)),
     "declare_done": ("action", ()),
+    "cancel_done": ("action", ()),
 }
+
+END_REASONS = ("all_done", "time_limit", "action_limit", "aborted", "budget", "error")
+# Record types the engine writes itself; World.record() refuses them.
+ENGINE_RECORD_TYPES = ("header", "event", "snapshot", "episode_end")
+DIFF_KEYS = ("grid", "chest", "inventory", "agents", "votes")
 
 
 class Clock(Protocol):
@@ -88,9 +95,14 @@ class Config:
     task: str = "open"
     brief: Optional[str] = None
     reference_design: str = "house"
-    target_interior: int = 12
+    target_interior: Optional[int] = None        # None -> 4 x number of agents
     reach_line_of_sight: bool = True
     view_occlusion: bool = True
+    models: Optional[dict[str, str]] = None      # agent id -> model name (logged as-is)
+    run_meta: Optional[dict] = None              # free-form JSON metadata (run id, prompt version, ...)
+    chest_scale: Optional[float] = None          # None -> agents / 3 (open task), 1.0 (blueprint)
+
+    MAX_AGENTS = 16
 
     def __post_init__(self) -> None:
         self.agents = list(self.agents)
@@ -107,8 +119,19 @@ class Config:
             raise ValueError(f"scarcity must be one of {SCARCITY}, got {self.scarcity!r}")
         if self.payoff not in PAYOFFS:
             raise ValueError(f"payoff must be one of {PAYOFFS}, got {self.payoff!r}")
-        if not self.agents:
-            raise ValueError("need at least one agent")
+        if not 1 <= len(self.agents) <= self.MAX_AGENTS:
+            raise ValueError(f"need 1 to {self.MAX_AGENTS} agents, got {len(self.agents)}")
+        n = len(self.agents)
+        # Defaults that scale with the team size; the resolved values are logged in the header.
+        if self.target_interior is None:
+            self.target_interior = 4 * n
+        if self.chest_scale is None:
+            # A blueprint is the same structure for any team size, so its chest isn't scaled.
+            self.chest_scale = 1.0 if self.task == "blueprint" else n / 3
+        if isinstance(self.chest_scale, bool) or not isinstance(self.chest_scale, (int, float)) \
+                or not self.chest_scale > 0:
+            raise ValueError(f"chest_scale must be a number > 0, got {self.chest_scale!r}")
+        self.chest_scale = float(self.chest_scale)
         if len(set(self.agents)) != len(self.agents):
             raise ValueError(f"agent ids must be unique: {self.agents}")
         if min(self.width, self.depth, self.height) < 2:
@@ -147,6 +170,22 @@ class Config:
                 if feet in bodies or head in bodies:
                     raise ValueError(f"start positions overlap at {p}")
                 bodies |= {feet, head}
+        if self.models is not None:
+            if not isinstance(self.models, dict):
+                raise ValueError("models must be a dict of agent id -> model name")
+            self.models = dict(self.models)
+            unknown = sorted(set(self.models) - set(self.agents))
+            if unknown:
+                raise ValueError(f"models has unknown agent ids {unknown}; agents: {self.agents}")
+            if not all(isinstance(m, str) and m for m in self.models.values()):
+                raise ValueError("models values must be non-empty strings")
+        if self.run_meta is not None:
+            if not isinstance(self.run_meta, dict):
+                raise ValueError("run_meta must be a dict")
+            try:
+                json.dumps(self.run_meta)
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"run_meta must be JSON-serializable: {e}") from None
 
     def in_bounds(self, c: Iterable[int]) -> bool:
         x, y, z = c
@@ -212,6 +251,11 @@ def ray_cells(start: tuple[float, float, float], target: Pos) -> list[Pos]:
     return out
 
 
+def scale_count(n: int, scale: float) -> int:
+    """Chest count for one block type scaled by `chest_scale`: rounded up, zero stays zero."""
+    return math.ceil(round(n * scale, 9)) if n > 0 else 0
+
+
 class World:
     """One live, embodied episode. Any agent may call `act` at any time; each call is atomic."""
 
@@ -228,7 +272,8 @@ class World:
         self.agents: list[str] = list(config.agents)
         self.chest_pos: Pos = tuple(config.chest_pos)  # type: ignore[assignment]
         self.blocks: dict[Pos, Block] = {}
-        self.chest: dict[str, int] = {t: int(self.task.chest_counts(config.scarcity).get(t, 0))
+        base = self.task.chest_counts(config.scarcity)
+        self.chest: dict[str, int] = {t: scale_count(int(base.get(t, 0)), config.chest_scale)  # type: ignore[arg-type]
                                       for t in BLOCK_TYPES}
         self.inventories: dict[str, dict[str, int]] = {a: {} for a in self.agents}
         self.notes: dict[str, list[str]] = {a: [] for a in self.agents}
@@ -242,6 +287,7 @@ class World:
         self._chest_seen: dict[str, dict | None] = {a: None for a in self.agents}
         self._last_action_t: dict[str, float | None] = {a: None for a in self.agents}
         self._lock = threading.RLock()
+        self._changed = threading.Condition(self._lock)  # notified on every committed event and at the end
         self._t = 0.0
         self._next_event_id = 0
         self._snapshot_seq = 0
@@ -322,7 +368,13 @@ class World:
             return self._done
 
     def finish(self, reason: str) -> None:
-        """End the episode: final snapshot, then `episode_end`. Only the first call has effect."""
+        """End the episode: final snapshot, then `episode_end`. Only the first call has effect.
+
+        `reason` is one of END_REASONS: all_done, time_limit, action_limit (set by the engine),
+        aborted, budget (the orchestrator's spending limit) or error (an orchestrator failure).
+        """
+        if reason not in END_REASONS:
+            raise ValueError(f"unknown end reason {reason!r}; known: {END_REASONS}")
         with self._lock:
             if self._done:
                 return
@@ -332,6 +384,57 @@ class World:
             self._write_snapshot(t)
             self.recorder.write({"type": "episode_end", "t": t, "reason": reason, **self.scores(),
                                  "actions_used": dict(self.actions_used)})
+            self._changed.notify_all()
+
+    # ------------------------------------------------------------------ orchestrator hooks
+
+    def record(self, record: dict) -> None:
+        """Write an extra log record (e.g. `{"type": "model_call", ...}`) in file order with events.
+
+        Thread-safe (same lock as events). Adds `t` (current episode time) if missing. Does
+        nothing once the episode has ended. Engine record types (header, event, snapshot,
+        episode_end) are refused with ValueError, since they would break replay.
+        """
+        if not isinstance(record, dict) or not isinstance(record.get("type"), str):
+            raise ValueError("record must be a dict with a string 'type'")
+        if record["type"] in ENGINE_RECORD_TYPES:
+            raise ValueError(f"record type {record['type']!r} is reserved for the engine")
+        with self._lock:
+            if self._done:
+                return
+            rec = dict(record)
+            if "t" not in rec:
+                rec["t"] = self.now()
+            self.recorder.write(rec)
+
+    def last_event_id(self) -> int:
+        """Id of the latest committed event (-1 if none yet)."""
+        with self._lock:
+            return self._next_event_id - 1
+
+    def wait_for_change(self, agent: str, since_event_id: int, timeout_s: float) -> int:
+        """Block until an event with id > `since_event_id` exists, `timeout_s` (wall seconds)
+        passes, or the episode ends; return the latest event id.
+
+        Any agent's event counts (including `agent`'s own). With a simulated clock nothing can
+        happen while the caller blocks, so this returns immediately. With a wall clock, the wait
+        is also cut short at `max_seconds`, when the episode is ended for the time limit.
+        """
+        if agent not in self.inventories:
+            raise ValueError(f"unknown agent {agent!r}")
+        with self._changed:
+            if getattr(self.clock, "kind", "wall") == "simulated":
+                return self._next_event_id - 1
+            deadline = time.monotonic() + max(0.0, float(timeout_s))
+            while not self._done and self._next_event_id - 1 <= since_event_id:
+                if self.check_end():  # e.g. the time limit passed while waiting
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                to_limit = max(0.0, self.config.max_seconds - self.clock.now())
+                self._changed.wait(min(remaining, to_limit + 0.002))
+            return self._next_event_id - 1
 
     # ------------------------------------------------------------------ state
 
@@ -510,8 +613,9 @@ class World:
 
         Blocks and agents within view_radius of the eyes (and in sight, with view_occlusion);
         chest counts only while within reach of the chest, else the counts last seen.
-        Messages are public ones plus private ones to/from `agent`; with `since_event_id`,
-        only those with a larger event_id. `last_event_id` can be passed back next time.
+        Messages are public ones, private ones to/from `agent`, and system notices about
+        finished votes (channel "system", from/to null); with `since_event_id`, only those with
+        a larger event_id. `last_event_id` can be passed back next time.
         """
         if agent not in self.inventories:
             raise ValueError(f"unknown agent {agent!r}")
@@ -564,7 +668,7 @@ class World:
                 "blocks": blocks,
                 "agents_visible": others,
                 "messages": [dict(m) for m in self.messages
-                             if (m["channel"] == "public" or agent in (m["from"], m["to"]))
+                             if (m["channel"] in ("public", "system") or agent in (m["from"], m["to"]))
                              and (since_event_id is None or m["event_id"] > since_event_id)],
                 "last_event_id": self._next_event_id - 1,
                 "notes": list(self.notes[agent]),
@@ -596,7 +700,7 @@ class World:
 
     def _apply(self, agent: str, tool: str, args: dict, t: float) -> ToolResult:
         cost, spec = TOOLS.get(tool, ("action", ()))
-        diff: dict = {"grid": [], "chest": {}, "inventory": {}, "agents": {}}
+        diff: dict = {"grid": [], "chest": {}, "inventory": {}, "agents": {}, "votes": {}}
         chat: dict | None = None
         data: dict | None = None
         ok = False
@@ -614,7 +718,8 @@ class World:
             if cost == "action":
                 self.actions_used[agent] += 1
                 self._last_action_t[agent] = t
-            work: dict = {"grid": [], "chest": {}, "inventory": {}, "agents": {}}
+            work: dict = {"grid": [], "chest": {}, "inventory": {}, "agents": {}, "votes": {}}
+            votes_before = sorted(self.done_votes)
             try:
                 if tool not in TOOLS:
                     raise _Fail(f"unknown tool {tool!r}; tools: {', '.join(TOOLS)}")
@@ -624,6 +729,12 @@ class World:
                 ok, diff = True, work
                 if work["grid"]:
                     self._scores_cache = None
+                    if self.done_votes:
+                        # any change to the build clears every finished vote
+                        self.done_votes.clear()
+                        self._notice(t, f"{agent} changed the build, so all finished votes were cleared")
+                if sorted(self.done_votes) != votes_before:
+                    work["votes"] = {"before": votes_before, "after": sorted(self.done_votes)}
             except _Fail as e:
                 message, chat, data = str(e), None, None
 
@@ -641,6 +752,7 @@ class World:
             "chat": chat,
         })
         self._next_event_id += 1
+        self._changed.notify_all()
         return ToolResult(ok, message, data)
 
     def _validate_args(self, agent: str, tool: str, spec: tuple, args: dict) -> dict:
@@ -866,8 +978,24 @@ class World:
         self.notes[agent].append(text)
         return "noted", None, None
 
+    def _notice(self, t: float, text: str) -> None:
+        """System notice shown to every agent in view() messages (derived from the event, not logged separately)."""
+        self.messages.append({"event_id": self._next_event_id, "t": t, "channel": "system",
+                              "from": None, "to": None, "text": text})
+
+    def _vote_count(self) -> str:
+        return f"{len(self.done_votes)} of {len(self.agents)} votes"
+
     def _tool_declare_done(self, agent: str, work: dict, t: float):
         if agent in self.done_votes:
-            return "you had already declared done", None, None
+            return f"you had already voted that the house is finished ({self._vote_count()})", None, None
         self.done_votes.append(agent)
+        self._notice(t, f"{agent} voted that the house is finished ({self._vote_count()})")
         return f"declared done ({len(self.done_votes)}/{len(self.agents)} votes)", None, None
+
+    def _tool_cancel_done(self, agent: str, work: dict, t: float):
+        if agent not in self.done_votes:
+            return f"you had not voted that the house is finished ({self._vote_count()})", None, None
+        self.done_votes.remove(agent)
+        self._notice(t, f"{agent} withdrew its finished vote ({self._vote_count()})")
+        return f"withdrew your finished vote ({len(self.done_votes)}/{len(self.agents)} votes)", None, None

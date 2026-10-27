@@ -30,6 +30,7 @@ def make_world(positions=None, **kw) -> World:
     kw.setdefault("agents", ["a", "b"])
     kw.setdefault("task", "blueprint")
     kw.setdefault("blueprint", "hut_small")
+    kw.setdefault("chest_scale", 1.0)  # full blueprint counts even with two agents
     if positions is not None or "start_positions" not in kw:
         kw["start_positions"] = positions or [NEAR_CHEST, [5, 3, 0]]
     return World(Config(**kw), clock=SimClock())
@@ -619,11 +620,11 @@ class TestEventShapes(unittest.TestCase):
         w.act("a", "place", x=0, y=0, z=5, type="stone")  # fails
         ev = events(w)
         for e in ev:
-            self.assertEqual(set(e["diff"]), {"grid", "chest", "inventory", "agents"})
+            self.assertEqual(set(e["diff"]), {"grid", "chest", "inventory", "agents", "votes"})
             for k in ("event_id", "t", "agent", "tool", "args", "cost", "ok", "message", "chat"):
                 self.assertIn(k, e)
         take, place, give, remove, deposit, say, whisper, note, bad = ev
-        self.assertEqual(take["diff"], {"grid": [], "chest": {"stone": -2}, "inventory": {"a": {"stone": 2}},
+        self.assertEqual(take["diff"], {"grid": [], "chest": {"stone": -2}, "inventory": {"a": {"stone": 2}}, "votes": {},
                                         "agents": {}})
         self.assertEqual(place["diff"]["grid"], [{"pos": [11, 2, 0], "before": None,
                                                  "after": {"type": "stone", "placed_by": "a", "placed_at": 0.0}}])
@@ -633,7 +634,7 @@ class TestEventShapes(unittest.TestCase):
         self.assertEqual(say["chat"], {"channel": "public", "from": "a", "to": None, "text": "hi all"})
         self.assertEqual(whisper["chat"], {"channel": "private", "from": "a", "to": "b", "text": "psst"})
         self.assertEqual((note["args"], note["cost"], note["chat"]), ({"text": "remember"}, "free", None))
-        self.assertEqual(bad["diff"], {"grid": [], "chest": {}, "inventory": {}, "agents": {}})
+        self.assertEqual(bad["diff"], {"grid": [], "chest": {}, "inventory": {}, "agents": {}, "votes": {}})
         replay(w.recorder.records)
 
 
@@ -734,6 +735,326 @@ class TestScripted(unittest.TestCase):
             return run_simulated(World(cfg, clock=SimClock())).recorder.records
         self.assertEqual(run(3), run(3))
         self.assertNotEqual(run(3), run(4))
+
+
+class TestVotes(unittest.TestCase):
+    def setUp(self):
+        # a by the chest, b and c close enough to reach (11, 2, 0) and each other
+        self.w = make_world(positions=[NEAR_CHEST, [11, 4, 0], [10, 3, 0]], agents=["a", "b", "c"])
+        w = self.w
+        w.act("a", "take", type="stone", n=6)
+        w.act("a", "give", to="b", type="stone", n=3)
+        w.act("a", "give", to="c", type="stone", n=3)
+
+    def votes(self, i=-1):
+        return events(self.w)[i]["diff"]["votes"]
+
+    def test_add_cancel_and_noops(self):
+        w = self.w
+        self.assertTrue(w.act("a", "declare_done").ok)
+        self.assertEqual(self.votes(), {"before": [], "after": ["a"]})
+        self.assertTrue(w.act("a", "declare_done").ok)  # already voted: no change
+        self.assertEqual(self.votes(), {})
+        self.assertTrue(w.act("b", "declare_done").ok)
+        self.assertEqual(self.votes(), {"before": ["a"], "after": ["a", "b"]})
+        self.assertTrue(w.act("a", "cancel_done").ok)
+        self.assertEqual(self.votes(), {"before": ["a", "b"], "after": ["b"]})
+        self.assertEqual(w.done_votes, ["b"])
+        self.assertTrue(w.act("a", "cancel_done").ok)  # nothing to withdraw: no change
+        self.assertEqual(self.votes(), {})
+        self.assertEqual(events(w)[-1]["cost"], "action")
+        self.assertFalse(w.done)
+        replay(w.recorder.records)
+
+    def test_all_done_needs_every_vote_at_once(self):
+        w = self.w
+        w.act("a", "declare_done")
+        w.act("b", "declare_done")
+        w.act("a", "cancel_done")
+        w.act("c", "declare_done")  # a, b and c have all voted, but never at the same time
+        self.assertFalse(w.done)
+        w.act("a", "declare_done")
+        self.assertEqual(w.end_reason, "all_done")
+        self.assertEqual(records_of(w, "snapshot")[-1]["done_votes"], ["b", "c", "a"])
+        replay(w.recorder.records)
+
+    def test_grid_changes_clear_votes(self):
+        w = self.w
+        for agent, tool, args in (("b", "place", dict(x=11, y=2, z=0, type="stone")),
+                                  ("c", "remove", dict(x=11, y=2, z=0))):
+            w.act("a", "declare_done")
+            w.act("b", "declare_done")
+            r = w.act(agent, tool, **args)
+            self.assertTrue(r.ok, r.message)
+            self.assertEqual(self.votes(), {"before": ["a", "b"], "after": []})
+            self.assertEqual(w.done_votes, [])
+        # failed grid actions and non-grid actions leave votes alone
+        w.act("a", "declare_done")
+        self.assertFalse(w.act("b", "place", x=0, y=0, z=0, type="stone").ok)  # out of reach
+        w.act("b", "move_to", x=10, y=4, z=0)
+        w.act("c", "give", to="a", type="stone", n=1)
+        w.act("c", "say", text="hi")
+        self.assertEqual(w.done_votes, ["a"])
+        replay(w.recorder.records)
+
+    def test_jump_place_clears_votes(self):
+        w = self.w
+        w.act("a", "declare_done")
+        w.act("c", "declare_done")
+        w.act("b", "jump")
+        advance(w, 0.1)
+        r = w.act("b", "place", x=11, y=4, z=0, type="stone")
+        self.assertTrue(r.ok, r.message)
+        self.assertEqual(w.positions["b"], (11, 4, 1))
+        self.assertEqual(self.votes(), {"before": ["a", "c"], "after": []})
+        replay(w.recorder.records)
+
+    def test_vote_diff_on_every_event(self):
+        w = run_simulated(make_world())
+        for e in events(w):
+            self.assertIn("votes", e["diff"])
+            v = e["diff"]["votes"]
+            self.assertTrue(v == {} or (set(v) == {"before", "after"} and v["before"] != v["after"]
+                                        and v["after"] == sorted(v["after"])), v)
+            if not e["ok"]:
+                self.assertEqual(v, {})
+
+    def test_system_notices_in_view(self):
+        w = self.w
+        w.act("a", "say", text="hello")
+        w.act("a", "declare_done")
+        w.act("b", "declare_done")
+        mark = w.view("c")["last_event_id"]
+        w.act("b", "cancel_done")
+        w.act("b", "declare_done")
+        w.act("c", "place", x=11, y=2, z=0, type="stone")
+        w.act("c", "place", x=11, y=1, z=0, type="stone")  # no votes left: no notice
+        msgs = w.view("c")["messages"]
+        self.assertEqual([(m["channel"], m["text"]) for m in msgs], [
+            ("public", "hello"),
+            ("system", "a voted that the house is finished (1 of 3 votes)"),
+            ("system", "b voted that the house is finished (2 of 3 votes)"),
+            ("system", "b withdrew its finished vote (1 of 3 votes)"),
+            ("system", "b voted that the house is finished (2 of 3 votes)"),
+            ("system", "c changed the build, so all finished votes were cleared"),
+        ])
+        ev = {e["event_id"]: e for e in events(w)}
+        for m in msgs:
+            self.assertEqual(m["t"], ev[m["event_id"]]["t"])
+            if m["channel"] == "system":
+                self.assertIsNone(m["from"])
+                self.assertIsNone(m["to"])
+        later = w.view("a", since_event_id=mark)["messages"]
+        self.assertEqual([m["text"] for m in later], [m["text"] for m in msgs[3:]])
+        self.assertEqual(w.view("a", since_event_id=w.view("a")["last_event_id"])["messages"], [])
+
+    def test_replay_detects_tampered_votes(self):
+        w = self.w
+        w.act("a", "declare_done")
+        w.act("b", "place", x=11, y=2, z=0, type="stone")
+        w.finish("aborted")
+        good = json.loads(json.dumps(w.recorder.records))
+        replay(good)
+        for tamper in ("drop_clear", "fake_vote", "missing_key"):
+            records = json.loads(json.dumps(good))
+            evs = [r for r in records if r["type"] == "event"]
+            self.assertEqual([e["tool"] for e in evs[-2:]], ["declare_done", "place"])
+            if tamper == "drop_clear":
+                evs[-1]["diff"]["votes"] = {}
+            elif tamper == "fake_vote":
+                evs[-1]["diff"]["votes"] = {"before": ["a"], "after": ["a", "b"]}
+            else:
+                del evs[0]["diff"]["votes"]
+            with self.assertRaises(AssertionError, msg=tamper):
+                replay(records)
+
+    def test_legacy_logs_without_vote_diff(self):
+        w = self.w
+        w.act("a", "declare_done")
+        w.act("b", "say", text="hi")
+        w.finish("aborted")
+        records = json.loads(json.dumps(w.recorder.records))
+        for r in records:
+            if r["type"] == "event":
+                del r["diff"]["votes"]
+        self.assertEqual(replay(records)["done_votes"], ["a"])
+
+    def test_scripted_bot_revotes_after_clear(self):
+        w = make_world(positions=[NEAR_CHEST, [11, 4, 0]])
+        bot = ScriptedBuilder()
+        mem = bot.memory("a")
+        w.act("a", "declare_done")
+        mem.declared = True
+        self.assertTrue(bot.step(w, "a"))  # still voted: waits, no call
+        self.assertEqual(len(events(w)), 1)
+        w.inventories["b"] = {"stone": 1}
+        w.act("b", "place", x=11, y=2, z=0, type="stone")  # clears a's vote
+        bot.step(w, "a")
+        self.assertFalse(mem.declared)  # will vote again once it believes it is finished
+
+
+class TestHooks(unittest.TestCase):
+    def test_record_order_and_t(self):
+        w = make_world()
+        advance(w, 1.5)
+        w.act("a", "observe")
+        w.record({"type": "model_call", "agent": "a", "call_id": "c1"})
+        w.record({"type": "model_call", "agent": "b", "t": 0.25})
+        recs = w.recorder.records
+        self.assertEqual(recs[-2], {"type": "model_call", "agent": "a", "call_id": "c1", "t": 1.5})
+        self.assertEqual(recs[-1]["t"], 0.25)  # given t is kept
+        for bad in ({"type": "event"}, {"type": "header"}, {"no": "type"}, "x"):
+            with self.assertRaises(ValueError):
+                w.record(bad)
+        w.finish("aborted")
+        n = len(recs)
+        w.record({"type": "model_call"})  # after the end: ignored
+        self.assertEqual(len(recs), n)
+        replay(recs)
+
+    def test_record_under_threads(self):
+        agents = [f"agent_{i}" for i in range(8)]
+        w = World(Config(agents=agents, max_actions_per_agent=10_000), clock=WallClock())
+        barrier = threading.Barrier(len(agents))
+
+        def run(agent: str) -> None:
+            barrier.wait()
+            for i in range(50):
+                w.act(agent, "observe")
+                w.record({"type": "model_call", "agent": agent, "call_id": f"{agent}-{i}"})
+
+        threads = [threading.Thread(target=run, args=(a,)) for a in agents]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        w.finish("aborted")
+        recs = w.recorder.records
+        calls = [r for r in recs if r["type"] == "model_call"]
+        self.assertEqual(len(calls), 8 * 50)
+        ts = [r["t"] for r in recs[1:]]
+        self.assertEqual(ts, sorted(ts))  # one file order, time never goes back
+        for a in agents:  # each agent's own calls come after its own observe, in order
+            mine = [r for r in recs if r.get("agent") == a]
+            self.assertEqual([r["type"] for r in mine], ["event", "model_call"] * 50)
+            self.assertEqual([r["call_id"] for r in mine if r["type"] == "model_call"],
+                             [f"{a}-{i}" for i in range(50)])
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "ep.jsonl"
+            rec = Recorder(path)
+            w2 = World(Config(agents=["a"]), rec, clock=SimClock())
+            w2.record({"type": "model_call", "agent": "a"})
+            w2.act("a", "observe")
+            w2.finish("budget")
+            rec.close()
+            self.assertEqual([r["type"] for r in load_log(path)],
+                             ["header", "model_call", "snapshot", "event", "snapshot", "episode_end"])
+            replay(load_log(path))
+
+    def test_models_and_run_meta(self):
+        cfg = Config(agents=["a", "b"], models={"a": "x/model-1", "b": "y/model-2"},
+                     run_meta={"run_id": "r1", "prompt_version": 3})
+        h = World(cfg, clock=SimClock()).recorder.records[0]
+        self.assertEqual(h["config"]["models"], {"a": "x/model-1", "b": "y/model-2"})
+        self.assertEqual(h["config"]["run_meta"], {"run_id": "r1", "prompt_version": 3})
+        h = World(Config(), clock=SimClock()).recorder.records[0]
+        self.assertIsNone(h["config"]["models"])
+        self.assertIsNone(h["config"]["run_meta"])
+        Config(agents=["a", "b"], models={"a": "m"})  # a subset is fine
+        for bad in ({"models": {"ghost": "m"}}, {"models": {"a": ""}}, {"models": ["m"]},
+                    {"run_meta": "x"}, {"run_meta": {"f": object()}}):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                Config(agents=["a", "b"], **bad)
+
+    def test_finish_reasons(self):
+        for reason in ("budget", "error", "aborted"):
+            w = make_world()
+            w.finish(reason)
+            self.assertEqual(records_of(w, "episode_end")[0]["reason"], reason)
+            replay(w.recorder.records)
+        with self.assertRaises(ValueError):
+            make_world().finish("bored")
+
+    def test_wait_for_change_sim_clock_returns_now(self):
+        w = make_world()
+        w.act("a", "observe")
+        self.assertEqual(w.wait_for_change("b", 0, 100.0), 0)
+        self.assertEqual(w.wait_for_change("b", -1, 100.0), 0)
+        with self.assertRaises(ValueError):
+            w.wait_for_change("ghost", -1, 0.1)
+
+    def test_wait_for_change_wakes_and_times_out(self):
+        import time
+        w = World(Config(agents=["a", "b"]), clock=WallClock())
+        w.act("a", "observe")
+        t0 = time.monotonic()
+        self.assertEqual(w.wait_for_change("b", 0, 0.2), 0)  # nothing new: times out
+        self.assertGreaterEqual(time.monotonic() - t0, 0.19)
+        self.assertEqual(w.wait_for_change("b", -1, 5.0), 0)  # already newer: immediate
+        timer = threading.Timer(0.1, lambda: w.act("a", "say", text="wake up"))
+        timer.start()
+        t0 = time.monotonic()
+        self.assertEqual(w.wait_for_change("b", 0, 5.0), 1)
+        self.assertLess(time.monotonic() - t0, 2.0)
+        timer.join()
+        threading.Timer(0.1, lambda: w.finish("error")).start()
+        t0 = time.monotonic()
+        self.assertEqual(w.wait_for_change("b", 1, 5.0), 1)  # the end wakes it too
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertEqual(w.end_reason, "error")
+
+    def test_wait_for_change_stops_at_time_limit(self):
+        import time
+        w = World(Config(agents=["a"], max_seconds=0.2), clock=WallClock())
+        t0 = time.monotonic()
+        w.wait_for_change("a", -1, 5.0)
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertEqual(w.end_reason, "time_limit")
+
+
+class TestTeamSize(unittest.TestCase):
+    def test_defaults_scale_with_agents(self):
+        base = World(Config(), clock=SimClock())
+        for n in (1, 2, 3, 5, 8, 16):
+            agents = [f"agent_{i}" for i in range(1, n + 1)]
+            for task in ("open", "blueprint"):
+                w = World(Config(agents=agents, task=task), clock=SimClock())
+                scale = 1.0 if task == "blueprint" else n / 3
+                self.assertEqual(w.config.target_interior, 4 * n)
+                self.assertAlmostEqual(w.config.chest_scale, scale)
+                for t, k in base.chest.items():
+                    self.assertEqual(w.chest[t], math.ceil(round(k * scale, 9)) if k else 0, (n, t))
+                h = w.recorder.records[0]
+                self.assertEqual(h["config"]["target_interior"], 4 * n)
+                self.assertAlmostEqual(h["config"]["chest_scale"], scale)
+                pos = list(w.positions.values())
+                self.assertEqual(len(set(pos)), n)
+                bodies = set()
+                for a, p in w.positions.items():
+                    self.assertTrue(w.standable(p, a), (n, p))
+                    bodies |= {p, (p[0], p[1], p[2] + 1)}
+                self.assertEqual(len(bodies), 2 * n)
+                replay(w.recorder.records)
+        self.assertEqual(base.chest, World(Config(chest_scale=1.0), clock=SimClock()).chest)
+
+    def test_explicit_values_and_limits(self):
+        w = World(Config(agents=["a", "b"], target_interior=12, chest_scale=1.0), clock=SimClock())
+        self.assertEqual(w.config.target_interior, 12)
+        self.assertEqual(w.chest, World(Config(), clock=SimClock()).chest)
+        self.assertEqual(sum(World(Config(chest_scale=2), clock=SimClock()).chest.values()),
+                         2 * sum(w.chest.values()))
+        for bad in ({"agents": [f"x{i}" for i in range(17)]}, {"chest_scale": 0}, {"chest_scale": -1},
+                    {"chest_scale": "big"}, {"target_interior": 0}):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                Config(**bad)
+
+    def test_scripted_five_agents_open_house(self):
+        agents = [f"agent_{i}" for i in range(1, 6)]
+        w = run_simulated(World(Config(agents=agents, max_seconds=900), clock=SimClock()))
+        replay(w.recorder.records)
+        self.assertEqual(w.end_reason, "all_done")
+        self.assertEqual(w.scores()["team_score"], 1.0)
+        self.assertEqual(w.scores()["score_details"]["target_interior"], 20)
 
 
 if __name__ == "__main__":

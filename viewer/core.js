@@ -20,7 +20,8 @@
  *     builder.built = {states, bp, task, agents, mismatches, verified, snapshotCount, snapsAtPos}
  *       states[p]  = state after the first p events (states[0] = start):
  *                    {grid: Map<key,{type,placed_by,placed_at|placed_at_round}>, chest: {type:n},
- *                     inv: {agent:{type:n}}, votes: [agent], actions: {agent:n},
+ *                     inv: {agent:{type:n}}, votes: [agent] (from diff.votes.after; older logs
+ *                     without diff.votes: every successful declare_done adds), actions: {agent:n},
  *                     positions: {agent:[x,y,z]}, moves: {agent: last diff.agents entry (+ landZ/raiseAt
  *                     when a block was placed under a jumping agent)}, stats: see scoring below}
  *       bp         = Map<key, type> of blueprint cells (empty for open tasks)
@@ -49,7 +50,8 @@
  *
  * ── Presentation helpers (no DOM) ─────────────────────────────────────────────────────────────
  * describeEvent(event) -> short text for feeds ("place stone at (4, 5, 0)", "walks to (…) (1.9 s)",
- *     "jumps", "places wood under itself at …", "remove … — agent_1 fell 1", ...)
+ *     "jumps", "places wood under itself at …", "remove … — agent_1 fell 1", "votes the house is finished
+ *     (2 votes)", "withdraws its finished vote (1 vote)", "place … — finished votes cleared", ...)
  * typeColor(type) -> '#rrggbb' (fixed palette for known block types, stable hash colour otherwise)
  * agentColors(agents) -> {agent: '#rrggbb'} in order (8-colour palette, repeats after 8)
  * TYPE_COLORS, AGENT_COLORS, HOP_HEIGHT, key(x, y, z)
@@ -272,7 +274,12 @@ function createLogBuilder() {
     // failed calls while walking / airborne "use nothing up" (log v3); every other action-cost call counts, even failed ones
     const walkingFail = !e.ok && typeof e.message === 'string' && /^(walking|airborne):/.test(e.message);
     if (e.cost === 'action' && !walkingFail) actions = { ...actions, [e.agent]: (actions[e.agent] || 0) + 1 };
-    if (e.tool === 'declare_done' && e.ok && !votes.includes(e.agent)) votes = [...votes, e.agent];
+    if (d.votes && typeof d.votes === 'object') {
+      // finished votes as logged (declare_done adds, cancel_done removes, any build change clears all)
+      if (Array.isArray(d.votes.after)) votes = [...d.votes.after];
+    } else if (e.tool === 'declare_done' && e.ok && !votes.includes(e.agent)) {
+      votes = [...votes, e.agent]; // older logs without diff.votes: votes only ever accumulate
+    }
     cur = { grid, chest, inv, votes, actions, positions, moves };
     pushState();
   }
@@ -421,6 +428,20 @@ function describeEvent(e) {
   const a = e.args || {};
   const pos = ('x' in a) ? `(${a.x}, ${a.y}, ${a.z})` : '';
   const target = a.agent ?? a.to ?? a.target ?? a.recipient;
+  return describeAction(e, a, pos, target) + votesCleared(e);
+}
+/** " (n votes)" after a vote change, from diff.votes (log v3 with votes; empty otherwise). */
+function voteCount(e) {
+  const v = e.diff && e.diff.votes;
+  return v && Array.isArray(v.after) ? ` (${v.after.length} vote${v.after.length === 1 ? '' : 's'})` : '';
+}
+/** " — finished votes cleared" when a change to the build wiped the votes. */
+function votesCleared(e) {
+  const v = e.diff && e.diff.votes;
+  return v && Array.isArray(v.before) && v.before.length && Array.isArray(v.after) && !v.after.length
+    && e.tool !== 'cancel_done' ? ' — finished votes cleared' : '';
+}
+function describeAction(e, a, pos, target) {
   switch (e.tool) {
     case 'place': {
       const m = e.diff.agents && e.diff.agents[e.agent];
@@ -447,7 +468,8 @@ function describeEvent(e) {
       return `walks to ${to ? '(' + to.join(', ') + ')' : JSON.stringify(a)}` + (m && typeof m.arrive_t === 'number' && typeof m.depart_t === 'number' ? ` (${(m.arrive_t - m.depart_t).toFixed(1)} s)` : '');
     }
     case 'observe': return 'observes';
-    case 'declare_done': return 'declares done';
+    case 'declare_done': return 'votes the house is finished' + voteCount(e);
+    case 'cancel_done': return 'withdraws its finished vote' + voteCount(e);
     default: return `${e.tool} ${Object.keys(a).length ? JSON.stringify(a) : ''}`;
   }
 }
