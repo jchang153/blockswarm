@@ -27,11 +27,12 @@ python3 scripts/run_demo.py
 Watch an episode in 3D in your browser:
 
 ```bash
-python3 scripts/serve_viewer.py runs/demo/house_exact.jsonl
+python3 scripts/serve_viewer.py runs/demo/open_house_exact.jsonl
 ```
 
 In the viewer: drag to orbit, scroll to zoom, space to play/pause, ←/→ to step through
-events. You can also open `viewer/index.html` directly and drag a `.jsonl` log onto it.
+events. Once it's open you can also drag any `.jsonl` log onto the page. To watch an episode
+while it runs, add `--follow` (see docs/vm.md for watching runs on the VM).
 
 ## Layout
 
@@ -41,7 +42,7 @@ events. You can also open `viewer/index.html` directly and drag a `.jsonl` log o
 | `blockswarm/blueprints.py` | Target structures (`hut_small`, `house`) |
 | `blockswarm/scripted.py` | A scripted, honest builder policy (baseline and test agent) |
 | `blockswarm/replay.py` | Rebuilds state from a log and checks it against snapshots |
-| `viewer/index.html` | 3D replay viewer (static page, three.js) |
+| `viewer/index.html`, `viewer/core.js` | 3D replay viewer with live follow (static page, three.js); core.js holds the shared log/state/scoring logic |
 | `scripts/` | Demo runner and viewer server |
 | `runs/` | Episode logs (not committed) |
 
