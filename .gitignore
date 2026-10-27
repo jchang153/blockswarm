@@ -5,3 +5,5 @@ __pycache__/
 logs/
 runs/
 .DS_Store
+site/
+site_data/

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BlockSwarm Builds</title>
+<meta name="description" content="Replays of LLM agents with bodies building a house together in a shared block world.">
+<link rel="icon" href="img/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/site.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="./"><span class="logo" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span id="siteTitle">BlockSwarm</span></a>
+  <nav>
+    <a href="./" aria-current="page">Builds</a>
+    <a href="about.html">About</a>
+    <button id="themeBtn" class="icon" type="button">◐</button>
+  </nav>
+</header>
+
+<main>
+  <section class="hero">
+    <h1 id="heroTitle">BlockSwarm</h1>
+    <p id="heroSub">Teams of LLM agents walk, carry blocks from a shared chest and talk to each other while they build a house in a small block world. Pick a run to watch the replay.</p>
+  </section>
+
+  <div class="toolbar" role="search">
+    <label>Task <select id="fTask"><option value="">All</option></select></label>
+    <label>Model <select id="fModel"><option value="">All</option></select></label>
+    <label>Sort <select id="fSort">
+      <option value="score">Highest score</option>
+      <option value="date">Newest</option>
+      <option value="duration">Longest</option>
+      <option value="duration-asc">Shortest</option>
+    </select></label>
+    <span class="count" id="count" aria-live="polite"></span>
+  </div>
+
+  <div class="grid" id="grid"></div>
+  <div class="empty" id="empty" hidden></div>
+</main>
+
+<footer class="site">
+  <span id="footGen"></span> Replays are reconstructed in your browser from the exact event logs. <a href="about.html">How to read a replay</a>.
+</footer>
+
+<script type="module" src="js/gallery.js"></script>
+</body>
+</html>

@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BlockSwarm Replay</title>
+<meta name="description" content="Replay of a BlockSwarm episode: LLM agents building together in a block world.">
+<link rel="icon" href="img/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/site.css">
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body class="replay">
+<header class="topbar">
+  <div class="ep-head">
+    <a class="back" href="./" title="Back to all builds">← <span class="hide-xs">Builds</span></a>
+    <h1 id="title">Loading…</h1>
+    <span id="liveScore" class="livescore" hidden title="Team score at the playhead (recomputed from the blocks)"></span>
+  </div>
+  <nav>
+    <a class="hide-sm" href="about.html">About</a>
+    <button id="themeBtn" class="icon" type="button">◐</button>
+  </nav>
+</header>
+
+<div class="layout">
+  <section class="stage" aria-label="Replay">
+    <div class="scene" id="scene">
+      <details class="overlay glass-card brief" id="brief" hidden><summary id="briefSum">Brief</summary><div class="txt" id="briefTxt"></div><div class="facts chips" id="facts"></div></details>
+      <div class="overlay viewbtns">
+        <button id="bInterior" type="button" aria-pressed="false" title="Highlight the enclosed interior (I)">Interior</button>
+        <button id="bNames" type="button" aria-pressed="true" title="Name tags and speech bubbles (N)">Names</button>
+        <button id="bOrbit" type="button" aria-pressed="false" title="Slowly orbit the camera (O)">Orbit</button>
+        <button id="bCam" type="button" title="Reset the camera (R)">Reset view</button>
+      </div>
+      <div class="bubble-layer" id="bubbles" aria-hidden="true"></div>
+      <div class="loading" id="loading">Loading replay…</div>
+      <div class="results" id="results">
+        <div class="card" role="dialog" aria-modal="false" aria-labelledby="resTitle" id="resCard"></div>
+      </div>
+      <div class="overlay glass-card kbd-help" id="kbdHelp" role="note">
+        <table>
+          <tr><td><kbd>Space</kbd></td><td>play / pause</td></tr>
+          <tr><td><kbd>←</kbd> <kbd>→</kbd></td><td>back / forward 5 s</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>←</kbd> <kbd>→</kbd></td><td>previous / next event</td></tr>
+          <tr><td><kbd>Home</kbd> <kbd>End</kbd></td><td>start / end</td></tr>
+          <tr><td><kbd>1</kbd>–<kbd>5</kbd></td><td>speed 1× 2× 5× 10× 30×</td></tr>
+          <tr><td><kbd>I</kbd> <kbd>N</kbd> <kbd>O</kbd> <kbd>R</kbd></td><td>interior · names · orbit · reset view</td></tr>
+          <tr><td><kbd>L</kbd></td><td>copy link to this moment</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="transport">
+      <div class="row">
+        <button id="play" class="primary" type="button" title="Play / pause (Space)">Play</button>
+        <div class="speed" id="speed" role="group" aria-label="Playback speed"></div>
+        <span class="time" id="time">0:00.0 / 0:00.0</span>
+        <span class="spacer"></span>
+        <button id="bResults" type="button">Results</button>
+        <button id="bLink" type="button" title="Copy a link to this moment (L)">Copy link</button>
+        <button id="bKeys" class="icon kbd-hint" type="button" title="Keyboard shortcuts" aria-label="Keyboard shortcuts" aria-pressed="false">?</button>
+      </div>
+      <div class="strip-wrap">
+        <canvas id="strip" tabindex="0" role="slider" aria-label="Timeline" aria-valuemin="0"></canvas>
+        <div class="strip-tip" id="stripTip"></div>
+      </div>
+    </div>
+  </section>
+
+  <aside class="side" aria-label="Team, chat and events">
+    <div class="panel-sec"><h2>Team</h2><div class="agents-row" id="agents"></div></div>
+    <div class="panel-sec chat-sec">
+      <h2>Chat <span class="muted" id="chatCount" style="text-transform:none;letter-spacing:0;font-weight:500"></span>
+        <label title="Show agents' private notes to themselves"><input type="checkbox" id="optNotes"> notes</label></h2>
+      <div id="chat"></div>
+    </div>
+    <div class="panel-sec ticker-sec"><h2>Who did what</h2><ul id="ticker"></ul></div>
+  </aside>
+</div>
+
+<script type="module" src="js/episode.js"></script>
+</body>
+</html>

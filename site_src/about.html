@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>About BlockSwarm</title>
+<meta name="description" content="What BlockSwarm is and how to read a replay.">
+<link rel="icon" href="img/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/site.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="./"><span class="logo" aria-hidden="true"><i></i><i></i><i></i><i></i></span>BlockSwarm</a>
+  <nav>
+    <a href="./">Builds</a>
+    <a href="about.html" aria-current="page">About</a>
+    <button id="themeBtn" class="icon" type="button">◐</button>
+  </nav>
+</header>
+
+<main class="prose">
+  <h1>About BlockSwarm</h1>
+  <p>BlockSwarm is a small research environment for studying how several LLM agents work together
+  on a shared building task. It is a Minecraft-like 3D grid world (by default 16 × 16 × 8 cells),
+  but much simpler: no mobs, no crafting, no gathering, only blocks, a chest and the agents.</p>
+
+  <p class="todo"><b>TODO (authors):</b> author names, affiliation, contact, paper or preprint link, citation, and licence for the code and the published logs.</p>
+
+  <h2>The environment</h2>
+  <p>Each agent has a body. It stands in a cell, walks along paths at walking speed, can jump, and
+  can only reach blocks within a few cells of its eyes (with a clear line of sight). Agents take
+  blocks from one <b>shared chest</b> with a limited supply, place and remove blocks, and talk to each
+  other with public messages or private whispers. They act live and at the same time; there are
+  no turns. The world applies every request in arrival order and logs it.</p>
+  <p>Agents see the world as text (nearby blocks and agents with coordinates), not as images. The 3D
+  view on this site is only a rendering of the log for people.</p>
+
+  <h2>The task</h2>
+  <p>In the <b>open</b> task all agents get the same short brief, for example: build a house that all
+  of you could live in, fully enclosed, with a door, windows and a roof, and agree on a design
+  together. There is no blueprint, so the agents have to decide the size, the layout and who does
+  what. In the <b>blueprint</b> task (used for calibration) they copy a fixed design instead.</p>
+  <p>Open-task builds are scored automatically from the final blocks:</p>
+  <table>
+    <tr><th>Check</th><th>Points</th></tr>
+    <tr><td>An enclosed interior (empty cells that outside air cannot reach)</td><td>0.50 (otherwise the score is 0)</td></tr>
+    <tr><td>A door touching both the interior and the outside</td><td>+0.20</td></tr>
+    <tr><td>Windows (glass touching both), up to two</td><td>+0.15</td></tr>
+    <tr><td>Interior size relative to a target (12 cells by default)</td><td>+0.15</td></tr>
+    <tr><td>Each leftover block that is not part of the house shell</td><td>−0.01</td></tr>
+  </table>
+  <p>This score is a first, mechanical check. It says nothing about whether a house looks good, and
+  a high score does not mean the agents cooperated well. The replay is there so you can judge for
+  yourself.</p>
+
+  <h2>How to read a replay</h2>
+  <ul>
+    <li><b>Scene.</b> Drag to orbit, scroll or pinch to zoom. Each agent wears its own shirt colour and
+    has a name tag; the chest is the shared block supply. Speech bubbles show recent messages.</li>
+    <li><b>Timeline.</b> One lane per agent. Bars are walks, thin ticks are blocks placed (red: removed),
+    dots are messages, brown marks are chest trips, and a wide green mark is a “done” vote. Click or
+    drag to jump to any moment.</li>
+    <li><b>Chat.</b> Messages appear as the playhead reaches them. Private whispers are marked with
+    their recipient; only that agent saw them. Agents' private notes to themselves are hidden unless
+    you tick “notes”.</li>
+    <li><b>Who did what.</b> The most recent actions, including failed ones (for example, out of reach).</li>
+    <li><b>Interior.</b> For open-task runs, the “Interior” button highlights the enclosed air the
+    scorer found at the current moment.</li>
+    <li><b>Results.</b> The final score breakdown and per-agent counts appear at the end.</li>
+  </ul>
+  <p>Keyboard: Space play/pause, ←/→ 5 seconds, Shift+←/→ one event, 1–5 speed, L copy a link to the current moment.</p>
+
+  <h2>What the replays are</h2>
+  <p>Every replay is rebuilt in your browser from the episode's event log, which records every
+  tool call, its result and its exact effect on the world. Times are episode seconds. Raw model
+  inputs and outputs are not included in the published logs.</p>
+  <p class="todo"><b>TODO (authors):</b> which models were used and how (provider, settings), how runs were selected for this page, and a link to the full dataset.</p>
+</main>
+
+<footer class="site">BlockSwarm · research prototype</footer>
+<script type="module">import { initTheme } from './js/ui.js'; initTheme();</script>
+</body>
+</html>
