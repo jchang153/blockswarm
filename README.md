@@ -38,14 +38,18 @@ while it runs, add `--follow` (see docs/vm.md for watching runs on the VM).
 
 | Path | What |
 | --- | --- |
-| `blockswarm/world.py` | The world: grid, chest, inventories, tools, rules, scoring, logging |
-| `blockswarm/blueprints.py` | Target structures (`hut_small`, `house`) |
+| `blockswarm/world.py` | The world: grid, chest, bodies, walking, jumping, reach and line of sight, tools, logging |
+| `blockswarm/tasks.py` | Scoring: open-ended house (default) and exact blueprint |
+| `blockswarm/pathing.py` | Where agents can stand and how they walk |
+| `blockswarm/live.py`, `blockswarm/clock.py` | Running agents concurrently on wall-clock or simulated time |
+| `blockswarm/blueprints.py` | Reference designs (`hut_small`, `house`): chest sizing, blueprint mode, scripted bots |
 | `blockswarm/scripted.py` | A scripted, honest builder policy (baseline and test agent) |
 | `blockswarm/replay.py` | Rebuilds state from a log and checks it against snapshots |
 | `viewer/index.html`, `viewer/core.js` | 3D replay viewer with live follow (static page, three.js); core.js holds the shared log/state/scoring logic |
-| `scripts/` | Demo runner and viewer server |
+| `site_src/`, `scripts/export_site.py` | Public gallery site (live at blockswarm.pages.dev) |
+| `scripts/` | Demo runner, viewer server, site export |
 | `runs/` | Episode logs (not committed) |
 
 ## Status
 
-Milestone 1 (engine, scripted demo, viewer). LLM agents via OpenRouter come next.
+Milestone 1 done: embodied live engine, open-ended scoring, scripted demo, 3D viewer with live follow, public gallery. LLM agents via OpenRouter come next.
