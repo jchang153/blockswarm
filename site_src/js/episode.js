@@ -19,7 +19,10 @@ const R = {
   pos: 0, time: 0, tEnd: 1, playing: false, speed: 5,
   showInterior: false, showNames: true, orbit: false, showNotes: false,
   chatItems: [], chatShown: -1, resultsShownAuto: false,
+  sel: null, fadeOthers: true, // sel: Set of agents to show, or null for everyone
 };
+/** Whether an agent passes the agent filter (blocks with no placer always do). */
+const isOn = a => !R.sel || a == null || R.sel.has(a);
 
 // ---------------------------------------------------------------- three.js scene
 const sceneEl = $('scene');
@@ -67,16 +70,19 @@ const cachedTex = c => { if (!texCache.has(c)) texCache.set(c, tex(c)); return t
 
 const matCache = new Map();
 /** Six materials in BoxGeometry face order (+x, -x, +y top, -y bottom, +z south/front, -z north). */
-function blockMaterials(variant) {
-  if (matCache.has(variant)) return matCache.get(variant);
+function blockMaterials(variant, faint = false) {
+  const ck = faint ? variant + '|faint' : variant;
+  if (matCache.has(ck)) return matCache.get(ck);
   const f = blockFaces(variant === '__chest' ? 'chest' : variant);
   const glass = isTransparent(variant);
-  const m = c => new THREE.MeshLambertMaterial(glass
-    ? { map: cachedTex(c), transparent: true, depthWrite: false, side: THREE.DoubleSide }
-    : { map: cachedTex(c) });
+  const m = c => new THREE.MeshLambertMaterial(faint
+    ? { map: cachedTex(c), transparent: true, opacity: 0.16, depthWrite: false }
+    : glass
+      ? { map: cachedTex(c), transparent: true, depthWrite: false, side: THREE.DoubleSide }
+      : { map: cachedTex(c) });
   const side = m(f.side), top = m(f.top), bottom = m(f.bottom);
   const mats = [side, side, top, bottom, f.front ? m(f.front) : side, side];
-  matCache.set(variant, mats);
+  matCache.set(ck, mats);
   return mats;
 }
 
@@ -243,7 +249,7 @@ function updateAvatars(dt) {
   const st = R.built.states[R.pos];
   for (const [a, av] of world.avatars) {
     const p = agentPoseAt(st, a, R.time);
-    if (!p.pos) { av.g.visible = false; continue; }
+    if (!p.pos || !isOn(a)) { av.g.visible = false; continue; }
     av.g.visible = true;
     av.g.position.copy(feetToThree(p.pos[0], p.pos[1], p.pos[2]));
     if (p.facing) av.target = Math.atan2(p.facing[0], -p.facing[1]);
@@ -291,20 +297,30 @@ function refreshBlocks(animate) {
   const st = R.built.states[R.pos];
   const grid = st.grid;
   const typeAt = (x, y, z) => { const b = grid.get(key(x, y, z)); return b && b.type; };
-  for (const [k, obj] of world.blocks) if (!grid.has(k)) { world.root.remove(obj.mesh); world.blocks.delete(k); world.popping.delete(obj); }
+  // agent filter: other agents' blocks are drawn faint, or not at all
+  const shown = b => isOn(b.placed_by) || R.fadeOthers;
+  for (const [k, obj] of world.blocks) {
+    const b = grid.get(k);
+    if (!b || !shown(b)) { world.root.remove(obj.mesh); world.blocks.delete(k); world.popping.delete(obj); }
+  }
   for (const [k, b] of grid) {
+    if (!shown(b)) continue;
     const [x, y, z] = k.split(',').map(Number);
     const variant = isDoor(b.type) ? doorKey(typeAt, x, y, z) : b.type;
+    const faint = !isOn(b.placed_by);
+    const glass = isTransparent(b.type);
     let obj = world.blocks.get(k);
-    if (obj && obj.variant !== variant) { obj.mesh.material = blockMaterials(variant); obj.variant = variant; }
+    if (obj && (obj.variant !== variant || obj.faint !== faint)) {
+      obj.mesh.material = blockMaterials(variant, faint); obj.variant = variant; obj.faint = faint;
+      obj.mesh.castShadow = !glass && !faint; obj.mesh.renderOrder = faint ? 1 : glass ? 2 : 0;
+    }
     if (!obj) {
-      const mesh = new THREE.Mesh(boxGeo, blockMaterials(variant));
+      const mesh = new THREE.Mesh(boxGeo, blockMaterials(variant, faint));
       mesh.position.copy(toThree(x, y, z));
-      const glass = isTransparent(b.type);
-      mesh.castShadow = !glass; mesh.receiveShadow = true;
-      if (glass) mesh.renderOrder = 2;
+      mesh.castShadow = !glass && !faint; mesh.receiveShadow = true;
+      mesh.renderOrder = faint ? 1 : glass ? 2 : 0;
       world.root.add(mesh);
-      obj = { mesh, variant, born: animate ? performance.now() : 0 };
+      obj = { mesh, variant, faint, born: animate ? performance.now() : 0 };
       if (animate) { mesh.scale.setScalar(0.01); world.popping.add(obj); }
       world.blocks.set(k, obj);
     }
@@ -381,7 +397,7 @@ function updateBubbles() {
     for (let i = R.pos - 1; i >= 0; i--) {
       const e = R.log.events[i];
       if (R.time - e.t > window_) break;
-      if (e.chat && !current.has(e.agent)) current.set(e.agent, e);
+      if (e.chat && !current.has(e.agent) && isOn(e.agent)) current.set(e.agent, e);
     }
   }
   const w = sceneEl.clientWidth, h = sceneEl.clientHeight;
@@ -493,6 +509,7 @@ function drawStrip() {
   });
   for (const e of R.log.events) {
     const li = idx.get(e.agent); if (li === undefined) continue;
+    g.globalAlpha = isOn(e.agent) ? 1 : 0.18;
     const y = top + li * lane, x = Math.round(sx(e.t, w)) + 0.5;
     const m = e.diff.agents && e.diff.agents[e.agent];
     if (e.ok && m && typeof m.arrive_t === 'number' && e.tool === 'move_to') {
@@ -508,6 +525,7 @@ function drawStrip() {
     else if (['take', 'deposit', 'give'].includes(e.tool)) { g.fillStyle = '#a8742c'; g.fillRect(x - 1, y + lane - 6, 2, 4); }
     else if (e.tool === 'declare_done') { g.fillStyle = accent; g.fillRect(x - 2, y + 1, 4, lane - 2); }
   }
+  g.globalAlpha = 1;
   // axis
   const span = R.tEnd, steps = [5, 10, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600];
   const stepT = steps.find(s => (w - ST.gutter) / (span / s) > 60) || 3600;
@@ -577,7 +595,7 @@ function renderV4() {
   const dep = atEnd ? new Set(finalResults(R.log).deployed) : null;
   let last = null;
   for (let i = R.pos - 1; i >= 0; i--) { const b = purchaseOf(R.log.events[i]); if (b && b.ok) { last = { ...b, t: R.log.events[i].t }; break; } }
-  const sig = JSON.stringify([bal, lb, atEnd, last && last.t]);
+  const sig = JSON.stringify([bal, lb, atEnd, last && last.t, R.sel && [...R.sel]]);
   if (sig === v4Sig) return;
   v4Sig = sig;
   const pct = start ? Math.max(0, Math.min(1, bal / start)) : 0;
@@ -585,7 +603,7 @@ function renderV4() {
     <div class="wallet-bar${pct < 0.2 ? ' low' : ''}" role="img" aria-label="${bal} of ${start} coins left"><i style="width:${pct * 100}%"></i></div>
     <div class="muted" style="font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${last ? `last: ${esc(agentLabel(last.agent))} bought ${blk(last.item)} ${last.n} × ${esc(itemInfo(last.item).name || last.item)} (−${last.cost})` : 'nothing bought yet'}</div>`;
   const max = Math.max(1, ...lb.map(r => r.score));
-  $('board').innerHTML = lb.map(r => `<li style="--c:${R.colors[r.agent]}"><span class="rk">#${r.rank}</span>
+  $('board').innerHTML = lb.map(r => `<li class="${isOn(r.agent) ? '' : 'off'}" style="--c:${R.colors[r.agent]}"><span class="rk">#${r.rank}</span>
     <span class="who"><i></i>${esc(agentLabel(r.agent))}${dep ? (dep.has(r.agent) ? ' <span class="dep">deployed</span>' : ' <span class="dep no">not deployed</span>') : ''}</span>
     <span class="bar"><i style="width:${r.score / max * 100}%"></i></span><span class="n">${r.score}</span></li>`).join('');
 }
@@ -601,13 +619,103 @@ function renderAgents() {
     const types = Object.entries(inv).filter(([, v]) => v > 0).sort((x, y) => y[1] - x[1]).slice(0, 3);
     return { a, n, state, types };
   });
-  const sig = JSON.stringify(rows);
+  const sig = JSON.stringify([rows, R.sel && [...R.sel]]);
   if (sig === agentsSig) return;
   agentsSig = sig;
-  $('agents').innerHTML = rows.map(({ a, n, state, types }) => `<span class="agent-pill" style="--c:${R.colors[a]}" title="${esc(a)}${R.models[a] ? ' · ' + esc(R.models[a]) : ''}">
+  $('agents').classList.toggle('filtering', !!R.sel);
+  $('agents').innerHTML = rows.map(({ a, n, state, types }) => `<button type="button" class="agent-pill${isOn(a) ? '' : ' off'}" data-agent="${esc(a)}" aria-pressed="${!!R.sel && isOn(a)}" style="--c:${R.colors[a]}" title="${esc(a)}${R.models[a] ? ' · ' + esc(R.models[a]) : ''} · click to filter, double-click to show only this agent">
     <span class="sw"></span>${esc(agentLabel(a))}${R.models[a] ? ` <span class="muted mono" style="font-size:11px">${esc(shortModel(R.models[a]))}</span>` : ''}
-    <span class="hold" title="blocks held">${types.map(([t]) => blk(t)).join('')} ${n}</span>${state ? `<span class="state">${state}</span>` : ''}</span>`).join('');
+    <span class="hold" title="blocks held">${types.map(([t]) => blk(t)).join('')} ${n}</span>${state ? `<span class="state">${state}</span>` : ''}</button>`).join('');
 }
+
+// ---------------------------------------------------------------- agent filter
+/** Show only the agents in `sel` (null or everyone = no filter): bodies, blocks, chat, ticker, timeline. */
+function setSel(sel) {
+  R.sel = sel && sel.size && sel.size < R.agents.length ? sel : null;
+  $('selAll').hidden = !R.sel; $('fadeWrap').hidden = !R.sel;
+  $('selHint').textContent = R.sel ? `Showing ${R.sel.size} of ${R.agents.length} agents` : 'Click agents to show only them · double-click to show just one';
+  if (!R.log) return;
+  refreshBlocks(false); renderAgents(); renderChat(true); renderTicker(); drawStrip();
+  v4Sig = ''; renderV4();
+}
+function toggleAgent(a) {
+  if (!R.sel) return setSel(new Set([a])); // from everyone, the first click starts a selection
+  const s = new Set(R.sel);
+  s.has(a) ? s.delete(a) : s.add(a);
+  setSel(s);
+}
+$('agents').addEventListener('click', ev => { const b = ev.target.closest('[data-agent]'); if (b) toggleAgent(b.dataset.agent); });
+$('agents').addEventListener('dblclick', ev => { const b = ev.target.closest('[data-agent]'); if (b) setSel(new Set([b.dataset.agent])); });
+$('selAll').addEventListener('click', () => setSel(null));
+$('optFade').addEventListener('change', ev => { R.fadeOthers = ev.target.checked; if (R.log) refreshBlocks(false); });
+
+// ---------------------------------------------------------------- panes: collapse, resize, hide (remembered per browser)
+const PANES_KEY = 'bs-panes';
+const panes = (() => { try { return JSON.parse(localStorage.getItem(PANES_KEY)) || {}; } catch { return {}; } })();
+panes.collapsed = panes.collapsed || {};
+function savePanes() { try { localStorage.setItem(PANES_KEY, JSON.stringify(panes)); } catch { /* storage blocked */ } }
+const layoutEl = document.querySelector('.layout'), sideEl = $('side');
+const secs = [...sideEl.querySelectorAll('.panel-sec[data-pane]')];
+function setCollapsed(sec, c) {
+  sec.classList.toggle('collapsed', c);
+  sec.querySelector('.pane-tog').setAttribute('aria-expanded', String(!c));
+  panes.collapsed[sec.dataset.pane] = c;
+}
+for (const sec of secs) {
+  if (panes.collapsed[sec.dataset.pane]) setCollapsed(sec, true);
+  sec.querySelector('.pane-tog').addEventListener('click', () => {
+    setCollapsed(sec, !sec.classList.contains('collapsed'));
+    if (panes.chatMax) setChatMax(false, false);
+    savePanes(); if (R.log) renderChat(true);
+  });
+}
+const sideMin = 260, sideMax = () => Math.max(sideMin, window.innerWidth - 320);
+function setSideW(w) {
+  if (w == null) { layoutEl.style.removeProperty('--side-w'); delete panes.w; return; }
+  panes.w = Math.round(Math.max(sideMin, Math.min(sideMax(), w)));
+  layoutEl.style.setProperty('--side-w', `${panes.w}px`);
+}
+if (panes.w) setSideW(panes.w);
+const handle = $('sideHandle');
+handle.addEventListener('pointerdown', ev => {
+  ev.preventDefault(); handle.setPointerCapture(ev.pointerId); layoutEl.classList.add('resizing');
+  const move = e => setSideW(window.innerWidth - e.clientX);
+  const up = () => { layoutEl.classList.remove('resizing'); handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', up); if (panes.chatMax) setChatMax(false, false); savePanes(); };
+  handle.addEventListener('pointermove', move); handle.addEventListener('pointerup', up);
+});
+handle.addEventListener('dblclick', () => { setSideW(null); savePanes(); });
+handle.addEventListener('keydown', ev => {
+  const d = ev.key === 'ArrowLeft' ? 40 : ev.key === 'ArrowRight' ? -40 : 0;
+  if (!d) return;
+  ev.preventDefault(); ev.stopPropagation(); setSideW(sideEl.offsetWidth + d); savePanes();
+});
+function setPanel(show) {
+  layoutEl.classList.toggle('noside', !show);
+  $('panelBtn').setAttribute('aria-pressed', String(show));
+  panes.hidden = !show; savePanes();
+}
+if (panes.hidden) setPanel(false);
+$('panelBtn').addEventListener('click', () => setPanel(layoutEl.classList.contains('noside')));
+/** Big chat: widen the panel to half the window and collapse the other sections; toggling back restores them. */
+function setChatMax(on, apply = true) {
+  $('chatMax').setAttribute('aria-pressed', String(on));
+  if (apply) {
+    if (on) {
+      panes.before = { w: panes.w ?? null, collapsed: { ...panes.collapsed } };
+      setPanel(true);
+      for (const sec of secs) setCollapsed(sec, sec.dataset.pane !== 'chat');
+      setSideW(Math.max(sideEl.offsetWidth, window.innerWidth * 0.5));
+    } else if (panes.before) {
+      for (const sec of secs) setCollapsed(sec, !!panes.before.collapsed[sec.dataset.pane]);
+      setSideW(panes.before.w);
+    }
+  }
+  if (!on) delete panes.before;
+  panes.chatMax = on; savePanes();
+  if (R.log) renderChat(true);
+}
+if (panes.chatMax) $('chatMax').setAttribute('aria-pressed', 'true');
+$('chatMax').addEventListener('click', () => setChatMax(!panes.chatMax));
 
 function buildChat() {
   const box = $('chat');
@@ -628,37 +736,41 @@ function buildChat() {
     el.addEventListener('click', () => { pause(); setPos(i + 1); });
     el.hidden = true;
     box.appendChild(el);
-    R.chatItems.push({ el, t: e.t, note: isNote });
+    R.chatItems.push({ el, t: e.t, note: isNote, agent: who });
   });
   const empty = document.createElement('div'); empty.className = 'chat-empty'; empty.id = 'chatEmpty'; box.appendChild(empty);
   R.chatShown = -1;
-  const nChat = R.chatItems.filter(c => !c.note).length;
-  $('chatCount').textContent = nChat ? `${nChat} message${nChat === 1 ? '' : 's'}` : '';
+}
+function renderChatCount() {
+  const all = R.chatItems.filter(c => !c.note), mine = all.filter(c => isOn(c.agent)).length;
+  $('chatCount').textContent = !all.length ? '' : R.sel ? `${mine} of ${all.length} messages` : `${all.length} message${all.length === 1 ? '' : 's'}`;
 }
 function renderChat(force) {
   const box = $('chat');
   let n = 0;
   while (n < R.chatItems.length && R.chatItems[n].t <= R.time + 1e-9) n++;
   if (n === R.chatShown && !force) return;
-  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60 || R.chatShown < 0 || n < R.chatShown;
+  if (force) renderChatCount();
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60 || R.chatShown < 0 || n < R.chatShown || force;
   let lastVisible = null;
   R.chatItems.forEach((c, i) => {
-    const show = i < n && (!c.note || R.showNotes);
+    const show = i < n && (!c.note || R.showNotes) && isOn(c.agent);
     c.el.hidden = !show;
     c.el.classList.remove('latest');
     if (show) lastVisible = c.el;
   });
   if (lastVisible && R.playing) lastVisible.classList.add('latest');
   const anyShown = !!lastVisible;
-  $('chatEmpty').textContent = anyShown ? '' : (R.chatItems.length ? 'No messages yet at this point.' : 'The agents did not talk in this run.');
+  $('chatEmpty').textContent = anyShown ? '' : !R.chatItems.length ? 'The agents did not talk in this run.'
+    : R.sel ? 'No messages from the selected agents yet at this point.' : 'No messages yet at this point.';
   R.chatShown = n;
   if (nearBottom) box.scrollTo({ top: box.scrollHeight, behavior: R.playing && !prefersReducedMotion() ? 'smooth' : 'instant' });
 }
 function renderTicker() {
   const out = [];
-  for (let i = R.pos - 1; i >= 0 && out.length < 7; i--) {
+  for (let i = R.pos - 1; i >= 0 && out.length < 60; i--) {
     const e = R.log.events[i];
-    if (e.tool === 'observe' || e.tool === 'note' || e.chat) continue;
+    if (e.tool === 'observe' || e.tool === 'note' || e.chat || !isOn(e.agent)) continue;
     if (!e.ok && /^(walking|airborne):/.test(e.message || '')) continue;
     let type = null;
     if (e.tool === 'place' || e.tool === 'take' || e.tool === 'deposit' || e.tool === 'give') type = e.args.type ?? e.args.item;
@@ -783,6 +895,7 @@ $('bKeys').addEventListener('click', tKeys);
 async function copyLink() {
   const u = new URL(location.href);
   u.search = ''; u.searchParams.set('ep', R.ep.id); u.searchParams.set('t', R.time.toFixed(1));
+  if (R.sel) u.searchParams.set('agents', R.agents.filter(a => R.sel.has(a)).join(','));
   try { await navigator.clipboard.writeText(u.href); toast(`Link to ${fmtClock(R.time)} copied`); }
   catch { window.prompt('Copy this link:', u.href); }
 }
@@ -812,6 +925,9 @@ document.addEventListener('keydown', ev => {
   else if (k === 'o' || k === 'O') tOrbit();
   else if (k === 'r' || k === 'R') resetCamera();
   else if (k === 'l' || k === 'L') copyLink();
+  else if (k === 'p' || k === 'P') setPanel(layoutEl.classList.contains('noside'));
+  else if (k === 'c' || k === 'C') setChatMax(!panes.chatMax);
+  else if (k === 'a' || k === 'A') setSel(null);
   else if (k === '?') tKeys();
   else if (k === 'Escape') { hideResults(); $('kbdHelp').classList.remove('show'); }
   else handled = false;
@@ -870,6 +986,9 @@ async function main() {
   frameCamera();
   sizeStrip();
   buildChat();
+  const want = (params.get('agents') || '').split(',').filter(a => R.agents.includes(a));
+  setSel(want.length ? new Set(want) : null);
+  renderChatCount();
   R.pos = -1;
   const tParam = parseFloat(params.get('t'));
   $('loading').style.display = 'none';

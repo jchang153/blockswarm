@@ -22,6 +22,7 @@
     <span id="liveScore" class="livescore" hidden></span>
   </div>
   <nav>
+    <button id="panelBtn" class="hide-sm" type="button" aria-pressed="true" title="Show or hide the side panel (P)">Panel</button>
     <a class="hide-sm" href="about.html">About</a>
     <button id="themeBtn" class="icon" type="button">◐</button>
   </nav>
@@ -51,6 +52,8 @@
           <tr><td><kbd>1</kbd>–<kbd>5</kbd></td><td>speed 1× 2× 5× 10× 30×</td></tr>
           <tr><td><kbd>I</kbd> <kbd>N</kbd> <kbd>O</kbd> <kbd>R</kbd></td><td>interior · names · orbit · reset view</td></tr>
           <tr><td><kbd>L</kbd></td><td>copy link to this moment</td></tr>
+          <tr><td><kbd>P</kbd> <kbd>C</kbd></td><td>side panel · big chat</td></tr>
+          <tr><td><kbd>A</kbd></td><td>show all agents</td></tr>
         </table>
       </div>
     </div>
@@ -71,20 +74,35 @@
     </div>
   </section>
 
-  <aside class="side" aria-label="Team, chat and events">
-    <div class="panel-sec"><h2>Team</h2><div class="agents-row" id="agents"></div></div>
-    <div class="panel-sec v4sec" id="v4sec" hidden>
-      <h2>Shared wallet <span class="muted" id="walletNote" style="text-transform:none;letter-spacing:0;font-weight:500"></span></h2>
-      <div id="wallet"></div>
-      <h2 style="margin-top:10px">Leaderboard <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500" title="Blocks each agent placed that are still standing. At the end, the top agents are deployed.">blocks still standing</span></h2>
-      <ol id="board" class="board"></ol>
+  <aside class="side" id="side" aria-label="Team, chat and events">
+    <div class="side-handle" id="sideHandle" role="separator" aria-orientation="vertical" aria-label="Resize the side panel" tabindex="0" title="Drag to resize · double-click to reset"></div>
+    <div class="panel-sec team-sec" data-pane="team">
+      <h2><button class="pane-tog" type="button" aria-expanded="true">Team</button>
+        <button class="linkbtn" id="selAll" type="button" hidden>show all</button>
+        <label id="fadeWrap" title="Show other agents' blocks faintly instead of hiding them" hidden><input type="checkbox" id="optFade" checked> faint others</label></h2>
+      <div class="pane-body">
+        <div class="agents-row" id="agents"></div>
+        <div class="hint muted" id="selHint">Click agents to show only them · double-click to show just one</div>
+      </div>
     </div>
-    <div class="panel-sec chat-sec">
-      <h2>Chat <span class="muted" id="chatCount" style="text-transform:none;letter-spacing:0;font-weight:500"></span>
-        <label title="Show agents' private notes to themselves"><input type="checkbox" id="optNotes"> notes</label></h2>
-      <div id="chat"></div>
+    <div class="panel-sec v4sec" id="v4sec" data-pane="wallet" hidden>
+      <h2><button class="pane-tog" type="button" aria-expanded="true">Shared wallet</button> <span class="muted" id="walletNote" style="text-transform:none;letter-spacing:0;font-weight:500"></span></h2>
+      <div class="pane-body">
+        <div id="wallet"></div>
+        <h2 style="margin-top:10px">Leaderboard <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500" title="Blocks each agent placed that are still standing. At the end, the top agents are deployed.">blocks still standing</span></h2>
+        <ol id="board" class="board"></ol>
+      </div>
     </div>
-    <div class="panel-sec ticker-sec"><h2>Who did what</h2><ul id="ticker"></ul></div>
+    <div class="panel-sec chat-sec" data-pane="chat">
+      <h2><button class="pane-tog" type="button" aria-expanded="true">Chat</button> <span class="muted" id="chatCount" style="text-transform:none;letter-spacing:0;font-weight:500"></span>
+        <label title="Show agents' private notes to themselves"><input type="checkbox" id="optNotes"> notes</label>
+        <button class="icon sm" id="chatMax" type="button" aria-pressed="false" title="Make the chat as big as possible (C)">⤢</button></h2>
+      <div class="pane-body" id="chat"></div>
+    </div>
+    <div class="panel-sec ticker-sec" data-pane="ticker">
+      <h2><button class="pane-tog" type="button" aria-expanded="true">Who did what</button></h2>
+      <ul class="pane-body" id="ticker"></ul>
+    </div>
   </aside>
 </div>
 
