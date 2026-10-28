@@ -19,6 +19,10 @@ tool says only "Hit another agent with your sword", and agents learn the rest (d
 death) from what happens. It never suggests or discourages attacking, crossing the
 line, removing the other team's blocks or working with the other team. Without `teams` the v4
 prompt and tools are produced byte for byte as before (tests pin their hashes).
+
+Walking (docs/walking.md section 5): with config `walking` "continuous" both prompts describe a
+walk that moves the body cell by cell; with "teleport", or a header without the key (every log
+written before continuous walking), they keep the old sentence, byte for byte.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ from __future__ import annotations
 from blockswarm.catalog import catalog_json
 from blockswarm.tasks import TEAM_BATTLE_BRIEF
 
-PROMPT_VERSION = "v5.0"
+PROMPT_VERSION = "v5.1"
 
 # The team-battle brief (docs/team-battle.md section 5), used when the config gives no brief.
 TEAM_BRIEF = TEAM_BATTLE_BRIEF  # one definition, in tasks.py
@@ -34,6 +38,27 @@ TEAM_BRIEF = TEAM_BATTLE_BRIEF  # one definition, in tasks.py
 
 def _cfg(header: dict) -> dict:
     return header.get("config", {})
+
+
+def walking_mode(header: dict) -> str:
+    """"continuous" or "teleport" (docs/walking.md). A header without the key is a log written
+    before continuous walking existed, so it means "teleport"."""
+    return _cfg(header).get("walking", "teleport")
+
+
+_WALK_TELEPORT = ("Your position becomes the destination at once (for the rules on bodies and reach), "
+                  "and you are walking until the arrival time.")
+_WALK_CONTINUOUS = (
+    "While you walk you move along the path one cell at a time at that speed, and your body, your eyes "
+    "and what others can see or reach move with you. You are walking until you arrive. If a cell ahead "
+    "on your path becomes blocked or can no longer be stood on, you stop at the last cell before it. "
+    "Walking agents pass through each other; nobody can stop in, or place a block into, the cell "
+    "another agent is walking to.")
+
+
+def _walk_text(cfg: dict) -> str:
+    """The movement sentence(s) for move_to (docs/walking.md section 5)."""
+    return _WALK_CONTINUOUS if cfg.get("walking", "teleport") == "continuous" else _WALK_TELEPORT
 
 
 def _agents(header: dict) -> list[str]:
@@ -225,9 +250,8 @@ def system_prompt(world_header: dict, agent_id: str) -> str:
         "or directly on top of a block or the shop. You cannot fly. Two agents cannot share a cell.\n"
         f"move_to walks the shortest path to a standable cell at {speed} cells per second (a diagonal "
         "step counts 1.41). Each step can go up at most 1 cell and down at most 3 cells; paths cannot "
-        "pass through blocks (doors excepted), the shop or other agents. Your position becomes the "
-        "destination at once (for the rules on bodies and reach), and you are walking until the arrival "
-        "time. If there is no path, the move fails.\n"
+        "pass through blocks (doors excepted), the shop or other agents. " + _walk_text(cfg)
+        + " If there is no path, the move fails.\n"
         f"jump makes you airborne for {air} s in your current cell. While you are airborne your feet "
         "cell counts as empty; if a block is placed into it during that time, you end up standing on top "
         "of that block.\n"
@@ -560,9 +584,8 @@ def team_system_prompt(world_header: dict, agent_id: str) -> str:
         "or directly on top of a block or a shop. You cannot fly. Two agents cannot share a cell.\n"
         f"move_to walks the shortest path to a standable cell at {speed} cells per second (a diagonal "
         "step counts 1.41). Each step can go up at most 1 cell and down at most 3 cells; paths cannot "
-        "pass through blocks (doors excepted), the shops or other agents. Your position becomes the "
-        "destination at once (for the rules on bodies and reach), and you are walking until the arrival "
-        "time. If there is no path, the move fails.\n"
+        "pass through blocks (doors excepted), the shops or other agents. " + _walk_text(cfg)
+        + " If there is no path, the move fails.\n"
         f"jump makes you airborne for {air} s in your current cell. While you are airborne your feet "
         "cell counts as empty; if a block is placed into it during that time, you end up standing on top "
         "of that block.\n"

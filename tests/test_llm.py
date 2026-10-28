@@ -19,7 +19,7 @@ from blockswarm.clock import WallClock
 from blockswarm.llm.agent import LLMAgent, LLMConfig
 from blockswarm.llm.budget import Budget, UnknownPrice, price_for
 from blockswarm.llm.client import BudgetRefused, MockClient, OpenRouterClient, mock_result, parse_tool_calls, tool_call
-from blockswarm.llm.runner import ConfigError, load_dotenv, resolve_config, run_episode
+from blockswarm.llm.runner import WORLD_KEYS, ConfigError, load_dotenv, resolve_config, run_episode
 from blockswarm.recorder import Recorder
 from blockswarm.world import Config, World
 
@@ -427,6 +427,25 @@ class TestTeamWait(unittest.TestCase):
 
 class TestTeamConfig(unittest.TestCase):
     @unittest.skipUnless(world_has_teams(), "world.py has no team battle yet")
+    def test_llm_by_model_overrides_per_team(self):
+        prices = {"m/a": {"input_per_m": 1, "output_per_m": 1}, "m/b": {"input_per_m": 1, "output_per_m": 1}}
+        raw = {"budget_usd": 1.0, "team_models": {"red": "m/a", "blue": "m/b"},
+               "llm": {"prices": prices, "temperature": None, "history_steps": 4},
+               "llm_by_model": {"m/a": {"max_tokens": 4096, "reasoning": {"effort": "low"}},
+                                "m/b": {"reasoning": {"enabled": False}}}, **TEAM_KEYS}
+        rc = resolve_config(raw)
+        red, blue = rc["llm_for"]["m/a"], rc["llm_for"]["m/b"]
+        self.assertEqual((red.max_tokens, red.reasoning), (4096, {"effort": "low"}))
+        self.assertEqual((blue.max_tokens, blue.reasoning), (2048, {"enabled": False}))
+        self.assertEqual((red.history_steps, blue.history_steps), (4, 4))  # shared settings kept
+        self.assertIsNone(blue.temperature)
+        with self.assertRaises(ConfigError):
+            resolve_config({**raw, "llm_by_model": {"m/zzz": {"max_tokens": 10}}})
+        for f in sorted((Path(__file__).resolve().parents[1] / "configs").glob("vs*.json")):  # shipped matchups
+            rc = resolve_config(json.loads(f.read_text()))
+            self.assertEqual(len(set(rc["models"].values())), 2, f.name)
+
+    @unittest.skipUnless(world_has_teams(), "world.py has no team battle yet")
     def test_teams_define_agents_and_team_models(self):
         raw = {"budget_usd": 1.0, "team_models": {"red": "m/a", "blue": "m/b"},
                "llm": {"prices": {"m/a": {"input_per_m": 1, "output_per_m": 1},
@@ -466,6 +485,7 @@ class TestTeamConfig(unittest.TestCase):
                 self.assertEqual(raw["teams"], {"red": RED, "blue": BLUE})
                 self.assertEqual(raw["shops"], {"red": [6, 10, 0], "blue": [33, 10, 0]})
                 self.assertEqual((raw["width"], raw["depth"], raw["height"], raw["divider_x"]), (40, 20, 10, 20))
+                self.assertEqual(raw["walking"], "continuous")  # docs/walking.md
                 if name != "teams-mock":
                     self.assertEqual((raw["max_seconds"], raw["budget_usd"]), (1800, 20.0))
                     pilot = json.loads((root / f"pilot2-{name[6:]}.json").read_text())
@@ -474,6 +494,8 @@ class TestTeamConfig(unittest.TestCase):
                 if world_has_teams():
                     rc = resolve_config(raw, mock=True)
                     self.assertEqual(rc["agents"], RED + BLUE)
+                    if "walking" in WORLD_KEYS:
+                        self.assertEqual(rc["world_kwargs"]["walking"], "continuous")
 
 
 class TestRunner(unittest.TestCase):

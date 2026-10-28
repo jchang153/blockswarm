@@ -21,7 +21,7 @@ from typing import Any, Callable, Iterable, Optional, Protocol
 from blockswarm.blueprints import Pos
 from blockswarm.catalog import CATALOG, ITEM_IDS, catalog_json
 from blockswarm.clock import WallClock
-from blockswarm.pathing import Terrain
+from blockswarm.pathing import Terrain, walk_index, walk_times
 from blockswarm.recorder import LOG_VERSION, Recorder
 from blockswarm.tasks import (INCENTIVES, TASK_KINDS, analysis, deployed, individual_scores, ranking, side_team,
                               task_header, team_summary)
@@ -35,6 +35,7 @@ START_RING = ((-1, 1), (1, 1), (-1, -1), (1, -1), (0, 1), (0, -1), (-1, 0), (1, 
 FALL_S_PER_CELL = 0.1
 STARTING_MONEY_PER_AGENT = 100
 VARIANTS = ("shop", "team_battle")
+WALKING_MODES = ("continuous", "teleport")  # docs/walking.md; logs without the key are "teleport"
 SWORD = "iron_sword"  # every agent's equipment with combat; not a block
 
 # Messages of rejected action calls that consume nothing (not counted in actions_used).
@@ -118,6 +119,10 @@ class Config:
     sword_damage: int = 7
     attack_reach: float = 3.0
     attack_cooldown_s: float = 0.6
+    # Continuous walking (docs/walking.md): "continuous" moves a walker cell by cell along its
+    # path over time; "teleport" (every log written before it) puts it at the destination at
+    # once. Logged in the header config only when "continuous" (teleport logs stay unchanged).
+    walking: str = "continuous"
 
     MAX_AGENTS = 16
 
@@ -163,6 +168,8 @@ class Config:
             raise ValueError("walk_speed, reach and view_radius must be > 0, eye_height >= 0")
         if self.jump_airtime <= 0:
             raise ValueError("jump_airtime must be > 0")
+        if self.walking not in WALKING_MODES:
+            raise ValueError(f"walking must be one of {WALKING_MODES}, got {self.walking!r}")
         if len(self.shop_pos) != 3 or not self.in_bounds(self.shop_pos):
             raise ValueError(f"shop_pos {self.shop_pos} is outside the grid")
         shop_cells = self.shop_cells()
@@ -347,7 +354,13 @@ class World:
         self._last_attack_t: dict[str, float | None] = {a: None for a in self.agents}
         self._placed_by_team: dict[str, int] = {tm: 0 for tm in self.team_names}
         self._removed_by_other: dict[str, int] = {tm: 0 for tm in self.team_names}
-        self.positions: dict[str, Pos] = dict(zip(self.agents, self._start_positions()))
+        # Current cell of every agent (dead agents: last cell), as of the last time walks were
+        # advanced (`_advance`); read it through `positions` / `current_cell` from outside.
+        self._pos: dict[str, Pos] = dict(zip(self.agents, self._start_positions()))
+        # Continuous walking: agent -> {"path", "times", "depart_t", "arrive_t"} for walks in
+        # progress (times[i] = when path[i] is reached; pathing.walk_times). Empty in teleport mode.
+        self.walks: dict[str, dict] = {}
+        self.continuous = config.walking == "continuous"
         self.walking_until: dict[str, float] = {a: 0.0 for a in self.agents}
         self.airborne_until: dict[str, float] = {a: 0.0 for a in self.agents}
         self._lifted: set[str] = set()  # airborne agents already lifted by a block this jump
@@ -366,7 +379,7 @@ class World:
             "type": "header",
             "log_version": LOG_VERSION,
             "episode_id": self.episode_id,
-            "config": json.loads(json.dumps(asdict(config))),
+            "config": self._header_config(),
             "task": dict(self.task),
             "clock": getattr(self.clock, "kind", "wall"),
             "grid": {"width": config.width, "depth": config.depth, "height": config.height},
@@ -374,7 +387,7 @@ class World:
             "shop": {"pos": list(self.shop_pos), "catalog": catalog_json(),
                      "starting_money": config.starting_money},
             "wallet": self.wallet,
-            "positions": {a: list(p) for a, p in self.positions.items()},
+            "positions": {a: list(p) for a, p in self._pos.items()},
             "block_types": list(BLOCK_TYPES),
             "inventories": {a: {} for a in self.agents},
             "variant": config.variant,
@@ -388,6 +401,15 @@ class World:
             "health": dict(self.health) if combat else None,
             "equipment": {a: [SWORD] for a in self.agents} if combat else None,
         })
+
+    def _header_config(self) -> dict:
+        """The resolved config as logged. `walking` is left out in teleport mode, so teleport logs
+        are exactly what the engine wrote before continuous walking existed (readers treat a
+        missing key as "teleport")."""
+        cfg = json.loads(json.dumps(asdict(self.config)))
+        if cfg.get("walking") == "teleport":
+            del cfg["walking"]
+        return cfg
 
     def _start_positions(self) -> list[Pos]:
         """Configured start positions, or rings around the shop (with teams: each team's members
@@ -521,6 +543,7 @@ class World:
             self._done = True
             self._end_reason = reason
             t = self.now()
+            self._advance(t)
             self._write_snapshot(t)
             scores = self.individual_scores()
             rank = [] if self.teams else ranking(scores, self.agents)
@@ -591,27 +614,36 @@ class World:
     def state(self) -> dict:
         """Blocks, wallet(s), inventories, actions, votes, positions, walkers, health and the dead
         in log format (`done_votes` is {team: [...]} with teams; dead agents keep their last
-        position)."""
+        position), at the time of the last event or view. Positions are current cells; with
+        continuous walking also `walks` (walks in progress)."""
         with self._lock:
             t = self._t
-            return {
+            self._advance(t)
+            out = {
                 "blocks": [[x, y, z, b.type, b.placed_by, b.placed_at]
                            for (x, y, z), b in sorted(self.blocks.items())],
                 "wallet": self.wallet,
                 "inventories": {a: dict(sorted(self.inventories[a].items())) for a in self.agents},
                 "actions_used": dict(self.actions_used),
                 "done_votes": self.team_votes if self.teams else list(self.done_votes),
-                "positions": {a: list(p) for a, p in self.positions.items()},
+                "positions": {a: list(p) for a, p in self._pos.items()},
                 "walking_until": {a: w for a, w in self.walking_until.items() if w > t},
                 "wallets": self.wallets,
                 "health": dict(self.health) if self.config.combat else None,
                 "dead": list(self.dead),
             }
+            if self.continuous:  # walks in progress (docs/walking.md section 4)
+                out["walks"] = {a: {"path": [list(c) for c in w["path"]], "depart_t": w["depart_t"],
+                                    "arrive_t": w["arrive_t"]}
+                                for a, w in self.walks.items() if w["arrive_t"] > t}
+            return out
 
     def snapshot(self) -> dict:
         """Current full state as a `snapshot` record (not written to the log)."""
         with self._lock:
-            return self._snapshot_record(self.now())
+            t = self.now()
+            self._advance(t)
+            return self._snapshot_record(t)
 
     def _snapshot_record(self, t: float) -> dict:
         return {"type": "snapshot", "seq": self._snapshot_seq, "t": t,
@@ -677,10 +709,60 @@ class World:
         b = self.blocks.get(c)
         return b is not None and b.type not in TRANSPARENT
 
-    def body_cells(self, exclude: str | None = None) -> dict[Pos, str]:
-        """Cells occupied by living agents' bodies (an airborne agent's feet cell is free)."""
+    @property
+    def positions(self) -> dict[str, Pos]:
+        """Every agent's current cell at the current episode time (dead agents: their last
+        cell). Walks are advanced to now first; the dict is the engine's own (don't keep it
+        across calls)."""
+        with self._lock:
+            self._sync()
+            return self._pos
+
+    def current_cell(self, agent: str, t: float | None = None) -> Pos:
+        """The cell `agent` is in at episode time `t` (default: now): with continuous walking a
+        walker is at path[i] for the largest i reached by `t` (docs/walking.md section 2), else
+        its position. For `t` before the last committed event the answer may not be meaningful."""
+        with self._lock:
+            if t is None:
+                self._sync()
+                return self._pos[agent]
+            w = self.walks.get(agent)
+            if w is None:
+                return self._pos[agent]
+            return w["path"][walk_index(w["times"], t)]
+
+    def _advance(self, t: float) -> None:
+        """Move every walker to its current cell at time `t` (the only place `_pos` follows a
+        walk) and drop walks that have arrived. Idempotent; `t` never goes back."""
+        for a in list(self.walks):
+            w = self.walks[a]
+            self._pos[a] = w["path"][walk_index(w["times"], t)]
+            if t >= w["arrive_t"]:
+                del self.walks[a]
+
+    def _sync(self) -> None:
+        """Advance walks to now (public read helpers; not used inside an event, whose time is
+        fixed). Frozen once the episode has ended."""
+        if self.walks and not self._done:
+            self._advance(self.now())
+
+    def reserved_cells(self, exclude: str | None = None) -> dict[Pos, str]:
+        """Continuous walking: the destination body cells (feet and head) of every walk in
+        progress except `exclude`'s. Other agents may not choose them as a `move_to`
+        destination or place a block into them; they don't block paths."""
         out: dict[Pos, str] = {}
-        for a, (x, y, z) in self.positions.items():
+        for a, w in self.walks.items():
+            if a != exclude and a not in self.dead:
+                x, y, z = w["path"][-1]
+                out[(x, y, z)] = a
+                out[(x, y, z + 1)] = a
+        return out
+
+    def body_cells(self, exclude: str | None = None) -> dict[Pos, str]:
+        """Cells occupied by living agents' bodies (an airborne agent's feet cell is free); a
+        walker's body is at its current cell."""
+        out: dict[Pos, str] = {}
+        for a, (x, y, z) in self._pos.items():
             if a != exclude and a not in self.dead:
                 if not self._feet_free(a):
                     out[(x, y, z)] = a
@@ -706,6 +788,7 @@ class World:
 
     def standable(self, pos: Pos, agent: str | None = None) -> bool:
         with self._lock:
+            self._sync()
             return self.terrain(agent).standable(tuple(pos))  # type: ignore[arg-type]
 
     def eye(self, pos: Pos) -> tuple[float, float, float]:
@@ -731,9 +814,12 @@ class World:
     def reachable_stand_cells(self, target: Pos, agent: str | None = None) -> list[Pos]:
         """Standable cells from which `target` is within reach (and line of sight).
         With `agent`, its own body is ignored and only cells it can walk to are returned,
-        sorted by walk length; otherwise sorted by distance to the target."""
+        sorted by walk length; otherwise sorted by distance to the target. Cells another
+        walker is walking to (continuous walking) are left out."""
         with self._lock:
+            self._sync()
             tx, ty, tz = target
+            reserved = self.reserved_cells(exclude=agent)
             r = int(math.ceil(self.config.reach)) + 1
             ter = self.terrain(agent)
             cells = []
@@ -741,7 +827,8 @@ class World:
                 for y in range(ty - r, ty + r + 1):
                     for z in range(max(0, tz - r - 1), tz + r + 1):
                         p = (x, y, z)
-                        if ter.standable(p) and self.can_reach(p, target):
+                        if (ter.standable(p) and p not in reserved and (x, y, z + 1) not in reserved
+                                and self.can_reach(p, target)):
                             cells.append(p)
             if agent is None:
                 return sorted(cells, key=lambda p: (self.distance(p, target), p))
@@ -751,14 +838,16 @@ class World:
     def walk_costs(self, agent: str, extra_solid: Iterable[Pos] = ()) -> dict[Pos, float]:
         """Walk length from the agent's position to every cell it can reach."""
         with self._lock:
-            return self.terrain(agent, extra_solid).costs_from(self.positions[agent])[0]
+            self._sync()
+            return self.terrain(agent, extra_solid).costs_from(self._pos[agent])[0]
 
     def find_path(self, agent: str, dest: Pos) -> tuple[list[Pos], float] | None:
         with self._lock:
+            self._sync()
             ter = self.terrain(agent)
             if not ter.standable(tuple(dest)):  # type: ignore[arg-type]
                 return None
-            return ter.path(self.positions[agent], tuple(dest))  # type: ignore[arg-type]
+            return ter.path(self._pos[agent], tuple(dest))  # type: ignore[arg-type]
 
     def cut_off_if_solid(self, cells: Iterable[Pos]) -> list[str]:
         """Living agents that could no longer walk to a spot within reach of their shop (with
@@ -766,6 +855,7 @@ class World:
         are ignored, since they move). Internal helper for the scripted bot and tests, not an
         agent tool."""
         with self._lock:
+            self._sync()
             extra = set(cells)
             c = self.config
             ter = Terrain(c.width, c.depth, c.height,
@@ -782,7 +872,7 @@ class World:
             out = []
             for a in self.alive_agents():
                 goals = goal_sets[self.shops.get(self.team_of(a) or "", self.shop_pos)]
-                x, y, z = self.positions[a]
+                x, y, z = self._pos[a]
                 if (x, y, z) in extra or (x, y, z + 1) in extra:
                     out.append(a)
                     continue
@@ -798,8 +888,12 @@ class World:
         """Whether a `buy` would pass the reach check now (not walking; a shop within reach and,
         with reach_line_of_sight, in sight; with teams any team's shop counts)."""
         with self._lock:
-            return not self.is_walking(agent) and any(self.can_reach(self.positions[agent], s)
-                                                      for s in sorted(self._shop_cells))
+            self._sync()
+            return self._shop_in_reach(agent)
+
+    def _shop_in_reach(self, agent: str) -> bool:
+        return not self.is_walking(agent) and any(self.can_reach(self._pos[agent], s)
+                                                  for s in sorted(self._shop_cells))
 
     def visible(self, from_pos: Pos, target: Pos) -> bool:
         """Whether `target` shows up in a view from `from_pos` (radius and occlusion rules)."""
@@ -828,6 +922,8 @@ class World:
           side the agent stands on}; "shop_pos" = own team's shop, "shop_in_reach" = any shop;
           "done_votes" = own team's voters; every "agents_visible" entry gets "team";
           "shops_in_reach": {team: bool} (each shop's shop_in_reach check).
+        With continuous walking, "position" / "eye" / visibility are the current cell's, and
+          "destination": [x, y, z] while walking (else None) is added.
         Keys added with combat: "health": int, "max_health": int, "equipment": ["iron_sword"],
           "dead": [agent, ...] (in order of death). Dead agents are never in "agents_visible".
         """
@@ -835,8 +931,10 @@ class World:
             raise ValueError(f"unknown agent {agent!r}")
         with self._lock:
             t = self.now()
+            if not self._done:
+                self._advance(t)
             c = self.config
-            pos = self.positions[agent]
+            pos = self._pos[agent]
             team = self.team_of(agent)
             last = self._last_action_t[agent]
             cooldown_until = 0.0 if last is None else last + c.action_cooldown_s
@@ -846,7 +944,7 @@ class World:
                       for (x, y, z), b in sorted(self.blocks.items()) if self.visible(pos, (x, y, z))]
             others = []
             for a in self.agents:
-                p = self.positions[a]
+                p = self._pos[a]
                 if a != agent and a not in self.dead and (self.visible(pos, p)
                                                           or self.visible(pos, (p[0], p[1], p[2] + 1))):
                     entry = {"id": a, "pos": list(p), "walking": self.is_walking(a, t),
@@ -875,7 +973,7 @@ class World:
                 "actions_remaining": max(0, c.max_actions_per_agent - used),
                 "next_action_at": max(t, cooldown_until, walking),
                 "shop_pos": list(self.shops[team] if team else self.shop_pos),
-                "shop_in_reach": self.shop_in_reach(agent),
+                "shop_in_reach": self._shop_in_reach(agent),
                 "wallet": self._wallets[team],
                 "grid": {"width": c.width, "depth": c.depth, "height": c.height},
                 "blocks": blocks,
@@ -886,6 +984,8 @@ class World:
                 "notes": list(self.notes[agent]),
                 "done_votes": list(self._votes[team]),
             }
+            if self.continuous:  # where a walker is walking to (its position is its current cell)
+                out["destination"] = list(self.walks[agent]["path"][-1]) if agent in self.walks else None
             if self.teams:
                 d = c.divider_x
                 first = {"x_min": 0, "x_max": d - 1}  # type: ignore[operator]
@@ -950,6 +1050,7 @@ class World:
             if self.check_end():
                 return ToolResult(False, f"episode is over ({self._end_reason})")
             t = self.now()
+            self._advance(t)
             if t >= self._next_snapshot_t:
                 self._write_snapshot(t)
             result = self._apply(agent, tool, args, t)
@@ -997,6 +1098,8 @@ class World:
                 handler: Callable[..., tuple[str, dict | None, dict | None]] = getattr(self, f"_tool_{tool}")
                 message, chat, data = handler(agent, work, t, **clean)
                 ok, diff = True, work
+                if self.walks and (work["grid"] or work["combat"].get("killed")):
+                    self._recheck_walks(work, t)
                 if work["grid"]:
                     self._analysis_cache = None
                     self._clear_votes_for_grid(agent, work, t)
@@ -1088,13 +1191,22 @@ class World:
 
     def _move(self, work: dict, agent: str, path: list[Pos], depart: float, arrive: float,
               kind: str = "walk") -> None:
-        """Record a position change. kind: walk (busy until arrive), fall, jump or lift."""
+        """Record a position change. kind: walk (busy until arrive), fall, jump or lift.
+        With continuous walking a walk is stored in `walks` and the agent stays at path[0]
+        until it moves on (`_advance`); every other kind ends any walk and moves at once."""
         entry = {"from": list(path[0]), "to": list(path[-1]), "path": [list(p) for p in path],
                  "depart_t": depart, "arrive_t": arrive}
         if kind in ("fall", "jump"):
             entry[kind] = True
         work["agents"][agent] = entry
-        self.positions[agent] = path[-1]
+        self.walks.pop(agent, None)
+        if kind == "walk" and self.continuous and len(path) > 1:
+            times = walk_times(path, depart, self.config.walk_speed)
+            times[-1] = arrive  # equal by construction (same sum); pinned so both always agree
+            self.walks[agent] = {"path": list(path), "times": times, "depart_t": depart, "arrive_t": arrive}
+            self._pos[agent] = path[0]
+        else:
+            self._pos[agent] = path[-1]
         if kind in ("walk", "fall"):
             self.walking_until[agent] = arrive
         if kind == "fall":
@@ -1124,7 +1236,7 @@ class World:
         return (x, y, z)
 
     def _need_reach(self, agent: str, target: Pos, what: str, reach: float | None = None) -> None:
-        pos = self.positions[agent]
+        pos = self._pos[agent]
         d = self.distance(pos, target)
         reach = self.config.reach if reach is None else reach
         if d > reach:
@@ -1146,23 +1258,27 @@ class World:
         if not ter.standable(dest):
             raise _Fail(f"{dest} is not standable (needs a 2-high space that is empty or a door, on the "
                         "ground, a block or the shop, not occupied by an agent)")
-        found = ter.path(self.positions[agent], dest)
+        reserved = self.reserved_cells(exclude=agent)
+        taken = next((reserved[c] for c in (dest, (dest[0], dest[1], dest[2] + 1)) if c in reserved), None)
+        if taken is not None:
+            raise _Fail(f"{dest} is reserved: {taken} is walking to {self.walks[taken]['path'][-1]}")
+        found = ter.path(self._pos[agent], dest)
         if found is None:
-            raise _Fail(f"no path from {self.positions[agent]} to {dest}")
+            raise _Fail(f"no path from {self._pos[agent]} to {dest}")
         path, length = found
         arrive = round(t + length / self.config.walk_speed, 3)
         self._move(work, agent, path, t, arrive)
         return f"walking to {dest}: {length:.2f} blocks, arrive at t={arrive:.3f}", None, None
 
     def _tool_jump(self, agent: str, work: dict, t: float):
-        pos = self.positions[agent]
+        pos = self._pos[agent]
         land = round(t + self.config.jump_airtime, 3)
         self._move(work, agent, [pos], t, land, kind="jump")
         return f"jumped: airborne until t={land:.3f}", None, None
 
     def _tool_buy(self, agent: str, work: dict, t: float, item: str, n: int):
         # any shop in reach will do (with teams: either team's); errors name the nearest shop
-        pos = self.positions[agent]
+        pos = self._pos[agent]
         shops = sorted(self._shop_cells, key=lambda s: (self.distance(pos, s), s))
         if not any(self.can_reach(pos, s) for s in shops):
             self._need_reach(agent, shops[0], "the shop")
@@ -1185,9 +1301,9 @@ class World:
     def _tool_give(self, agent: str, work: dict, t: float, to: str, type: str, n: int):
         if to in self.dead:
             raise _Fail(f"{to} is dead")
-        tx, ty, tz = self.positions[to]
+        tx, ty, tz = self._pos[to]
         cells = [(tx, ty, tz), (tx, ty, tz + 1)]
-        target = min(cells, key=lambda c: (self.distance(self.positions[agent], c), c))
+        target = min(cells, key=lambda c: (self.distance(self._pos[agent], c), c))
         self._need_reach(agent, target, to)
         self._need_held(agent, type, n)
         self._need_room(to, n, who=to)
@@ -1205,7 +1321,10 @@ class World:
         bodies = self.body_cells()
         if pos in bodies:
             raise _Fail(f"{pos} is occupied by {bodies[pos]}'s body")
-        jumper = next((a for a in self.alive_agents() if self.positions[a] == pos and self._feet_free(a)), None)
+        reserved = self.reserved_cells()
+        if pos in reserved:
+            raise _Fail(f"{pos} is reserved: {reserved[pos]} is walking to {self.walks[reserved[pos]]['path'][-1]}")
+        jumper = next((a for a in self.alive_agents() if self._pos[a] == pos and self._feet_free(a)), None)
         if jumper is not None:
             x, y, z = pos
             above = (x, y, z + 2)
@@ -1251,7 +1370,7 @@ class World:
     def _apply_falls(self, work: dict, t: float) -> None:
         """Living agents left without support drop straight down to the next standable cell."""
         for a in self.alive_agents():
-            x, y, z = self.positions[a]
+            x, y, z = self._pos[a]
             if z == 0 or self.solid((x, y, z - 1)):
                 continue
             ter = self.terrain(a)
@@ -1260,6 +1379,42 @@ class World:
                 nz -= 1
             path = [(x, y, z), (x, y, nz)]
             self._move(work, a, path, t, round(t + FALL_S_PER_CELL * (z - nz), 3), kind="fall")
+
+    def _recheck_walks(self, work: dict, t: float) -> None:
+        """After a committed grid change (or a death), cut every walk in progress at the first
+        future path cell that is no longer standable or no longer enterable from the cell before
+        it (grid only, bodies ignored; docs/walking.md section 3). The walker stops at the cell
+        before it, backing off further (never behind its current cell) while that cell overlaps
+        a standing agent's body or another walker's destination. Falls (support gone under the
+        current cell) were applied already by `_apply_falls` and ended those walks."""
+        c = self.config
+        ter = Terrain(c.width, c.depth, c.height, solid=self.solid, occupied=lambda p: False,
+                      passable=self.passable)
+        for a in self.agents:
+            w = self.walks.get(a)
+            if w is None or a in self.dead:
+                continue
+            path, times = w["path"], w["times"]
+            k = walk_index(times, t)
+            bad = next((j for j in range(k + 1, len(path))
+                        if not (ter.standable(path[j]) and ter.can_step(path[j - 1], path[j]))), None)
+            if bad is None:
+                continue
+            standing = {p for p, b in self.body_cells(exclude=a).items() if b not in self.walks}
+            reserved = self.reserved_cells(exclude=a)
+            end = bad - 1
+            while end > k and any(q in standing or q in reserved
+                                  for q in (path[end], (path[end][0], path[end][1], path[end][2] + 1))):
+                end -= 1
+            arrive = max(times[end], t)
+            work["agents"][a] = {"from": list(path[k]), "to": list(path[end]),
+                                 "path": [list(p) for p in path[k:end + 1]], "depart_t": w["depart_t"],
+                                 "arrive_t": arrive, "stopped": True, "path_offset": k}
+            self.walking_until[a] = arrive
+            if end == k:
+                del self.walks[a]
+            else:
+                w.update(path=path[:end + 1], times=times[:end + 1], arrive_t=arrive)
 
     def _post(self, agent: str, to: str | None, text: str, t: float, channel: str | None = None) -> dict:
         chat = {"channel": channel or ("public" if to is None else "private"), "from": agent, "to": to,
@@ -1317,9 +1472,9 @@ class World:
     def _tool_attack(self, agent: str, work: dict, t: float, target: str):
         if target in self.dead:
             raise _Fail(f"{target} is dead")
-        tx, ty, tz = self.positions[target]
+        tx, ty, tz = self._pos[target]
         cells = [(tx, ty, tz), (tx, ty, tz + 1)]
-        cell = min(cells, key=lambda c: (self.distance(self.positions[agent], c), c))
+        cell = min(cells, key=lambda c: (self.distance(self._pos[agent], c), c))
         self._need_reach(agent, cell, target, reach=self.config.attack_reach)
         c = self.config
         before = self.health[target]
@@ -1345,7 +1500,8 @@ class World:
         if target in votes:
             votes.remove(target)
         self.walking_until[target] = 0.0
+        self.walks.pop(target, None)
         self.airborne_until[target] = 0.0
         self._lifted.discard(target)
-        work["agents"][target] = {"dead": True, "at": list(self.positions[target])}
+        work["agents"][target] = {"dead": True, "at": list(self._pos[target])}
         self._notice(t, f"{target} was killed by {attacker}")

@@ -23,6 +23,10 @@ Design (see also prompts.py):
   (with their team; killed agents marked, from `dead` in the view or the kill notices), message
   channel labels ([team], [all], [private], [system]) and the team's finished votes. Nothing of
   this appears without `teams`, so v4 observations are unchanged.
+- Continuous walking (docs/walking.md section 5): `position` is the agent's current cell; while
+  walking, the own status line adds the destination when the view gives one and it differs from
+  the current cell ("walking to (x, y, z), arrive at t=..."). Other agents show their current
+  cell and "walking". Teleport views (destination = position) render exactly as before.
 """
 
 from __future__ import annotations
@@ -251,6 +255,13 @@ def _leaderboard(scores: Any, agents: list[str]) -> list[tuple[str, int]]:
     return [(a, ind[a]) for a in order if isinstance(ind[a], (int, float))]
 
 
+def walk_destination(view: dict) -> Pos | None:
+    """Where this agent's walk in progress ends: the view's `destination` (continuous walking,
+    docs/walking.md), or None. With teleport walking the position already is the destination."""
+    d = view.get("destination")
+    return tuple(d) if d is not None else None  # type: ignore[return-value]
+
+
 def render_observation(view: dict, memory: ObservationMemory) -> str:
     """Text observation for the model. Updates `memory` (call once per view)."""
     me = view["you"]
@@ -267,7 +278,9 @@ def render_observation(view: dict, memory: ObservationMemory) -> str:
     if view.get("done"):
         status.append("EPISODE OVER")
     if view.get("walking_until") is not None:
-        status.append(f"walking, arrive at t={view['walking_until']:.1f}")
+        dest = walk_destination(view)
+        status.append((f"walking to {fmt_pos(dest)}, " if dest is not None and dest != pos else "walking, ")
+                      + f"arrive at t={view['walking_until']:.1f}")
     if view.get("airborne_until") is not None:
         status.append(f"airborne, land at t={view['airborne_until']:.1f}")
     nxt = view.get("next_action_at")

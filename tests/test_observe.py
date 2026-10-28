@@ -733,6 +733,102 @@ class EngineTeamBattleTests(unittest.TestCase):
         self.assertIn("[all] blue_2: all hello", red)
 
 
+# ---------------------------------------------------------------------------- walking (docs/walking.md)
+
+TELEPORT_SENTENCE = ("Your position becomes the destination at once (for the rules on bodies and reach), and you "
+                     "are walking until the arrival time.")
+CONTINUOUS_TEXT = (
+    "While you walk you move along the path one cell at a time at that speed, and your body, your eyes and what "
+    "others can see or reach move with you. You are walking until you arrive. If a cell ahead on your path becomes "
+    "blocked or can no longer be stood on, you stop at the last cell before it. Walking agents pass through each "
+    "other; nobody can stop in, or place a block into, the cell another agent is walking to.")
+
+
+def _with_walking(h: dict, mode: str | None) -> dict:
+    h = json.loads(json.dumps(h))
+    if mode is not None:
+        h["config"]["walking"] = mode
+    return h
+
+
+def _flat(text: str) -> str:
+    return re.sub(r"\s+", " ", text)
+
+
+class WalkingPromptTests(unittest.TestCase):
+    def test_prompt_version(self):
+        self.assertEqual(PROMPT_VERSION, "v5.1")
+
+    def test_continuous_wording_both_prompts(self):
+        for h, agent in ((make_header(3), "agent_1"), (make_header(1), "agent_1"), (team_header(), "red_2")):
+            with self.subTest(agent=agent, team="teams" in h):
+                sp = _flat(system_prompt(_with_walking(h, "continuous"), agent))
+                self.assertIn(CONTINUOUS_TEXT + " If there is no path, the move fails.", sp)
+                self.assertNotIn("becomes the destination", sp)
+                self.assertNotIn("at once", sp)
+
+    def test_teleport_and_missing_key_keep_old_sentence(self):
+        for h, agent in ((make_header(3), "agent_2"), (team_header(), "blue_1")):
+            for mode in (None, "teleport"):
+                with self.subTest(agent=agent, mode=mode):
+                    sp = system_prompt(_with_walking(h, mode), agent)
+                    self.assertIn(TELEPORT_SENTENCE, _flat(sp))
+                    self.assertNotIn("one cell at a time", sp)
+                    self.assertEqual(sp, system_prompt(h, agent))  # absent key == teleport, byte for byte
+
+    def test_only_the_walking_sentence_differs(self):
+        for h, agent in ((make_header(3), "agent_1"), (team_header(), "red_1")):
+            a = system_prompt(_with_walking(h, "teleport"), agent)
+            b = system_prompt(_with_walking(h, "continuous"), agent)
+            self.assertIn(TELEPORT_SENTENCE, a)
+            self.assertEqual(b, a.replace(TELEPORT_SENTENCE, CONTINUOUS_TEXT))
+
+    def test_tools_unchanged_by_walking(self):
+        for h, agent in ((make_header(3), "agent_1"), (team_header(), "red_1")):
+            base = json.dumps(tool_schemas(h, agent), sort_keys=True)
+            for mode in ("teleport", "continuous"):
+                self.assertEqual(json.dumps(tool_schemas(_with_walking(h, mode), agent), sort_keys=True), base)
+
+    def test_continuous_team_prompt_stays_neutral(self):
+        sp = system_prompt(_with_walking(team_header(), "continuous"), "red_1").lower()
+        for word in TEAM_BANNED + ["sword", "death", "dies", "killed"]:
+            self.assertNotIn(word, sp, word)
+        base = system_prompt(team_header(), "red_1").lower()
+        for word in ("health", "damage", "kill"):  # no more mentions than the teleport prompt has
+            self.assertEqual(sp.count(word), base.count(word), word)
+
+
+class WalkingObservationTests(unittest.TestCase):
+    def test_own_line_walking_with_destination(self):
+        v = make_view(pos=(10, 2, 0), t=3.0)
+        v["walking_until"] = 4.6
+        v["next_action_at"] = 4.6
+        v["destination"] = [16, 2, 0]
+        text = render_observation(v, ObservationMemory("agent_1"))
+        self.assertIn("You: agent_1 | feet at (10, 2, 0) (eyes at z=1.62) | walking to (16, 2, 0), arrive at t=4.6",
+                      text)
+
+    def test_teleport_view_unchanged(self):
+        # position already is the destination, or no destination given: old wording
+        for extra in ({}, {"destination": None}, {"destination": [12, 2, 0]}):
+            v = make_view(pos=(12, 2, 0), t=3.0)
+            v["walking_until"] = 4.6
+            v.update(extra)
+            text = render_observation(v, ObservationMemory("agent_1"))
+            self.assertIn("| walking, arrive at t=4.6", text)
+            self.assertNotIn("walking to", text)
+
+    def test_not_walking(self):
+        text = render_observation(make_view(pos=(12, 2, 0)), ObservationMemory("agent_1"))
+        self.assertIn("You: agent_1 | feet at (12, 2, 0) (eyes at z=1.62) | standing", text)
+
+    def test_other_agent_walking(self):
+        v = make_view(agents_visible=[{"id": "agent_2", "pos": [13, 3, 0], "walking": True, "airborne": False}])
+        text = render_observation(v, ObservationMemory("agent_1"))
+        self.assertIn("agent_2 [map 2]: feet at (13, 3, 0), offset (+1, +1, +0), ", text)
+        self.assertRegex(text, r"agent_2 \[map 2\]: .* walking\n")
+
+
 @unittest.skipUnless(getattr(recorder, "LOG_VERSION", 0) >= 4, "world.py is not on log format v4 yet")
 class EngineV4Tests(unittest.TestCase):
     def test_real_world(self):

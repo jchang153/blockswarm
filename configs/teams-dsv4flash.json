@@ -40,6 +40,7 @@
   "sword_damage": 7,
   "attack_reach": 3.0,
   "attack_cooldown_s": 0.6,
+  "walking": "continuous",
   "width": 40,
   "depth": 20,
   "height": 10,

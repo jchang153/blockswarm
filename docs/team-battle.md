@@ -51,8 +51,9 @@ shop (same ring logic as v4, per team). The default team-battle config: platform
   attacker not walking; attack cooldown respected (fail message prefix `"cooldown"`, not counted as
   an action, like the action cooldown); reach + line of sight as above (`out of reach` / `no line of
   sight` messages like `_need_reach`). Effect: target health −= `sword_damage` (min 0). Health ≤ 0 →
-  target **dies**. Positions use the same convention as everywhere else (a walking agent is at its
-  destination).
+  target **dies**. Positions use the same convention as everywhere else: with continuous walking
+  (docs/walking.md, the default) a walking target is at its current cell along its path; in
+  teleport logs it is at its destination.
 - **Death:** permanent for the episode. The dead agent's body is removed (its cells free up; nobody
   stands on it), its block inventory is lost (diff `inventory` shows the negative deltas), its done
   vote (if any) is removed, its blocks stay in the world. Any `act` by a dead agent returns

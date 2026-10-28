@@ -16,6 +16,7 @@ corner cutting). Straight steps cost 1, diagonal steps √2.
 
 from __future__ import annotations
 
+import bisect
 import heapq
 import math
 from typing import Callable, Iterator
@@ -106,6 +107,11 @@ class Terrain:
                     heapq.heappush(heap, (nd, n))
         return {c: dist[c] for c in done}, prev
 
+    def can_step(self, a: Pos, b: Pos) -> bool:
+        """Whether one walking step leads from feet cell `a` to feet cell `b` (same rules as
+        path planning, so `b` is also standable)."""
+        return any(n == tuple(b) for n, _ in self.neighbours(tuple(a)))  # type: ignore[arg-type]
+
     def path(self, start: Pos, goal: Pos) -> tuple[list[Pos], float] | None:
         """Shortest path (both ends included) and its length, or None if unreachable."""
         if start == goal:
@@ -122,7 +128,27 @@ class Terrain:
 
 def path_length(path: list[list[int]] | list[Pos]) -> float:
     """Walk length of a path: 1 per straight step, √2 per diagonal step."""
+    return cumulative_lengths(path)[-1] if path else 0.0
+
+
+def cumulative_lengths(path: list[list[int]] | list[Pos]) -> list[float]:
+    """`C_i` = walk length from path[0] to path[i] (summed in path order, so `C_n` equals
+    path_length and the Dijkstra distance bit for bit)."""
     total = 0.0
+    out = [0.0]
     for a, b in zip(path, path[1:]):
         total += SQRT2 if (a[0] != b[0] and a[1] != b[1]) else 1.0
-    return total
+        out.append(total)
+    return out
+
+
+def walk_times(path: list[list[int]] | list[Pos], depart_t: float, speed: float) -> list[float]:
+    """Continuous walking (docs/walking.md section 2): the time each path cell is reached,
+    `round(depart_t + C_i / speed, 3)` (the last one is the arrival time)."""
+    return [round(depart_t + c / speed, 3) for c in cumulative_lengths(path)]
+
+
+def walk_index(times: list[float], t: float) -> int:
+    """Index of the walker's current cell at time `t`: the largest i with times[i] <= t
+    (0 before departure)."""
+    return max(0, bisect.bisect_right(times, t) - 1)

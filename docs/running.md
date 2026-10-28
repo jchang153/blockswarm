@@ -85,14 +85,26 @@ with `"team_models": {"red": "<model a>", "blue": "<model b>"}` and put both mod
 `llm.prices`. Budget and cost control are unchanged (one shared `budget_usd` for all 10 agents,
 so expect about twice the spend of a 5-agent pilot).
 
-Agents get a separate prompt (prompts.py, `PROMPT_VERSION` v5.0): the brief, their team, the
-other team, the sides and the line, both shops, the team wallet, the channels (`say` = own team,
-`say_all` = everyone, `whisper` = one agent) and the sword/health rules as plain facts, with no
-hint either way about attacking or crossing. An agent that is killed stops its loop
+Agents get a separate prompt (prompts.py, `PROMPT_VERSION` v5.1): the brief, their team, the
+other team, the sides and the line, both shops, the team wallet and the channels (`say` = own
+team, `say_all` = everyone, `whisper` = one agent) as plain facts, with no hint either way about
+attacking or crossing. The sword is not explained: the `attack` tool says only "Hit another agent
+with your sword", and agents learn damage, health and death from what happens. An agent that is killed stops its loop
 (`agent_stop` reason `dead`); its blocks stay. The `--mock` policy for team battle builds on
 its own side and now and then uses team say, `say_all`, raids across the line and `attack`, so
 a mock log shows every new mechanic in the viewer. The manifest adds `wallets`, `health`,
 `dead`, `kills` and per-team `teams` from `episode_end`.
+
+### Walking
+
+`"walking": "continuous"` (the default; set explicitly in `configs/teams-*.json`) makes a
+walking agent move along its path cell by cell: its body, eyes, reach and visibility are at its
+current cell, a walk stops early if a cell ahead becomes blocked or unstandable, walkers pass
+through each other, and an agent's destination is reserved against others' moves and placing
+(docs/walking.md). `"teleport"` is the old behaviour (position becomes the destination at once).
+Logs whose header config has no `walking` key are teleport logs. The prompts (v5.1) describe
+whichever mode the config uses; with teleport the v4 shop prompt is byte-identical to before.
+Observations show the agent's current cell and, while walking, its destination and arrival time.
 
 ## Outputs: `runs/<run_id>/` (git-ignored)
 

@@ -1,7 +1,8 @@
 """Replay an episode log from its header by applying event diffs; check every snapshot.
 
 Reads v5 logs (v4 plus the team battle: team wallets and votes, chat channels, combat;
-docs/team-battle.md), v4 logs (shop and shared wallet) and v3 logs (physical chest; see
+docs/team-battle.md; with `config.walking == "continuous"` walkers move cell by cell,
+docs/walking.md), v4 logs (shop and shared wallet) and v3 logs (physical chest; see
 docs/log-format.md).
 """
 
@@ -10,7 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from blockswarm.pathing import path_length
+from blockswarm.pathing import path_length, walk_index, walk_times
 from blockswarm.tasks import analysis, deployed, individual_scores, ranking, side_team, team_summary
 from blockswarm.world import AIRBORNE_MSG, COOLDOWN_MSG, DIFF_KEYS, LIMIT_MSG, WALKING_MSG
 
@@ -51,6 +52,11 @@ def replay(records: list[dict]) -> dict:
     combat settings, deaths (inventory lost, vote dropped, no events from the dead),
     `health` / `dead` in snapshots, and `kills` and the per-team `teams` stats at the end.
     Without teams a v5 log is checked like v4 (with `diff.combat` and the v5 snapshot keys).
+    Continuous walking (v5 `config.walking == "continuous"`; a missing key means teleport):
+    positions are current cells, recomputed from each walk's path and timing at every record's
+    `t` (docs/walking.md section 2); truncation entries (`stopped`, `path_offset`) must cut the
+    walk at a cell ahead of the current one with the walk's timing; falls and deaths end walks;
+    snapshots' `walks` must match the walks in progress.
     v4: checks blocks, wallet (every `buy` costs price x n from the header catalog; nothing else
     changes it), inventories, positions, walkers, actions used, votes, `individual_scores` and
     `analysis` (recomputed) in every snapshot and the `episode_end`, plus `ranking` and
@@ -120,6 +126,15 @@ def replay(records: list[dict]) -> dict:
     removed_by_other = {tm: 0 for tm in team_names}
     positions = {a: list(p) for a, p in header["positions"].items()}
     walking_until = {a: 0.0 for a in agents}
+    continuous = v5 and cfg.get("walking", "teleport") == "continuous"
+    walks: dict[str, dict] = {}  # continuous walking: walks in progress (path, times, depart_t, arrive_t)
+
+    def advance(t: float) -> None:
+        for a in list(walks):
+            w = walks[a]
+            positions[a] = list(w["path"][walk_index(w["times"], t)])
+            if t >= w["arrive_t"]:
+                del walks[a]
     blocks: dict[tuple, list] = {}
     inventories = {a: dict(header["inventories"].get(a, {})) for a in agents}
     actions_used = {a: 0 for a in agents}
@@ -182,6 +197,35 @@ def replay(records: list[dict]) -> dict:
         walkers = {a: w for a, w in walking_until.items() if w > rec["t"]}
         if rec["walking_until"] != walkers:
             raise AssertionError(f"{where}: walking_until mismatch {rec['walking_until']} vs {walkers}")
+        if continuous:
+            want_walks = {a: {"path": [list(c) for c in w["path"]], "depart_t": w["depart_t"],
+                              "arrive_t": w["arrive_t"]} for a, w in walks.items() if w["arrive_t"] > rec["t"]}
+            if rec.get("walks") != want_walks:
+                raise AssertionError(f"{where}: walks mismatch {rec.get('walks')} vs {want_walks}")
+        elif "walks" in rec:
+            raise AssertionError(f"{where}: walks in a teleport log")
+
+    def stop_walk(eid: int, rec: dict, agent: str, mv: dict) -> None:
+        """A truncated walk (docs/walking.md section 4): the walker goes on to `to` and stops."""
+        w = walks.get(agent)
+        if not continuous or w is None or rec["tool"] == "move_to" or not rec["diff"]["grid"] and \
+                not rec["diff"]["combat"].get("killed"):
+            raise AssertionError(f"event {eid}: truncation of {agent} without a walk changed by the grid")
+        k = mv.get("path_offset")
+        cut = mv["path"]
+        end = (k or 0) + len(cut) - 1
+        if (k != walk_index(w["times"], rec["t"]) or not cut or mv["from"] != positions[agent]
+                or cut[0] != mv["from"] or cut[-1] != mv["to"] or w["path"][k:end + 1] != cut
+                or end >= len(w["path"]) - 1 or mv["depart_t"] != w["depart_t"]):
+            raise AssertionError(f"event {eid}: bad truncation of {agent}'s walk: {mv}")
+        arrive = max(w["times"][end], rec["t"])
+        if mv["arrive_t"] != arrive:
+            raise AssertionError(f"event {eid}: truncated arrive_t {mv['arrive_t']} != {arrive}")
+        walking_until[agent] = arrive
+        if end == k:
+            del walks[agent]
+        else:
+            w.update(path=w["path"][:end + 1], times=w["times"][:end + 1], arrive_t=arrive)
 
     for i, rec in enumerate(records[1:], start=1):
         kind = rec.get("type")
@@ -191,6 +235,7 @@ def replay(records: list[dict]) -> dict:
             if rec["t"] < last_t:
                 raise AssertionError(f"record {i}: t went backwards ({rec['t']} < {last_t})")
             last_t = rec["t"]
+            advance(rec["t"])
         if kind == "event":
             eid = rec["event_id"]
             if eid != last_event_id + 1:
@@ -291,6 +336,10 @@ def replay(records: list[dict]) -> dict:
                 if mv.get("dead"):
                     if agent != killed or mv != {"dead": True, "at": positions[agent]}:
                         raise AssertionError(f"event {eid}: bad death entry for {agent}: {mv}")
+                    walks.pop(agent, None)
+                    continue
+                if mv.get("stopped"):
+                    stop_walk(eid, rec, agent, mv)
                     continue
                 if mv["from"] != positions[agent] or mv["path"][0] != mv["from"] or mv["path"][-1] != mv["to"]:
                     raise AssertionError(f"event {eid}: bad move for {agent}")
@@ -307,6 +356,15 @@ def replay(records: list[dict]) -> dict:
                     pass  # lifted by a block placed under its feet mid-jump; lands at arrive_t
                 else:
                     walking_until[agent] = mv["arrive_t"]  # walking or falling: busy until arrival
+                walks.pop(agent, None)  # a new walk, a fall or a jump ends any walk
+                if (continuous and rec["tool"] == "move_to" and agent == actor and not mv.get("fall")
+                        and len(mv["path"]) > 1):
+                    times = walk_times(mv["path"], mv["depart_t"], cfg["walk_speed"])
+                    times[-1] = mv["arrive_t"]
+                    walks[agent] = {"path": [list(c) for c in mv["path"]], "times": times,
+                                    "depart_t": mv["depart_t"], "arrive_t": mv["arrive_t"]}
+                    positions[agent] = list(mv["from"])  # it walks from here (advanced below)
+                    continue
                 positions[agent] = list(mv["to"])
             if killed is not None:
                 if killed not in diff["agents"]:

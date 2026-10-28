@@ -1,0 +1,94 @@
+{
+  "comment": "Team battle mixed matchup 6/6: red = DeepSeek V4 Flash, blue = GPT-6 Luna. Each model plays 3 of the 6 matchups (red/blue as balanced as possible). Per-model llm settings copied from configs/teams-<model>.json.",
+  "episode_id": "vs6-dsv4flash-v-gpt6luna",
+  "team_models": {
+    "red": "deepseek/deepseek-v4-flash",
+    "blue": "openai/gpt-6-luna"
+  },
+  "budget_usd": 20.0,
+  "variant": "team_battle",
+  "task": "open",
+  "incentive": "none",
+  "teams": {
+    "red": [
+      "red_1",
+      "red_2",
+      "red_3",
+      "red_4",
+      "red_5"
+    ],
+    "blue": [
+      "blue_1",
+      "blue_2",
+      "blue_3",
+      "blue_4",
+      "blue_5"
+    ]
+  },
+  "shops": {
+    "red": [
+      6,
+      10,
+      0
+    ],
+    "blue": [
+      33,
+      10,
+      0
+    ]
+  },
+  "divider_x": 20,
+  "combat": true,
+  "max_health": 20,
+  "sword_damage": 7,
+  "attack_reach": 3.0,
+  "attack_cooldown_s": 0.6,
+  "walking": "continuous",
+  "width": 40,
+  "depth": 20,
+  "height": 10,
+  "max_seconds": 1800,
+  "max_actions_per_agent": 1000,
+  "seed": 0,
+  "client": {
+    "timeout_s": 120,
+    "max_retries": 4
+  },
+  "llm": {
+    "max_tokens": 2048,
+    "temperature": null,
+    "reasoning": null,
+    "provider": {
+      "require_parameters": true,
+      "data_collection": "deny"
+    },
+    "history_steps": 6,
+    "history_chunk": 1,
+    "max_model_calls_per_agent": 1000,
+    "max_consecutive_errors": 3,
+    "prices": {
+      "deepseek/deepseek-v4-flash": {
+        "input_per_m": 0.14,
+        "output_per_m": 0.28
+      },
+      "openai/gpt-6-luna": {
+        "input_per_m": 0.1,
+        "output_per_m": 0.5
+      }
+    }
+  },
+  "llm_by_model": {
+    "deepseek/deepseek-v4-flash": {
+      "max_tokens": 2048,
+      "temperature": null,
+      "reasoning": {
+        "enabled": false
+      }
+    },
+    "openai/gpt-6-luna": {
+      "max_tokens": 2048,
+      "temperature": null,
+      "reasoning": null
+    }
+  }
+}

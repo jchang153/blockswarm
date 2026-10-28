@@ -16,6 +16,8 @@ Config keys: any World Config field (width, starting_money, incentive, max_secon
   "team_models": {team: model id} instead of "model"/"models" (e.g. one model per team),
   "llm": LLMConfig fields (max_tokens, temperature, reasoning, provider, history_steps,
          max_model_calls_per_agent, prices, ...),
+  "llm_by_model": {model id: {LLMConfig fields}} overrides merged onto "llm" for agents using that
+         model (e.g. reasoning settings that differ between the two teams' models),
   "budget_usd", "episode_id", "client": {"timeout_s", "max_retries"},
   "mock": {"latency_s": [lo, hi], "seed"} (only used with mock=True),
   and free-form "comment" / "model_candidates" / keys starting with "_" (ignored).
@@ -49,7 +51,7 @@ from blockswarm.world import Config, World
 
 REPO = Path(__file__).resolve().parents[2]
 PLACEHOLDER_MODEL = "CHOOSE_MODEL"
-META_KEYS = {"episode_id", "model", "models", "team_models", "llm", "budget_usd", "n_agents", "agents",
+META_KEYS = {"episode_id", "model", "models", "team_models", "llm", "llm_by_model", "budget_usd", "n_agents", "agents",
              "client", "mock", "comment", "model_candidates"}
 WORLD_KEYS = {f.name for f in fields(Config)} - {"agents", "models", "run_meta"}
 # Rough prompt size used for the dry-run spend estimate (system + tools + window), in tokens.
@@ -140,6 +142,19 @@ def resolve_config(raw: dict, *, n_agents: int | None = None, budget_usd: float 
     except (TypeError, ValueError) as e:
         raise ConfigError(f"llm: {e}") from None
     llm.allow_unknown_price = llm.allow_unknown_price or allow_unknown_price or mock
+    by_model = raw.get("llm_by_model") or {}
+    if not isinstance(by_model, dict) or not all(isinstance(v, dict) for v in by_model.values()):
+        raise ConfigError("llm_by_model must be a dict model id -> dict of llm settings")
+    stray = sorted(set(by_model) - set(models.values()))
+    if stray:
+        raise ConfigError(f"llm_by_model has models no agent uses: {stray}")
+    llm_for: dict[str, LLMConfig] = {}
+    for model in sorted(set(models.values())):
+        try:
+            llm_for[model] = LLMConfig.from_dict({**(raw.get("llm") or {}), **by_model.get(model, {})})
+        except (TypeError, ValueError) as e:
+            raise ConfigError(f"llm_by_model[{model}]: {e}") from None
+        llm_for[model].allow_unknown_price = llm.allow_unknown_price
     prices: dict[str, dict] = {}
     for model in sorted(set(models.values())):
         try:
@@ -162,7 +177,8 @@ def resolve_config(raw: dict, *, n_agents: int | None = None, budget_usd: float 
     client = dict(raw.get("client") or {})
     if set(client) - {"timeout_s", "max_retries"}:
         raise ConfigError("client accepts only timeout_s and max_retries")
-    return {"agents": agents, "models": models, "llm": llm, "prices": prices, "budget_usd": float(b),
+    return {"agents": agents, "models": models, "llm": llm, "llm_for": llm_for, "prices": prices,
+            "budget_usd": float(b),
             "world_kwargs": world_kwargs, "world_cfg": world_cfg, "episode_id": raw.get("episode_id"),
             "client": client, "mock": dict(raw.get("mock") or {})}
 
@@ -173,8 +189,9 @@ def spend_plan(rc: dict) -> dict:
     per_agent = []
     for a in rc["agents"]:
         p = rc["prices"][rc["models"][a]]
-        out_only = estimate_cost(p, 0, llm.max_tokens, 1.0)
-        typical = estimate_cost(p, TYPICAL_PROMPT_TOKENS, llm.max_tokens, llm.price_safety)
+        own = rc["llm_for"][rc["models"][a]]
+        out_only = estimate_cost(p, 0, own.max_tokens, 1.0)
+        typical = estimate_cost(p, TYPICAL_PROMPT_TOKENS, own.max_tokens, own.price_safety)
         per_agent.append({"agent": a, "model": rc["models"][a], "price": p,
                           "per_call_reservation_usd~": typical, "per_call_output_cap_usd": out_only})
     n = len(rc["agents"])
@@ -528,6 +545,10 @@ def run_episode(config_path: str | Path, *, run_dir: str | Path | None = None, d
                 "llm": {k: getattr(llm, k) for k in ("max_tokens", "temperature", "reasoning", "provider",
                                                      "history_steps", "history_chunk",
                                                      "max_model_calls_per_agent")}}
+    by_model = {m: {k: getattr(c, k) for k in ("max_tokens", "temperature", "reasoning")}
+                for m, c in rc["llm_for"].items()}
+    if len({json.dumps(v, sort_keys=True) for v in by_model.values()}) > 1:
+        run_meta["llm_by_model"] = by_model
     manifest: dict = {"run_id": run_id, "episode_id": episode_id, "status": "running", "mock": mock,
                       "config_path": str(config_path), "git": git, "prompt_version": run_meta["prompt_version"],
                       "models": rc["models"], "n_agents": len(rc["agents"]), "budget_usd": rc["budget_usd"],
@@ -550,7 +571,7 @@ def run_episode(config_path: str | Path, *, run_dir: str | Path | None = None, d
             client = OpenRouterClient(env["OPENROUTER_API_KEY"], **rc["client"])
 
     rng = random.Random(world_cfg.seed)
-    agents = [LLMAgent(world, a, client, rc["models"][a], budget, llm, late_sink=late_sink,
+    agents = [LLMAgent(world, a, client, rc["models"][a], budget, rc["llm_for"][rc["models"][a]], late_sink=late_sink,
                        start_delay_s=rng.uniform(0, llm.stagger_s)) for a in rc["agents"]]
     results: dict[str, str] = {}
 

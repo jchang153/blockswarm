@@ -43,7 +43,8 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
             "models": null | {"agent_1": "provider/model-name", ...},
             "run_meta": null | {"run_id": "...", "prompt_version": "...", ...},
             "variant": "shop", "teams": null, "shops": null, "divider_x": null, "combat": false,
-            "max_health": 20, "sword_damage": 7, "attack_reach": 3.0, "attack_cooldown_s": 0.6},
+            "max_health": 20, "sword_damage": 7, "attack_reach": 3.0, "attack_cooldown_s": 0.6,
+            "walking": "continuous"},
  "task": {"kind": "open", "brief": "Work together to build a house that all of you could live in. Agree on a design together."},
  "clock": "simulated" | "wall",
  "grid": {"width": 24, "depth": 24, "height": 10},
@@ -72,6 +73,9 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
 - Team size: 1–16 agents. These config values are logged **resolved**; by default they scale
   with N = number of agents: `starting_money` = 100·N, `deploy_top_k` = max(1, N // 2),
   `target_interior` = 4·N.
+- **[v5]** `config.walking`: `"continuous"` (walkers move cell by cell; see "Continuous
+  walking" below). The engine leaves the key out in `"teleport"` mode, and **a config without
+  it means `"teleport"`** (every log written before continuous walking, v3 and v4 included).
 - `config.models` (agent id → model name, any subset of the agents) and `config.run_meta`
   (free-form JSON) are set by the LLM orchestrator and logged as given; `null` in scripted runs.
 
@@ -123,9 +127,11 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
                          "depart_t": 42.137, "arrive_t": 44.010}}
   ```
   `path` includes both ends; `arrive_t = depart_t + walk length / walk_speed`, where a
-  straight step counts 1 and a diagonal step √2. The agent's position becomes `to`
-  immediately (for collision and reach rules); until `arrive_t` its action-cost calls fail
-  with a message starting `"walking:"` and use nothing up. Viewers animate along `path`.
+  straight step counts 1 and a diagonal step √2. In teleport mode the agent's position
+  becomes `to` immediately (for collision and reach rules); with continuous walking it moves
+  along `path` over time (see "Continuous walking"). Either way, until `arrive_t` its
+  action-cost calls fail with a message starting `"walking:"` and use nothing up. Viewers
+  animate along `path`.
   **[v4]** Paths may go through door blocks (a body may be in a door cell); every other
   block and the shop are impassable.
 - Other position changes use the same `diff.agents` entry shape:
@@ -158,7 +164,8 @@ exact replay checks and fast seeking.
 ```
 **[v4]** `wallet` instead of `chest`; `individual_scores` and `analysis` (see "Incentive and
 analysis") instead of `team_score` / `score_details`. `positions` and `walking_until` (only
-agents still walking at the snapshot's `t`). `after_event_id` is the last event included in
+agents still walking at the snapshot's `t`). With continuous walking `positions` are the
+current cells at the snapshot's `t` and there is a `walks` key (see "Continuous walking"). `after_event_id` is the last event included in
 the state (`-1` if none yet). `done_votes` lists the current voters in the order they voted
 (compare as a set).
 
@@ -263,6 +270,44 @@ without combat), `dead` (agents in order of death, `[]` if none); `done_votes` b
 
 Sample log: `tests/data/v5_team_battle_sample.jsonl` (regenerate with
 `python3 -m tests.make_v5_fixture`).
+
+## Continuous walking
+Present when `config.walking == "continuous"` (the default for new runs; design:
+[walking.md](walking.md)). Without the key the log is teleport: everything as described above.
+
+**Where a walker is.** For a walk with `path = [p0 … pn]`, `depart_t` and
+`v = config.walk_speed`, let `C_i` be the walk length from `p0` to `p_i` (summed step by step,
+1 straight, √2 diagonal). Cell `p_i` is reached at `round(depart_t + C_i / v, 3)` (so `p_n` at
+`arrive_t`), and the walker's **current cell** at time `t` is `p_i` for the largest `i` reached
+by `t`. Bodies, eyes, reach and line-of-sight targets, visibility, support and falls all use the
+current cell at the event's `t`. While walking, the destination `p_n` and the cell above it are
+reserved: other agents' `move_to` to a spot overlapping them fails with `"<dest> is reserved:
+<walker> is walking to <p_n>"`, and so does a `place` into them; paths may pass through them, and
+walkers pass through each other.
+
+**Truncation.** After every successful event that changes the grid (or kills an agent), every
+walk in progress is re-checked against the grid (bodies ignored). If a future cell `p_j` is no
+longer standable or no longer enterable from `p_{j-1}`, the walk is cut: the event's
+`diff.agents` gets, for that walker,
+```json
+"agent_2": {"from": [5, 5, 0], "to": [5, 7, 0], "path": [[5, 5, 0], [5, 6, 0], [5, 7, 0]],
+            "depart_t": 0.0, "arrive_t": 0.927, "stopped": true, "path_offset": 2}
+```
+`from` = the current cell, `to` = the new end, `path` = the original path from the current cell
+to the new end, `depart_t` = the walk's original departure, `path_offset` = index in the
+original path of `path[0]`, so cell `path[k]` is still reached at
+`round(depart_t + C_{k + path_offset} / v, 3)` with `C` from the original path. The new end is
+normally `p_{j-1}`; if that cell (or the one above it) holds a standing agent's body or another
+walker's reserved destination, the end moves back along the path, but never behind the current
+cell. `arrive_t` = when the new end is reached, or the event's `t` if the walker is already
+there (the walk is then over). `walking_until` follows the new `arrive_t`.
+A walker whose current cell loses its support falls as before (`"fall": true` entry), which ends
+the walk; a killed walker's death entry `at` is its current cell and its walk ends.
+
+**Snapshots** add `walks: {agent: {"path": [...], "depart_t", "arrive_t"}}` for walks in
+progress at the snapshot's `t` (after any truncation: `path` is the original path cut at the
+new end, from `p0`). `positions` (snapshots and `episode_end`) are current cells.
+`blockswarm/replay.py` recomputes current cells from these rules and checks them.
 
 ## Incentive and analysis
 Computed by `blockswarm/tasks.py`. There is **no team score**.

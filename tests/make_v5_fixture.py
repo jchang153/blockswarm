@@ -5,10 +5,12 @@ Regenerate (from the repo root) after any engine change that alters the log:
 tests/test_teams.py checks that the file is up to date and that replay.py verifies it.
 
 The episode: 2 teams (red: 3 agents, blue: 2) on a 16 x 8 x 6 platform split at x = 8, on a
-simulated clock. Buys, places on each side, team / public / private chat, finished votes, a red
-agent crossing the line and removing a blue block (clears only blue's votes), a failed
-out-of-reach attack, a hit, an attack on cooldown, a kill in 3 hits (inventory lost, vote
-dropped), a dead agent's ignored action, and an all_done end.
+simulated clock, with continuous walking (docs/walking.md). Buys, places on each side, team /
+public / private chat, finished votes, a red agent crossing the line and removing a blue block
+(clears only blue's votes), a failed out-of-reach attack, a hit, an attack on cooldown, a kill in
+3 hits (inventory lost, vote dropped), a dead agent's ignored action, a give to a walker mid-path
+(out of reach at its destination), a snapshot taken mid-walk (`walks`), a walk truncated by a
+block placed on a cell ahead of the walker (`stopped`, `path_offset`), and an all_done end.
 """
 
 from __future__ import annotations
@@ -31,7 +33,8 @@ TEAMS = {"red": ["red_1", "red_2", "red_3"], "blue": ["blue_1", "blue_2"]}
 
 def fixture_config() -> Config:
     return Config(width=16, depth=8, height=6, agents=TEAMS["red"] + TEAMS["blue"], teams=TEAMS,
-                  shops={"red": [3, 4, 0], "blue": [12, 4, 0]}, snapshot_interval_s=2.0)
+                  shops={"red": [3, 4, 0], "blue": [12, 4, 0]}, snapshot_interval_s=2.0,
+                  walking="continuous")
 
 
 def build_fixture(path: str | Path | None = None) -> World:
@@ -80,9 +83,23 @@ def build_fixture(path: str | Path | None = None) -> World:
     # blue_2 removes red's block on blue's side: red's blocks_placed_by_team (3, all places) now
     # differs from red blocks standing (2) and blocks_by_team_on_other_side drops to 0
     at(8.2, "blue_2", "remove", x=9, y=7, z=0)
-    at(8.5, "red_3", "declare_done")
-    at(9.0, "blue_1", "declare_done")
-    at(9.4, "blue_2", "declare_done")  # every living agent has voted: all_done
+    # continuous walking: red_3 walks east along y = 3 (straight, 8 cells; cell i is reached at
+    # 9.6 + i / 4.317). red_1 hands it a plank as it passes (at its destination it would be out of
+    # reach); the snapshot at 10.1 catches it mid-walk at (4, 3, 0); blue_1 then blocks (8, 3, 0)
+    # ahead of it, so it stops at (7, 3, 0) instead of (10, 3, 0).
+    at(9.6, "red_3", "move_to", x=10, y=3, z=0)
+    clock.advance_to(9.9)
+    if w.positions["red_3"] != (3, 3, 0):
+        raise AssertionError(f"red_3 should be at (3, 3, 0) at 9.9, is at {w.positions['red_3']}")
+    at(9.9, "red_1", "give", to="red_3", type="oak_planks", n=1)
+    at(10.1, "blue_1", "place", x=8, y=3, z=0, type="stone")
+    stop = w.recorder.records[-1]["diff"]["agents"].get("red_3", {})
+    if not stop.get("stopped") or stop["to"] != [7, 3, 0] or stop["path_offset"] != 2:
+        raise AssertionError(f"red_3's walk should stop at (7, 3, 0): {stop}")
+    at(10.5, "red_3", "declare_done", ok=False)  # still walking (until 10.99)
+    at(11.2, "red_3", "declare_done")
+    at(11.4, "blue_1", "declare_done")
+    at(11.6, "blue_2", "declare_done")  # every living agent has voted: all_done
     if w.end_reason != "all_done":
         raise AssertionError(f"expected all_done, got {w.end_reason}")
     w.recorder.close()

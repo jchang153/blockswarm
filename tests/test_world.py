@@ -175,7 +175,7 @@ class TestBodiesAndShop(unittest.TestCase):
         self.assertEqual(w.analysis()["leftovers"], 1)  # the shop itself isn't a block
 
     def test_stand_on_shop(self):
-        w = make_world(positions=[[12, 2, 0], [5, 3, 0]])
+        w = make_world(positions=[[12, 2, 0], [5, 3, 0]], walking="teleport")
         self.assertTrue(w.act("a", "move_to", x=13, y=2, z=1).ok)  # step up onto the shop
         self.assertEqual(w.positions["a"], (13, 2, 1))
 
@@ -196,7 +196,8 @@ class TestBodiesAndShop(unittest.TestCase):
 
 class TestMoving(unittest.TestCase):
     def test_move_walk_time_and_walking_rules(self):
-        w = make_world(positions=[NEAR_SHOP, [5, 3, 0]])
+        # teleport semantics (logs before docs/walking.md); continuous: tests/test_walking.py
+        w = make_world(positions=[NEAR_SHOP, [5, 3, 0]], walking="teleport")
         r = w.act("b", "move_to", x=8, y=6, z=0)
         self.assertTrue(r.ok)
         mv = events(w)[-1]["diff"]["agents"]["b"]
@@ -689,7 +690,7 @@ class TestSnapshots(unittest.TestCase):
         self.assertEqual(replay(w.recorder.records)["snapshots_checked"], 5)
 
     def test_positions_and_walkers_in_snapshot(self):
-        w = make_world(snapshot_interval_s=1)
+        w = make_world(snapshot_interval_s=1, walking="teleport")  # continuous: tests/test_walking.py
         w.act("b", "move_to", x=5, y=9, z=0)
         w.clock.advance_to(1.0)
         w.act("a", "observe")
