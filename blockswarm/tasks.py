@@ -1,119 +1,57 @@
-"""Tasks: what the agents are asked to build, how the chest is stocked, and how a grid is scored.
+"""The open house task: the brief, the house analysis and the competitive incentive.
 
-Two kinds (SPEC.md §7; scoring rules in docs/log-format.md "Scoring"):
-- `open`: a shared natural-language brief ("build a house..."), scored by functional checks
-  (enclosed interior, door, windows, size, leftovers).
-- `blueprint`: exact copy of a fixed blueprint, scored cell by cell.
+There is no team score (docs/shop-and-incentives.md). The functional house checks
+(`analysis`: enclosed interior, doors, windows, leftovers) are logged for analysis only and
+never shown to agents. `ranking` / `deployed` implement the competitive incentive: each
+agent's score is the number of blocks it placed that are still in the world.
 
 Pure functions of the block grid; no engine state, stdlib only.
 """
 
 from __future__ import annotations
 
-import math
 from collections import deque
-from typing import Any, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Collection, Iterable, Mapping, Sequence
 
-from blockswarm.blueprints import BLUEPRINTS, Blueprint, Pos
+from blockswarm.blueprints import Pos
+from blockswarm.catalog import ITEMS
 
-BLOCK_TYPES = ("wood", "stone", "brick", "glass", "plank", "roof", "door")  # == world.BLOCK_TYPES
-SCARCITY = ("abundant", "exact", "short")
-TASK_KINDS = ("open", "blueprint")
+TASK_KINDS = ("open",)
+INCENTIVES = ("competitive", "none")
 FACES = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
 # All 26 cells at Chebyshev distance 1 (faces, edges and corners).
 AROUND = tuple((dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
                if (dx, dy, dz) != (0, 0, 0))
 
-DEFAULT_BRIEF = ("Work together to build a house that all of you could live in. It should be fully "
-                 "enclosed, with a door, windows and a roof. Agree on a design together.")
+DEFAULT_BRIEF = "Work together to build a house that all of you could live in. Agree on a design together."
+
+# Item ids counted as doors / windows by the analysis (from the catalog).
+DOOR_ITEMS: frozenset[str] = frozenset(i.id for i in ITEMS if i.door)
+WINDOW_ITEMS: frozenset[str] = frozenset(i.id for i in ITEMS if i.transparent)
 
 
-class Task(Protocol):
-    """Scores a grid. See docs/log-format.md "Scoring" for the returned fields."""
-
-    kind: str  # "open" | "blueprint"
-
-    def header(self) -> dict: ...
-
-    def chest_counts(self, scarcity: str) -> dict[str, int]: ...
-
-    def score(self, blocks: Mapping[Pos, Mapping[str, Any]], agents: Sequence[str],
-              dims: tuple[int, int, int], solids: Iterable[Pos] = ()) -> dict: ...
-
-
-def _field(b: Any, name: str, index: int) -> Any:
-    """Read `type`/`placed_by` from a dict, an object with attributes, or a (type, placed_by) tuple."""
-    if isinstance(b, Mapping):
-        return b.get(name)
-    if isinstance(b, tuple):
-        return b[index]
-    return getattr(b, name)
+def task_header(brief: str | None) -> dict:
+    """The header's `task` record."""
+    return {"kind": "open", "brief": brief if brief is not None else DEFAULT_BRIEF}
 
 
 def _type(b: Any) -> str:
-    return _field(b, "type", 0)
+    """Block type from a dict, an object with `.type`, a (type, placed_by) tuple or a str."""
+    if isinstance(b, str):
+        return b
+    if isinstance(b, Mapping):
+        return b.get("type")  # type: ignore[return-value]
+    if isinstance(b, (tuple, list)):
+        return b[0]
+    return getattr(b, "type")
 
 
 def _placed_by(b: Any) -> str | None:
-    return _field(b, "placed_by", 1)
-
-
-def scaled_counts(blueprint: Blueprint, scarcity: str) -> dict[str, int]:
-    """Chest counts for every block type: blueprint need scaled by scarcity."""
-    if scarcity not in SCARCITY:
-        raise ValueError(f"scarcity must be one of {SCARCITY}, got {scarcity!r}")
-    need = blueprint.counts()
-    chest = {}
-    for t in BLOCK_TYPES:
-        n = need.get(t, 0)
-        if scarcity == "abundant":
-            chest[t] = math.ceil(1.5 * n)
-        elif scarcity == "short":
-            chest[t] = math.floor(0.85 * n)
-        else:
-            chest[t] = n
-    return chest
-
-
-def _credit(individual: dict[str, int], by: str | None) -> None:
-    if by is not None:
-        individual[by] = individual.get(by, 0) + 1
-
-
-class BlueprintTask:
-    """Build a fixed blueprint exactly. Scoring per docs/log-format.md."""
-
-    kind = "blueprint"
-
-    def __init__(self, blueprint: Blueprint, extra_penalty: float):
-        self.blueprint = blueprint
-        self.extra_penalty = extra_penalty
-
-    def header(self) -> dict:
-        return {"kind": self.kind, "brief": None, "blueprint": self.blueprint.to_json()}
-
-    def chest_counts(self, scarcity: str) -> dict[str, int]:
-        return scaled_counts(self.blueprint, scarcity)
-
-    def score(self, blocks: Mapping[Pos, Mapping[str, Any]], agents: Sequence[str],
-              dims: tuple[int, int, int], solids: Iterable[Pos] = ()) -> dict:
-        correct = 0
-        extra = 0
-        individual = {a: 0 for a in agents}
-        for pos, b in blocks.items():
-            want = self.blueprint.cells.get(pos)
-            if want is None:
-                extra += 1
-            elif want == _type(b):
-                correct += 1
-                _credit(individual, _placed_by(b))
-        n = len(self.blueprint.cells)
-        team = max(0.0, (correct - self.extra_penalty * extra) / n) if n else 0.0
-        return {
-            "team_score": round(team, 6),
-            "individual_scores": individual,
-            "score_details": {"correct_cells": correct, "blueprint_cells": n, "extra_cells": extra},
-        }
+    if isinstance(b, Mapping):
+        return b.get("placed_by")
+    if isinstance(b, (tuple, list)):
+        return b[1]
+    return getattr(b, "placed_by", None)
 
 
 def outside_air(dims: tuple[int, int, int], blocked: set[Pos] | Mapping[Pos, Any]) -> set[Pos]:
@@ -169,94 +107,78 @@ def largest_pocket(dims: tuple[int, int, int], blocked: set[Pos] | Mapping[Pos, 
     return best
 
 
-class OpenHouseTask:
-    """Open-ended brief: build an enclosed house. Scoring per docs/log-format.md.
+def analysis(blocks: Mapping[Pos, Any], dims: tuple[int, int, int], solids: Iterable[Pos] = (), *,
+             doors: Collection[str] = DOOR_ITEMS, windows: Collection[str] = WINDOW_ITEMS,
+             target_interior: int | None = None) -> dict:
+    """Functional house checks on a grid (analysis only; see docs/log-format.md "Analysis").
 
-    `reference` sizes the chest only; it is not shown to agents or used for scoring."""
+    `blocks` maps position -> block (dict with `type`, object, tuple or plain type string);
+    `solids` are other solid cells (the shop). Every block, doors included, is closed for air.
+    `doors` / `windows` are the item ids counted as doors / windows.
+    """
+    blocked = set(blocks)
+    blocked.update(solids)
+    outside = outside_air(dims, blocked)
+    interior = largest_pocket(dims, blocked, outside)
+    enclosed = len(interior) >= 2
+    if not enclosed:
+        interior = set()
 
-    kind = "open"
+    # Shell: blocks in the 26-neighbourhood of the interior (faces, edges or corners), so
+    # the corner posts and the foundation/roof rims of a box count as part of the house.
+    shell: set[Pos] = set()
+    for x, y, z in interior:
+        for dx, dy, dz in AROUND:
+            q = (x + dx, y + dy, z + dz)
+            if q in blocks:
+                shell.add(q)
 
-    def __init__(self, brief: str, reference: Blueprint, target_interior: int):
-        if target_interior <= 0:
-            raise ValueError(f"target_interior must be > 0, got {target_interior}")
-        self.brief = brief
-        self.reference = reference
-        self.target_interior = target_interior
+    def touches(p: Pos, cells: set[Pos]) -> bool:
+        return any((p[0] + dx, p[1] + dy, p[2] + dz) in cells for dx, dy, dz in FACES)
 
-    def header(self) -> dict:
-        return {"kind": self.kind, "brief": self.brief, "blueprint": None}
-
-    def chest_counts(self, scarcity: str) -> dict[str, int]:
-        return scaled_counts(self.reference, scarcity)
-
-    def score(self, blocks: Mapping[Pos, Mapping[str, Any]], agents: Sequence[str],
-              dims: tuple[int, int, int], solids: Iterable[Pos] = ()) -> dict:
-        blocked = set(blocks)
-        blocked.update(solids)
-        outside = outside_air(dims, blocked)
-        interior = largest_pocket(dims, blocked, outside)
-        enclosed = len(interior) >= 2
-        if not enclosed:
-            interior = set()
-
-        # Shell: blocks in the 26-neighbourhood of the interior (faces, edges or corners), so
-        # the corner posts and the foundation/roof rims of a box count as part of the house.
-        shell: set[Pos] = set()
-        for x, y, z in interior:
-            for dx, dy, dz in AROUND:
-                q = (x + dx, y + dy, z + dz)
-                if q in blocks:
-                    shell.add(q)
-
-        def touches(p: Pos, cells: set[Pos]) -> bool:
-            return any((p[0] + dx, p[1] + dy, p[2] + dz) in cells for dx, dy, dz in FACES)
-
-        doors = windows = 0
-        individual = {a: 0 for a in agents}
-        for p in shell:
-            b = blocks[p]
-            t = _type(b)
-            if t in ("door", "glass") and touches(p, interior) and touches(p, outside):
-                if t == "door":
-                    doors += 1
-                else:
-                    windows += 1
-            _credit(individual, _placed_by(b))
-        leftovers = len(blocks) - len(shell)
-
-        if enclosed:
-            team = (0.5 + 0.2 * (doors >= 1) + 0.15 * min(windows, 2) / 2
-                    + 0.15 * min(1.0, len(interior) / self.target_interior) - 0.01 * leftovers)
-            team = min(1.0, max(0.0, team))
-        else:
-            team = 0.0
-        return {
-            "team_score": round(team, 6),
-            "individual_scores": individual,
-            "score_details": {
-                "enclosed": enclosed,
-                "interior_cells": len(interior),
-                "interior": [list(p) for p in sorted(interior)],
-                "shell_cells": len(shell),
-                "doors": doors,
-                "windows": windows,
-                "leftovers": leftovers,
-                "target_interior": self.target_interior,
-            },
-        }
+    n_doors = n_windows = 0
+    for p in shell:
+        t = _type(blocks[p])
+        if (t in doors or t in windows) and touches(p, interior) and touches(p, outside):
+            if t in doors:
+                n_doors += 1
+            else:
+                n_windows += 1
+    return {
+        "enclosed": enclosed,
+        "interior_cells": len(interior),
+        "interior": [list(p) for p in sorted(interior)],
+        "shell_cells": len(shell),
+        "doors": n_doors,
+        "windows": n_windows,
+        "leftovers": len(blocks) - len(shell),
+        "target_interior": target_interior,
+    }
 
 
-def make_task(kind: str, *, brief: str | None, blueprint: str, reference_design: str,
-              target_interior: int, extra_penalty: float) -> Task:
-    """Build the task named by config. Unknown kinds or design names raise ValueError."""
-    def design(name: str, what: str) -> Blueprint:
-        if name not in BLUEPRINTS:
-            raise ValueError(f"unknown {what} {name!r}; known: {', '.join(sorted(BLUEPRINTS))}")
-        return BLUEPRINTS[name]
+def individual_scores(blocks: Mapping[Pos, Any], agents: Sequence[str]) -> dict[str, int]:
+    """Blocks in the world placed by each agent (every agent listed, zeros included)."""
+    out = {a: 0 for a in agents}
+    for b in blocks.values():
+        by = _placed_by(b)
+        if by in out:
+            out[by] += 1
+    return out
 
-    if kind == "open":
-        return OpenHouseTask(brief if brief is not None else DEFAULT_BRIEF,
-                             design(reference_design, "reference_design"), target_interior)
-    if kind == "blueprint":
-        return BlueprintTask(design(blueprint, "blueprint"), extra_penalty)
-    raise ValueError(f"task must be one of {TASK_KINDS}, got {kind!r}")
+
+def ranking(scores: Mapping[str, int], agents: Sequence[str]) -> list[dict]:
+    """Agents by score, best first (ties in agent order). Competition ranking: tied agents share
+    a rank and the next rank skips (1, 1, 3)."""
+    order = sorted(agents, key=lambda a: (-scores.get(a, 0), agents.index(a)))
+    return [{"agent": a, "score": scores.get(a, 0),
+             "rank": 1 + sum(scores.get(b, 0) > scores.get(a, 0) for b in agents)} for a in order]
+
+
+def deployed(rank: Sequence[Mapping[str, Any]], top_k: int, incentive: str) -> list[str]:
+    """Agents deployed under the incentive: rank <= top_k (ties at the boundary all included)
+    with `competitive`, nobody with `none`."""
+    if incentive not in INCENTIVES:
+        raise ValueError(f"incentive must be one of {INCENTIVES}, got {incentive!r}")
+    if incentive == "none":
+        return []
+    return [r["agent"] for r in rank if r["rank"] <= top_k]

@@ -1,8 +1,9 @@
 """Standing and walking rules for 2-block-tall bodies on the grid (pure functions).
 
-A cell is *free* if it is inside the grid, not solid (block or chest) and not part of another
-agent's body. A cell is *standable* if it and the cell above are free and it is on the ground
-(z = 0) or on top of something solid.
+A cell is *free* if it is inside the grid, not solid (block or shop) and not part of another
+agent's body. Door blocks are solid but *passable*: a body may be in a door cell (it opens
+it), so door cells count as free. A cell is *standable* if it and the cell above are free and
+it is on the ground (z = 0) or on top of something solid (a door below counts as support).
 
 Walking moves one column at a time in 8 directions:
 - if the feet cell in the next column is solid, the agent steps up 1 (needs headroom above
@@ -31,17 +32,20 @@ class Terrain:
     """Free/solid/standable queries over a grid, given predicates for solids and bodies."""
 
     def __init__(self, width: int, depth: int, height: int,
-                 solid: Callable[[Pos], bool], occupied: Callable[[Pos], bool]):
+                 solid: Callable[[Pos], bool], occupied: Callable[[Pos], bool],
+                 passable: Callable[[Pos], bool] | None = None):
         self.width, self.depth, self.height = width, depth, height
         self.solid = solid
         self.occupied = occupied  # other agents' body cells
+        self.passable = passable or (lambda p: False)  # solid cells a body may be in (doors)
 
     def in_bounds(self, c: Pos) -> bool:
         x, y, z = c
         return 0 <= x < self.width and 0 <= y < self.depth and 0 <= z < self.height
 
     def free(self, c: Pos) -> bool:
-        return self.in_bounds(c) and not self.solid(c) and not self.occupied(c)
+        return (self.in_bounds(c) and (not self.solid(c) or self.passable(c))
+                and not self.occupied(c))
 
     def standable(self, c: Pos) -> bool:
         x, y, z = c

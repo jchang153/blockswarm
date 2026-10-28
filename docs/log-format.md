@@ -1,6 +1,9 @@
-# Episode log format (v3: live, embodied)
+# Episode log format (v4: shop, shared wallet, competitive incentive)
 
-v3 adds agent bodies: positions, walking and the physical chest (marked **[v3]** below).
+v4 replaces v3's physical chest with a shop and a shared wallet, makes block types the shop's
+catalog items, drops the team score and the blueprint task, and adds the competitive
+incentive (design: [shop-and-incentives.md](shop-and-incentives.md)). Changes from v3 are
+marked **[v4]**; v3 is described at the end ("Reading v3 logs"). Readers must still read v3.
 
 One episode = one JSONL file (one JSON object per line). The engine writes it; the
 viewer and analysis tools read it. It is the ground truth for everything that happened.
@@ -20,34 +23,41 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
 
 ### `header` (exactly one, first line)
 ```json
-{"type": "header", "log_version": 3, "episode_id": "demo-house-exact",
- "config": {"width": 16, "depth": 16, "height": 8, "agents": ["agent_1", "agent_2", "agent_3"],
-            "blueprint": "house", "scarcity": "exact", "inventory_cap": 12,
-            "max_seconds": 600, "max_actions_per_agent": 300, "action_cooldown_s": 0.0,
-            "snapshot_interval_s": 10, "payoff": "team", "mixed_alpha": 0.5,
-            "extra_penalty": 0.1, "seed": 0, "max_message_chars": 1000,
-            "chest_pos": [13, 2, 0], "start_positions": null, "walk_speed": 4.317,
-            "reach": 4.5, "eye_height": 1.62, "view_radius": 8, "jump_airtime": 0.6,
-            "task": "open", "brief": "Work together to build a house ...",
-            "reference_design": "house", "target_interior": 12, "chest_scale": 1.0,
-            "reach_line_of_sight": true, "view_occlusion": true,
+{"type": "header", "log_version": 4, "episode_id": "demo-open_house",
+ "config": {"width": 24, "depth": 24, "height": 10, "agents": ["agent_1", "agent_2", "agent_3"],
+            "inventory_cap": 12, "max_seconds": 600, "max_actions_per_agent": 300,
+            "action_cooldown_s": 0.0, "snapshot_interval_s": 10, "seed": 0,
+            "max_message_chars": 1000, "shop_pos": [12, 4, 0], "starting_money": 300,
+            "start_positions": null, "walk_speed": 4.317, "reach": 4.5, "eye_height": 1.62,
+            "view_radius": 8, "jump_airtime": 0.6, "task": "open", "brief": null,
+            "target_interior": 12, "incentive": "competitive", "deploy_top_k": 1,
+            "show_leaderboard": false, "reach_line_of_sight": true, "view_occlusion": true,
             "models": null | {"agent_1": "provider/model-name", ...},
             "run_meta": null | {"run_id": "...", "prompt_version": "...", ...}},
- "task": {"kind": "open" | "blueprint", "brief": "..." | null,
-          "blueprint": null | {"name": "house", "cells": [[4, 5, 0, "stone"], ...]}},
+ "task": {"kind": "open", "brief": "Work together to build a house that all of you could live in. Agree on a design together."},
  "clock": "simulated" | "wall",
- "grid": {"width": 16, "depth": 16, "height": 8},
+ "grid": {"width": 24, "depth": 24, "height": 10},
  "agents": ["agent_1", "agent_2", "agent_3"],
- "chest_pos": [13, 2, 0],
- "positions": {"agent_1": [12, 3, 0], "agent_2": [14, 3, 0], "agent_3": [12, 1, 0]},
- "block_types": ["wood", "stone", "brick", "glass", "plank", "roof", "door"],
- "chest": {"stone": 35, "brick": 52, ...},
+ "shop": {"pos": [12, 4, 0], "starting_money": 300,
+          "catalog": [{"id": "dirt", "name": "Dirt", "family": "earth", "price": 1,
+                       "color": "#86603c", "transparent": false, "door": false}, ...]},
+ "wallet": 300,
+ "positions": {"agent_1": [11, 5, 0], "agent_2": [13, 5, 0], "agent_3": [11, 3, 0]},
+ "block_types": ["dirt", "cobblestone", ...],
  "inventories": {"agent_1": {}, "agent_2": {}, "agent_3": {}}}
 ```
-- Team size: 1–16 agents. `config.target_interior` and `config.chest_scale` are logged
-  **resolved**: by default they scale with N = number of agents (`target_interior` = 4·N,
-  `chest_scale` = N / 3 for the open task and 1.0 for the blueprint task, so N = 3 gives 12 and 1.0). The header `chest` is the task's counts for
-  the scarcity setting × `chest_scale`, each type rounded up (zero stays zero).
+- **[v4]** No `chest` / `chest_pos`. `shop` = position, the full catalog (`blockswarm/catalog.py`;
+  every item a full cube; `transparent` items don't block sight, `door` items can be walked
+  through but are closed for air) and `starting_money`; `wallet` = the shared wallet's
+  starting balance (= `starting_money`). `block_types` = the catalog's item ids in order.
+- **[v4]** `task` = `{"kind": "open", "brief": "..."}` (the brief as given to agents; the
+  default if `config.brief` is null). Config drops `blueprint`, `scarcity`, `payoff`,
+  `mixed_alpha`, `extra_penalty`, `chest_pos`, `chest_scale` and `reference_design`; adds
+  `shop_pos`, `starting_money`, `incentive` (`"competitive"` | `"none"`), `deploy_top_k`,
+  `show_leaderboard`. `target_interior` stays (analysis only).
+- Team size: 1–16 agents. These config values are logged **resolved**; by default they scale
+  with N = number of agents: `starting_money` = 100·N, `deploy_top_k` = max(1, N // 2),
+  `target_interior` = 4·N.
 - `config.models` (agent id → model name, any subset of the agents) and `config.run_meta`
   (free-form JSON) are set by the LLM orchestrator and logged as given; `null` in scripted runs.
 
@@ -59,19 +69,25 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
  "diff": {
    "grid": [{"pos": [4, 5, 0], "before": null,
              "after": {"type": "stone", "placed_by": "agent_2", "placed_at": 42.137}}],
-   "chest": {},
+   "wallet": 0,
    "inventory": {"agent_2": {"stone": -1}},
    "agents": {},
    "votes": {"before": ["agent_1", "agent_3"], "after": []}
  },
  "chat": null}
 ```
-- `cost`: `"action"` (move_to, jump, take, deposit, give, place, remove, declare_done,
-  cancel_done), `"message"` (say, whisper) or `"free"` (observe, note).
-- `diff` always has the five keys `grid`, `chest`, `inventory`, `agents`, `votes`; they are
-  empty when nothing changed (always the case when `ok` is false). Chest and inventory values
-  are signed deltas. (Earlier v3 logs have only the first four keys; readers should then
-  derive votes the old way: every successful `declare_done` adds a vote, nothing removes one.)
+- `cost`: `"action"` (move_to, jump, buy, give, place, remove, declare_done, cancel_done),
+  `"message"` (say, whisper) or `"free"` (observe, note). Any other tool name (e.g. v3's
+  `take` / `deposit`) fails as an unknown tool and costs an action.
+- **[v4]** `diff` always has the five keys `grid`, `wallet`, `inventory`, `agents`, `votes`.
+  `wallet` is the signed change of the shared wallet (an int, `0` when unchanged); the others
+  are empty when nothing changed. All are empty/0 when `ok` is false. Inventory values are
+  signed deltas. Block `type`s are catalog item ids.
+- **[v4]** `buy(item, n)`: needs the shop within reach (and line of sight; transparent items
+  don't block it), the buyer not walking, `n ≥ 1`, `price × n ≤` wallet, and room in the
+  buyer's inventory (`inventory_cap`). A successful buy has
+  `"wallet": -price*n, "inventory": {"<buyer>": {"<item>": n}}`. Nothing else changes the
+  wallet (no selling).
 - `diff.votes` — the collective "finished" vote: `{}` when the set of voters did not change,
   else `{"before": [...], "after": [...]}` (agent ids, sorted). Rules:
   `declare_done` adds the caller's vote, `cancel_done` removes it (both succeed as no-ops when
@@ -83,7 +99,7 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
   finished (2 of 3 votes)"}`, "... withdrew its finished vote (1 of 3 votes)", "agent_3 changed
   the build, so all finished votes were cleared"), which carry the event's `event_id` and `t`;
   they are derived from these events and not logged separately.
-- **[v3]** `diff.agents` is filled by a successful `move_to`:
+- `diff.agents` is filled by a successful `move_to`:
   ```json
   "agents": {"agent_2": {"from": [12, 3, 0], "to": [6, 4, 1],
                          "path": [[12, 3, 0], [11, 3, 0], ..., [6, 4, 1]],
@@ -93,7 +109,9 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
   straight step counts 1 and a diagonal step √2. The agent's position becomes `to`
   immediately (for collision and reach rules); until `arrive_t` its action-cost calls fail
   with a message starting `"walking:"` and use nothing up. Viewers animate along `path`.
-- **[v3]** Other position changes use the same `diff.agents` entry shape:
+  **[v4]** Paths may go through door blocks (a body may be in a door cell); every other
+  block and the shop are impassable.
+- Other position changes use the same `diff.agents` entry shape:
   - `jump()`: entry with `"jump": true`, `from` = `to` = current position, `path` = `[from]`,
     `arrive_t = depart_t + jump_airtime` (the landing time). While airborne the agent's feet
     cell is free; `move_to` fails with a message starting `"airborne:"` (uses nothing up).
@@ -114,17 +132,18 @@ after each interval boundary, written just before that event) and once at the en
 exact replay checks and fast seeking.
 ```json
 {"type": "snapshot", "seq": 3, "t": 30.004, "after_event_id": 211,
- "team_score": 0.31, "individual_scores": {"agent_1": 12, ...},
- "score_details": {...},
+ "individual_scores": {"agent_1": 12, "agent_2": 9, "agent_3": 0},
+ "analysis": {...},
  "blocks": [[4, 5, 0, "stone", "agent_2", 12.51], ...],
- "chest": {"stone": 0, ...}, "inventories": {"agent_1": {"brick": 3}, ...},
+ "wallet": 188, "inventories": {"agent_1": {"oak_planks": 3}, ...},
  "actions_used": {"agent_1": 40, ...}, "done_votes": ["agent_1"],
  "positions": {"agent_1": [6, 4, 1], ...}, "walking_until": {"agent_2": 44.01}}
 ```
-**[v3]** `positions` and `walking_until` (only agents still walking at the snapshot's `t`).
-`after_event_id` is the last event included in the state (`-1` if none yet).
-
-`done_votes` lists the current voters in the order they voted (compare as a set).
+**[v4]** `wallet` instead of `chest`; `individual_scores` and `analysis` (see "Incentive and
+analysis") instead of `team_score` / `score_details`. `positions` and `walking_until` (only
+agents still walking at the snapshot's `t`). `after_event_id` is the last event included in
+the state (`-1` if none yet). `done_votes` lists the current voters in the order they voted
+(compare as a set).
 
 ### `model_call` (LLM runs only; any number, anywhere between header and episode_end)
 One model request/response, written by the orchestrator through the world's lock, so it sits
@@ -145,7 +164,13 @@ ignore these records; the public site export strips them.
 ```json
 {"type": "episode_end", "t": 187.402,
  "reason": "all_done" | "time_limit" | "action_limit" | "aborted" | "budget" | "error",
- "team_score": 1.0, "individual_scores": {...}, "score_details": {...},
+ "wallet": 12,
+ "individual_scores": {"agent_1": 47, "agent_2": 43, "agent_3": 40},
+ "ranking": [{"agent": "agent_1", "score": 47, "rank": 1},
+             {"agent": "agent_2", "score": 43, "rank": 2},
+             {"agent": "agent_3", "score": 40, "rank": 3}],
+ "deployed": ["agent_1"],
+ "analysis": {...},
  "actions_used": {...}}
 ```
 `all_done` = every agent's finished vote is present at once. `time_limit` = `max_seconds`
@@ -153,35 +178,50 @@ reached. `action_limit` = every agent has used `max_actions_per_agent`. `aborted
 early (e.g. every agent quit, or a runner gave up). `budget` = the orchestrator's spending
 limit (tokens / cost) was reached. `error` = the orchestrator stopped on an unrecoverable error.
 
-## Scoring
-Computed by the task (`blockswarm/tasks.py`). Every snapshot and the `episode_end` carry
-`team_score` (0–1), `individual_scores` (agent → int) and `score_details` (task-specific;
-viewers should show its keys generically).
+## Incentive and analysis
+Computed by `blockswarm/tasks.py`. There is **no team score**.
 
-**`open` task** — `score_details`:
+**[v4] Incentive.** `individual_scores[a]` = blocks in the world with `placed_by == a` (every
+agent listed, zeros included); a removed block no longer counts for whoever placed it.
+`ranking` lists every agent, best first (ties in the order of `agents`); `rank` is
+competition ranking (1 + the number of agents with a strictly higher score, so ties share a
+rank: 1, 1, 3). `deployed` = agents with `rank ≤ config.deploy_top_k`, in ranking order (so ties
+at the boundary are all deployed) when `config.incentive` is `"competitive"`; `[]` when it is
+`"none"` (the ranking is still logged). Agents see `scores` (= current `individual_scores`) in
+their view only with `config.show_leaderboard`.
+
+**Analysis** (logged only, never shown to agents):
 `{"enclosed": bool, "interior_cells": int, "interior": [[x,y,z], ...], "shell_cells": int,
 "doors": int, "windows": int, "leftovers": int, "target_interior": 12}`.
 - Outside air = empty cells reachable by face-steps from any empty cell on the grid's
-  boundary or above the top layer, through empty cells (doors and the chest block movement).
+  boundary or above the top layer, through empty cells (every block, doors included, and the
+  shop block it).
 - Interior = the largest connected region of empty cells not reachable from outside;
-  `enclosed` = interior has ≥ 2 cells.
+  `enclosed` = interior has ≥ 2 cells (else the interior is empty).
 - Shell = blocks within one cell (any of the 26 neighbours, so edges and corners count) of an
-  interior cell. Door / window = door / glass block in the
-  shell that is face-adjacent to both an interior cell and outside air. Leftovers = blocks not
-  in the shell.
-- `team_score` = 0 if not enclosed, else 0.5 + 0.2·[doors ≥ 1] + 0.15·min(windows, 2)/2
-  + 0.15·min(1, interior_cells / target_interior) − 0.01·leftovers, clamped to [0, 1],
-  rounded to 6 decimals.
-- `individual_scores[a]` = shell blocks with `placed_by == a`.
-
-**`blueprint` task** — `score_details`: `{"correct_cells", "blueprint_cells", "extra_cells"}`.
-- Correct = blueprint position holds a block of the blueprint's type. Extra = block at a
-  position not in the blueprint (wrong-type blocks on blueprint positions are neither).
-- `team_score = correct / blueprint_cells − extra_penalty · extra / blueprint_cells`, floored at 0.
-- `individual_scores[a]` = correct cells with `placed_by == a`.
+  interior cell. Door / window = a `door` / `transparent` catalog item in the shell that is
+  face-adjacent to both an interior cell and outside air. Leftovers = blocks not in the shell.
+- `target_interior` is the config value, for reference only.
 
 ## Orchestrator records (LLM runs)
 LLM runs add `agent_prompt` (each agent's system prompt, logged once and referenced by sha256
 from `model_call`), `model_call`, `tool_results`, `implicit_wait`, `agent_stop` and
 `orchestrator_error` records. They are described in [running.md](running.md). Replay and the
 viewers ignore them; the public site export drops them by default.
+
+## Reading v3 logs
+v3 logs (`log_version: 3`) differ as follows; `blockswarm/replay.py` reads both.
+- Header: `chest_pos` and `chest` (counts per type) instead of `shop` / `wallet`;
+  `block_types` = `["wood", "stone", "brick", "glass", "plank", "roof", "door"]`;
+  `task` = `{"kind": "open" | "blueprint", "brief": ..., "blueprint": null | {...}}`; config
+  has `blueprint`, `scarcity`, `payoff`, `mixed_alpha`, `extra_penalty`, `chest_pos`,
+  `chest_scale`, `reference_design` and no shop/incentive keys.
+- Tools `take(type, n)` / `deposit(type, n)` moved blocks between the chest and the
+  inventory (within reach of the chest); there was no `buy`.
+- Event `diff` keys: `grid`, `chest` (signed counts per type), `inventory`, `agents`, `votes`.
+  Early v3 logs have no `votes` key: derive votes the old way (every successful
+  `declare_done` adds a vote, nothing removes one).
+- Snapshots / `episode_end`: `chest` instead of `wallet`, and `team_score`,
+  `individual_scores` (shell blocks per agent in the open task, correct cells in the
+  blueprint task) and `score_details` (open task: the same keys as v4's `analysis`, with door
+  = type `door` and window = type `glass`). No `ranking` / `deployed`.

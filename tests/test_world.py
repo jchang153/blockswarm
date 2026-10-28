@@ -13,26 +13,31 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from blockswarm.blueprints import BLUEPRINTS  # noqa: E402
+from blockswarm.catalog import CATALOG, catalog_json  # noqa: E402
 from blockswarm.clock import SimClock, WallClock  # noqa: E402
 from blockswarm.live import run_live  # noqa: E402
 from blockswarm.pathing import SQRT2, Terrain  # noqa: E402
 from blockswarm.recorder import Recorder  # noqa: E402
 from blockswarm.replay import load_log, replay  # noqa: E402
 from blockswarm.scripted import ScriptedBuilder, run_simulated  # noqa: E402
-from blockswarm.world import Config, World, ray_cells  # noqa: E402
+from blockswarm.tasks import DEFAULT_BRIEF, deployed, ranking  # noqa: E402
+from blockswarm.world import Block, Config, World, ray_cells  # noqa: E402
 
-CHEST = (13, 2, 0)
-NEAR_CHEST = [12, 3, 0]
+SHOP = (13, 2, 0)
+NEAR_SHOP = [12, 3, 0]
 
 
 def make_world(positions=None, **kw) -> World:
-    """Two agents, a and b, on a simulated clock. Default: a next to the chest, b farther away."""
+    """Two agents, a and b, on a simulated clock, on a 16 x 16 x 8 grid with the shop at
+    (13, 2, 0) and 1000 coins. Default: a next to the shop, b farther away."""
     kw.setdefault("agents", ["a", "b"])
-    kw.setdefault("task", "blueprint")
-    kw.setdefault("blueprint", "hut_small")
-    kw.setdefault("chest_scale", 1.0)  # full blueprint counts even with two agents
+    kw.setdefault("width", 16)
+    kw.setdefault("depth", 16)
+    kw.setdefault("height", 8)
+    kw.setdefault("shop_pos", SHOP)
+    kw.setdefault("starting_money", 1000)
     if positions is not None or "start_positions" not in kw:
-        kw["start_positions"] = positions or [NEAR_CHEST, [5, 3, 0]]
+        kw["start_positions"] = positions or [NEAR_SHOP, [5, 3, 0]]
     return World(Config(**kw), clock=SimClock())
 
 
@@ -49,7 +54,7 @@ def build(w: World, agent: str, cells: list[tuple[int, int, int]], btype: str = 
     from blockswarm.world import Block
     for c in cells:
         w.blocks[c] = Block(btype, agent, 0.0)
-    w._scores_cache = None
+    w._analysis_cache = None
 
 
 def advance(w: World, dt: float) -> None:
@@ -58,49 +63,48 @@ def advance(w: World, dt: float) -> None:
 
 class TestConfigAndHeader(unittest.TestCase):
     def test_validation(self):
-        for bad in ({"task": "castle"}, {"blueprint": "castle"}, {"scarcity": "rare"}, {"payoff": "x"},
+        for bad in ({"task": "blueprint"}, {"blueprint": "house"}, {"scarcity": "exact"}, {"payoff": "team"},
+                    {"chest_pos": (1, 1, 0)}, {"chest_scale": 1.0},
                     {"agents": []}, {"agents": ["a", "a"]}, {"max_seconds": 0}, {"action_cooldown_s": -1},
-                    {"max_actions_per_agent": 0}, {"chest_pos": (16, 0, 0)}, {"jump_airtime": 0},
-                    {"task": "blueprint", "blueprint": "hut_small", "chest_pos": (7, 7, 0)},
+                    {"max_actions_per_agent": 0}, {"shop_pos": (24, 0, 0)}, {"jump_airtime": 0},
+                    {"incentive": "team"}, {"deploy_top_k": 0}, {"deploy_top_k": 4}, {"deploy_top_k": 1.5},
+                    {"starting_money": -1}, {"starting_money": 1.5}, {"starting_money": True},
+                    {"show_leaderboard": "yes"},
                     {"start_positions": [[1, 1, 0]]},
                     {"start_positions": [[1, 1, 1], [3, 3, 0], [5, 5, 0]]},
                     {"start_positions": [[1, 1, 0], [1, 1, 0], [5, 5, 0]]},
-                    {"start_positions": [[13, 2, 0], [3, 3, 0], [5, 5, 0]]}):
-            with self.assertRaises(ValueError, msg=str(bad)):
+                    {"start_positions": [[12, 4, 0], [3, 3, 0], [5, 5, 0]]}):
+            with self.assertRaises((ValueError, TypeError), msg=str(bad)):
                 Config(**bad)
-        Config(start_positions=[[13, 2, 1], [3, 3, 0], [5, 5, 0]])  # standing on the chest is fine
+        Config(start_positions=[[12, 4, 1], [3, 3, 0], [5, 5, 0]])  # standing on the shop is fine
+        c = Config()
+        self.assertEqual((c.width, c.depth, c.height, c.shop_pos), (24, 24, 10, (12, 4, 0)))
+        self.assertEqual((c.starting_money, c.incentive, c.deploy_top_k, c.show_leaderboard),
+                         (300, "competitive", 1, False))
 
     def test_header(self):
         w = World(Config(), clock=SimClock())
         h = w.recorder.records[0]
-        self.assertEqual(h["log_version"], 3)
+        self.assertEqual(h["log_version"], 4)
         self.assertEqual(h["clock"], "simulated")
-        self.assertEqual(h["task"]["kind"], "open")
-        self.assertIsNone(h["task"]["blueprint"])
-        self.assertTrue(h["task"]["brief"])
-        self.assertNotIn("blueprint", {k for k in h if k != "config"})
-        self.assertEqual(h["chest_pos"], [13, 2, 0])
-        self.assertEqual(h["positions"], {"agent_1": [12, 3, 0], "agent_2": [14, 3, 0], "agent_3": [12, 1, 0]})
-        for key in ("chest_pos", "start_positions", "walk_speed", "reach", "eye_height", "view_radius",
-                    "jump_airtime", "task", "brief", "reference_design", "target_interior",
+        self.assertEqual(h["task"], {"kind": "open", "brief": DEFAULT_BRIEF})
+        for gone in ("chest", "chest_pos"):
+            self.assertNotIn(gone, h)
+        for gone in ("blueprint", "scarcity", "payoff", "chest_scale", "chest_pos", "reference_design"):
+            self.assertNotIn(gone, h["config"])
+        self.assertEqual(h["shop"]["pos"], [12, 4, 0])
+        self.assertEqual(h["shop"]["starting_money"], 300)
+        self.assertEqual(h["shop"]["catalog"], catalog_json())
+        self.assertEqual(h["wallet"], 300)
+        self.assertEqual(h["positions"], {"agent_1": [11, 5, 0], "agent_2": [13, 5, 0], "agent_3": [11, 3, 0]})
+        for key in ("shop_pos", "starting_money", "incentive", "deploy_top_k", "show_leaderboard",
+                    "start_positions", "walk_speed", "reach", "eye_height", "view_radius",
+                    "jump_airtime", "task", "brief", "target_interior",
                     "reach_line_of_sight", "view_occlusion", "max_seconds", "max_actions_per_agent"):
             self.assertIn(key, h["config"])
-        self.assertEqual(h["config"]["chest_pos"], [13, 2, 0])
-        self.assertEqual(set(h["chest"]), set(h["block_types"]))
+        self.assertEqual(h["config"]["shop_pos"], [12, 4, 0])
+        self.assertEqual(h["block_types"], [i["id"] for i in h["shop"]["catalog"]])
         json.dumps(h)
-        bp = World(Config(task="blueprint", blueprint="hut_small"), clock=SimClock()).recorder.records[0]
-        self.assertEqual(bp["task"]["kind"], "blueprint")
-        self.assertEqual(len(bp["task"]["blueprint"]["cells"]), len(BLUEPRINTS["hut_small"].cells))
-
-    def test_scarcity_counts(self):
-        need = BLUEPRINTS["house"].counts()
-        for scarcity, f in (("exact", lambda n: n), ("abundant", lambda n: math.ceil(1.5 * n)),
-                            ("short", lambda n: math.floor(0.85 * n))):
-            for task in ("open", "blueprint"):
-                chest = World(Config(task=task, blueprint="house", scarcity=scarcity), clock=SimClock()).chest
-                for t, n in need.items():
-                    self.assertEqual(chest[t], f(n), (scarcity, task, t))
-                self.assertEqual(chest["wood"], 0)
 
 
 class TestTerrain(unittest.TestCase):
@@ -153,34 +157,36 @@ class TestTerrain(unittest.TestCase):
         self.assertEqual(ray_cells((0.5, 0.5, 0.5), (1, 1, 0)), [])  # exact diagonal through an edge
 
 
-class TestBodiesAndChest(unittest.TestCase):
-    def test_chest_is_solid(self):
+class TestBodiesAndShop(unittest.TestCase):
+    def test_shop_is_solid(self):
         w = make_world()
-        w.act("a", "take", type="stone", n=2)
+        w.act("a", "buy", item="stone", n=2)
         r = w.act("a", "place", x=13, y=2, z=0, type="stone")
         self.assertFalse(r.ok)
-        self.assertIn("chest", r.message)
-        self.assertFalse(w.act("a", "remove", x=13, y=2, z=0).ok)
-        self.assertTrue(w.act("a", "place", x=13, y=2, z=1, type="stone").ok)  # supported by the chest
+        self.assertIn("shop", r.message)
+        r = w.act("a", "remove", x=13, y=2, z=0)
+        self.assertFalse(r.ok)
+        self.assertIn("shop cannot be removed", r.message)
+        self.assertTrue(w.act("a", "place", x=13, y=2, z=1, type="stone").ok)  # supported by the shop
         self.assertTrue(w.standable((13, 3, 0)))
         self.assertFalse(w.standable((13, 2, 0)))
-        self.assertEqual(w.scores()["score_details"]["extra_cells"], 1)  # the chest itself isn't scored
+        self.assertEqual(w.analysis()["leftovers"], 1)  # the shop itself isn't a block
 
-    def test_stand_on_chest(self):
+    def test_stand_on_shop(self):
         w = make_world(positions=[[12, 2, 0], [5, 3, 0]])
-        self.assertTrue(w.act("a", "move_to", x=13, y=2, z=1).ok)  # step up onto the chest
+        self.assertTrue(w.act("a", "move_to", x=13, y=2, z=1).ok)  # step up onto the shop
         self.assertEqual(w.positions["a"], (13, 2, 1))
 
     def test_no_placing_into_bodies(self):
-        w = make_world(positions=[NEAR_CHEST, [11, 3, 0]])
-        w.act("a", "take", type="stone", n=3)
+        w = make_world(positions=[NEAR_SHOP, [11, 3, 0]])
+        w.act("a", "buy", item="stone", n=3)
         for cell in ((11, 3, 0), (11, 3, 1), (12, 3, 0), (12, 3, 1)):
             r = w.act("a", "place", x=cell[0], y=cell[1], z=cell[2], type="stone")
             self.assertFalse(r.ok, cell)
             self.assertIn("body", r.message)
 
     def test_two_agents_cannot_share_a_cell(self):
-        w = make_world(positions=[NEAR_CHEST, [10, 3, 0]])
+        w = make_world(positions=[NEAR_SHOP, [10, 3, 0]])
         r = w.act("b", "move_to", x=12, y=3, z=0)
         self.assertFalse(r.ok)
         self.assertIn("not standable", r.message)
@@ -188,7 +194,7 @@ class TestBodiesAndChest(unittest.TestCase):
 
 class TestMoving(unittest.TestCase):
     def test_move_walk_time_and_walking_rules(self):
-        w = make_world(positions=[NEAR_CHEST, [5, 3, 0]])
+        w = make_world(positions=[NEAR_SHOP, [5, 3, 0]])
         r = w.act("b", "move_to", x=8, y=6, z=0)
         self.assertTrue(r.ok)
         mv = events(w)[-1]["diff"]["agents"]["b"]
@@ -200,7 +206,7 @@ class TestMoving(unittest.TestCase):
         self.assertEqual(w.positions["b"], (8, 6, 0))  # moved immediately
         used = w.actions_used["b"]
         advance(w, 0.5)
-        r = w.act("b", "take", type="stone", n=1)
+        r = w.act("b", "buy", item="stone", n=1)
         self.assertFalse(r.ok)
         self.assertTrue(r.message.startswith("walking:"))
         self.assertEqual(w.actions_used["b"], used)  # consumed nothing
@@ -225,13 +231,12 @@ class TestMoving(unittest.TestCase):
 
 class TestReach(unittest.TestCase):
     def test_reach_limits(self):
-        w = make_world(positions=[NEAR_CHEST, [5, 3, 0]])
-        r = w.act("b", "take", type="stone", n=1)
+        w = make_world(positions=[NEAR_SHOP, [5, 3, 0]])
+        r = w.act("b", "buy", item="stone", n=1)
         self.assertFalse(r.ok)
         self.assertTrue(r.message.startswith("out of reach"))
         self.assertEqual(w.actions_used["b"], 1)  # an invalid action still counts
-        self.assertTrue(w.act("a", "take", type="stone", n=3).ok)
-        self.assertTrue(w.act("a", "deposit", type="stone", n=1).ok)
+        self.assertTrue(w.act("a", "buy", item="stone", n=2).ok)
         self.assertFalse(w.act("a", "place", x=6, y=3, z=0, type="stone").ok)  # far
         self.assertFalse(w.act("a", "give", to="b", type="stone", n=1).ok)  # b is far
         self.assertTrue(w.act("a", "place", x=10, y=3, z=0, type="stone").ok)
@@ -273,11 +278,12 @@ class TestReach(unittest.TestCase):
         w.inventories["a"] = {"stone": 1}
         self.assertTrue(w.act("a", "place", x=10, y=3, z=0, type="stone").ok)
 
-    def test_chest_behind_wall(self):
+    def test_shop_behind_wall(self):
         w = make_world(positions=[[10, 2, 0], [5, 3, 0]])
         build(w, "b", [(11, 2, z) for z in range(3)] + [(12, 2, z) for z in range(3)])
-        r = w.act("a", "take", type="stone", n=1)
+        r = w.act("a", "buy", item="stone", n=1)
         self.assertTrue(r.message.startswith("no line of sight"))
+        self.assertFalse(w.view("a")["shop_in_reach"])
 
     def test_reachable_stand_cells(self):
         w = make_world()
@@ -292,8 +298,8 @@ class TestReach(unittest.TestCase):
 
 class TestJumpAndFall(unittest.TestCase):
     def test_jump_and_place_under_self(self):
-        w = make_world(positions=[NEAR_CHEST, [5, 3, 0]])
-        w.act("a", "take", type="stone", n=3)
+        w = make_world(positions=[NEAR_SHOP, [5, 3, 0]])
+        w.act("a", "buy", item="stone", n=3)
         w.clock.advance_to(10)
         r = w.act("a", "jump")
         self.assertTrue(r.ok)
@@ -322,8 +328,8 @@ class TestJumpAndFall(unittest.TestCase):
         replay(w.recorder.records)
 
     def test_jump_lands_before_place(self):
-        w = make_world(positions=[NEAR_CHEST, [5, 3, 0]])
-        w.act("a", "take", type="stone", n=1)
+        w = make_world(positions=[NEAR_SHOP, [5, 3, 0]])
+        w.act("a", "buy", item="stone", n=1)
         w.act("a", "jump")
         w.clock.advance_to(0.7)
         r = w.act("a", "place", x=12, y=3, z=0, type="stone")
@@ -331,8 +337,8 @@ class TestJumpAndFall(unittest.TestCase):
         self.assertIn("body", r.message)
 
     def test_other_agent_places_under_jumper(self):
-        w = make_world(positions=[NEAR_CHEST, [11, 3, 0]])
-        w.act("a", "take", type="stone", n=1)
+        w = make_world(positions=[NEAR_SHOP, [11, 3, 0]])
+        w.act("a", "buy", item="stone", n=1)
         w.act("b", "jump")
         w.clock.advance_to(0.2)
         self.assertTrue(w.act("a", "place", x=11, y=3, z=0, type="stone").ok)
@@ -340,9 +346,9 @@ class TestJumpAndFall(unittest.TestCase):
         replay(w.recorder.records)
 
     def test_jump_with_blocked_headroom(self):
-        w = make_world(positions=[NEAR_CHEST, [5, 3, 0]])
+        w = make_world(positions=[NEAR_SHOP, [5, 3, 0]])
         build(w, "b", [(12, 4, 2)])
-        w.act("a", "take", type="stone", n=2)
+        w.act("a", "buy", item="stone", n=2)
         self.assertTrue(w.act("a", "place", x=12, y=3, z=2, type="stone").ok)  # supported sideways
         w.act("a", "jump")
         r = w.act("a", "place", x=12, y=3, z=0, type="stone")
@@ -355,8 +361,8 @@ class TestJumpAndFall(unittest.TestCase):
         self.assertTrue(w.act("b", "jump").message.startswith("walking:"))
 
     def test_fall_self_and_others(self):
-        w = make_world(positions=[NEAR_CHEST, [11, 3, 0]])
-        w.act("a", "take", type="stone", n=3)
+        w = make_world(positions=[NEAR_SHOP, [11, 3, 0]])
+        w.act("a", "buy", item="stone", n=3)
         # b climbs a 2-high tower: jump, a places under it, twice
         for z in (0, 1):
             w.act("b", "jump")
@@ -380,7 +386,7 @@ class TestJumpAndFall(unittest.TestCase):
         replay(w.recorder.records)
 
     def test_fall_several_cells(self):
-        w = make_world(positions=[NEAR_CHEST, [5, 3, 0]])
+        w = make_world(positions=[NEAR_SHOP, [5, 3, 0]])
         build(w, "a", [(11, 3, 2), (11, 2, 2)])  # a ledge: (11,3,2) hangs off (11,2,2)... both floating
         w.positions["b"] = (11, 3, 3)
         r = w.act("a", "remove", x=11, y=3, z=2)
@@ -410,24 +416,26 @@ class TestView(unittest.TestCase):
         self.assertEqual(w2.view("a")["agents_visible"],
                          [{"id": "c", "pos": [3, 4, 0], "walking": False, "airborne": False}])
 
-    def test_chest_visibility(self):
-        w = make_world(positions=[NEAR_CHEST, [5, 3, 0]])
+    def test_wallet_and_shop_in_view(self):
+        w = make_world(positions=[NEAR_SHOP, [5, 3, 0]])
         v = w.view("a")
-        self.assertEqual(v["chest"], w.chest)
-        self.assertEqual(v["chest_last_seen"]["t"], 0.0)
-        self.assertIsNone(w.view("b")["chest"])
-        self.assertIsNone(w.view("b")["chest_last_seen"])
-        w.act("a", "take", type="stone", n=2)
+        self.assertEqual((v["wallet"], v["shop_pos"], v["shop_in_reach"]), (1000, [13, 2, 0], True))
+        for gone in ("chest", "chest_pos", "chest_last_seen", "payoff", "scores", "analysis"):
+            self.assertNotIn(gone, v)
+        vb = w.view("b")
+        self.assertEqual((vb["wallet"], vb["shop_in_reach"]), (1000, False))  # far away: still sees the wallet
+        w.act("a", "buy", item="glass", n=2)
+        self.assertEqual(w.view("b")["wallet"], 1000 - 2 * CATALOG["glass"].price)
         w.act("a", "move_to", x=5, y=6, z=0)
-        w.clock.advance_to(10)
-        v = w.view("a")
-        self.assertIsNone(v["chest"])
-        self.assertEqual(v["chest_last_seen"]["counts"]["stone"], w.chest["stone"])
-        w.act("b", "move_to", x=11, y=3, z=0)
-        w.clock.advance_to(20)
-        w.act("b", "take", type="stone", n=1)  # a doesn't see this
-        self.assertEqual(w.view("a")["chest_last_seen"]["counts"]["stone"], w.chest["stone"] + 1)
-        self.assertEqual(w.view("b")["chest"]["stone"], w.chest["stone"])
+        self.assertFalse(w.view("a")["shop_in_reach"])  # walking
+        json.dumps(v)
+
+    def test_leaderboard(self):
+        w = make_world(positions=[NEAR_SHOP, [11, 4, 0]], show_leaderboard=True)
+        w.act("a", "buy", item="stone", n=2)
+        w.act("a", "place", x=11, y=2, z=0, type="stone")
+        self.assertEqual(w.view("b")["scores"], {"a": 1, "b": 0})
+        self.assertNotIn("scores", make_world().view("a"))
 
     def test_messages_and_privacy(self):
         w = make_world()
@@ -435,7 +443,7 @@ class TestView(unittest.TestCase):
         w.act("a", "whisper", to="b", text="secret")
         w.act("a", "whisper", to="b", text="secret 2")
         w.act("a", "note", text="mine")
-        w.act("a", "take", type="stone", n=1)
+        w.act("a", "buy", item="stone", n=1)
         vb = w.view("b")
         self.assertEqual([m["text"] for m in vb["messages"]], ["public one", "secret", "secret 2"])
         self.assertEqual([m["text"] for m in w.view("b", since_event_id=1)["messages"]], ["secret 2"])
@@ -443,42 +451,88 @@ class TestView(unittest.TestCase):
         self.assertEqual(vb["notes"], [])
         self.assertEqual(vb["inventory"], {})
         self.assertEqual(w.view("a")["notes"], ["mine"])
-        self.assertEqual(w.view("a")["task"]["kind"], "blueprint")
+        self.assertEqual(w.view("a")["task"]["kind"], "open")
         json.dumps(w.view("a"))
 
 
-class TestInventoryAndChest(unittest.TestCase):
+class TestInventoryAndShop(unittest.TestCase):
     def setUp(self):
-        self.w = make_world(positions=[NEAR_CHEST, [11, 4, 0]])
+        self.w = make_world(positions=[NEAR_SHOP, [11, 4, 0]])
 
     def test_inventory_cap(self):
         w = self.w
-        self.assertTrue(w.act("a", "take", type="brick", n=12).ok)
-        self.assertIn("cap", w.act("a", "take", type="stone", n=1).message)
-        w.inventories["b"] = {"brick": 12}
-        w.act("a", "deposit", type="brick", n=1)
-        w.act("a", "take", type="stone", n=1)
-        self.assertFalse(w.act("a", "give", to="b", type="stone", n=1).ok)
+        self.assertTrue(w.act("a", "buy", item="bricks", n=12).ok)
+        r = w.act("a", "buy", item="stone", n=1)
+        self.assertIn("cap", r.message)
+        self.assertEqual(w.wallet, 1000 - 12 * CATALOG["bricks"].price)  # nothing charged
+        w.inventories["b"] = {"bricks": 12}
+        self.assertFalse(w.act("a", "give", to="b", type="bricks", n=1).ok)
 
     def test_cap_on_remove(self):
         w = self.w
-        w.act("a", "take", type="stone", n=1)
+        w.act("a", "buy", item="stone", n=1)
         w.act("a", "place", x=11, y=2, z=0, type="stone")
-        w.act("a", "take", type="brick", n=12)
+        w.act("a", "buy", item="bricks", n=12)
         self.assertFalse(w.act("a", "remove", x=11, y=2, z=0).ok)
         self.assertIn((11, 2, 0), w.blocks)
 
-    def test_chest_underflow_and_bad_n(self):
-        w = self.w
-        self.assertFalse(w.act("a", "take", type="door", n=w.chest["door"] + 1).ok)
-        self.assertFalse(w.act("a", "take", type="wood", n=1).ok)
+    def test_buy_rules(self):
+        w = make_world(positions=[NEAR_SHOP, [5, 3, 0]], starting_money=50)
+        price = CATALOG["oak_door"].price
+        r = w.act("a", "buy", item="oak_door", n=2)
+        self.assertTrue(r.ok, r.message)
+        self.assertEqual(w.wallet, 50 - 2 * price)
+        self.assertEqual(w.inventories["a"], {"oak_door": 2})
+        ev = events(w)[-1]
+        self.assertEqual(ev["diff"], {"grid": [], "wallet": -2 * price, "inventory": {"a": {"oak_door": 2}},
+                                      "agents": {}, "votes": {}})
+        self.assertEqual(ev["cost"], "action")
+        # money: the wallet is shared and can't go negative
+        r = w.act("a", "buy", item="diamond_block", n=1)
+        self.assertFalse(r.ok)
+        self.assertTrue(r.message.startswith("not enough money"), r.message)
+        self.assertTrue(w.act("a", "buy", item="dirt", n=w.wallet if w.wallet <= 10 else 10).ok)
+        # reach: b is far from the shop
+        r = w.act("b", "buy", item="stone", n=1)
+        self.assertTrue(r.message.startswith("out of reach"), r.message)
+        # unknown items, n <= 0, old tools
+        for item in ("lava", "brick", "door", 7, None):
+            r = w.act("a", "buy", item=item, n=1)
+            self.assertFalse(r.ok)
+            self.assertIn("unknown item", r.message)
         for n in (0, -1, 1.5, "2", True):
-            self.assertFalse(w.act("a", "take", type="stone", n=n).ok, n)
-        self.assertEqual(w.inventories["a"], {})
+            self.assertFalse(w.act("a", "buy", item="stone", n=n).ok, n)
+        for tool in ("take", "deposit"):
+            self.assertIn("unknown tool", w.act("a", tool, type="stone", n=1).message)
+        # walking: refused and nothing used up
+        w.act("a", "move_to", x=11, y=3, z=0)
+        used = w.actions_used["a"]
+        r = w.act("a", "buy", item="stone", n=1)
+        self.assertTrue(r.message.startswith("walking:"))
+        self.assertEqual(w.actions_used["a"], used)
+        wallet = w.wallet
+        for e in events(w)[2:]:
+            self.assertEqual(e["diff"]["wallet"], 0 if not (e["ok"] and e["tool"] == "buy") else e["diff"]["wallet"])
+        self.assertEqual(w.wallet, wallet)
+        w.finish("aborted")
+        self.assertEqual(replay(w.recorder.records)["wallet"], w.wallet)
+        self.assertEqual(records_of(w, "episode_end")[0]["wallet"], w.wallet)
+
+    def test_buy_through_glass_not_stone(self):
+        # a stands 3 cells from the shop with a wall in between
+        for wall, ok in (("glass", True), ("glass_pane", True), ("light_blue_stained_glass", True),
+                         ("tinted_glass", False), ("stone", False), ("oak_door", False)):
+            w = make_world(positions=[[10, 2, 0], [5, 3, 0]])
+            build(w, "b", [(11, 2, z) for z in range(3)], wall)
+            r = w.act("a", "buy", item="stone", n=1)
+            self.assertEqual(r.ok, ok, (wall, r.message))
+            self.assertEqual(w.view("a")["shop_in_reach"], ok)
+            if not ok:
+                self.assertTrue(r.message.startswith("no line of sight"), r.message)
 
     def test_give_whisper_self_or_unknown(self):
         w = self.w
-        w.act("a", "take", type="stone", n=1)
+        w.act("a", "buy", item="stone", n=1)
         for to in ("a", "ghost"):
             self.assertFalse(w.act("a", "give", to=to, type="stone", n=1).ok)
             self.assertFalse(w.act("a", "whisper", to=to, text="hi").ok)
@@ -488,32 +542,98 @@ class TestInventoryAndChest(unittest.TestCase):
         w = self.w
         self.assertFalse(w.act("a", "fly").ok)
         self.assertFalse(w.act("a", "pillar_up", type="stone").ok)  # removed tool
-        self.assertFalse(w.act("a", "take", type="stone").ok)
+        self.assertFalse(w.act("a", "buy", item="stone").ok)
         self.assertFalse(w.act("a", "place", x=0, y=0, z=0, type="lava").ok)
         self.assertFalse(w.act("a", "say", text="x" * 1001).ok)
         self.assertEqual(len(events(w)), 5)
         self.assertEqual(w.actions_used["a"], 4)
 
 
+class TestBlockProperties(unittest.TestCase):
+    def test_transparent_view_and_line_of_sight(self):
+        w = make_world(positions=[[2, 2, 0], [12, 12, 0]])
+        build(w, "b", [(5, 2, 0)])
+        for wall, seen in (("glass", True), ("white_stained_glass", True), ("bricks", False),
+                           ("tinted_glass", False)):
+            build(w, "b", [(3, 2, z) for z in range(4)], wall)
+            self.assertEqual([5, 2, 0] in [b["pos"] for b in w.view("a")["blocks"]], seen, wall)
+            self.assertEqual(w.line_of_sight((2, 2, 0), (5, 2, 0)), seen, wall)
+        build(w, "b", [(3, 2, z) for z in range(4)], "glass")
+        w.inventories["a"] = {"stone": 1}
+        r = w.act("a", "place", x=4, y=2, z=0, type="stone")  # through the glass wall
+        self.assertTrue(r.ok, r.message)
+
+    def test_doors_walkable_but_solid(self):
+        w = make_world(positions=[[2, 4, 0], [12, 12, 0]])
+        # a 2-high wall across the grid at x = 4, with a 2-high oak door at y = 4
+        build(w, "b", [(4, y, z) for y in range(16) for z in range(2) if y != 4])
+        build(w, "b", [(4, 4, 0), (4, 4, 1)], "oak_door")
+        self.assertTrue(w.standable((4, 4, 0)))           # stand in the doorway
+        r = w.act("a", "move_to", x=6, y=4, z=0)          # walk through it
+        self.assertTrue(r.ok, r.message)
+        path = events(w)[-1]["diff"]["agents"]["a"]["path"]
+        self.assertIn([4, 4, 0], path)
+        advance(w, 5)
+        self.assertTrue(w.act("a", "move_to", x=4, y=4, z=0).ok)  # and stop in it
+        advance(w, 5)
+        w.inventories["a"] = {"stone": 2}
+        # still solid for placing and support
+        r = w.act("a", "place", x=4, y=4, z=1, type="stone")
+        self.assertFalse(r.ok)
+        self.assertIn("occupied by oak_door", r.message)
+        self.assertTrue(w.supported((4, 4, 2)))
+        self.assertTrue(w.act("a", "place", x=4, y=4, z=2, type="stone").ok)  # on top of the door
+        # a door with a solid block in the upper cell is not standable
+        build(w, "b", [(4, 8, 0)], "oak_door")
+        self.assertFalse(w.standable((4, 8, 0)))
+        replay_free = w.analysis()
+        self.assertFalse(replay_free["enclosed"])
+        # a door blocks sight like a wall
+        self.assertFalse(w.line_of_sight((2, 8, 0), (6, 8, 0)))
+
+    def test_door_closed_for_enclosure(self):
+        w = make_world(positions=[[1, 1, 0], [14, 14, 0]])
+        bp = BLUEPRINTS["house"]
+        for p, t in bp.cells.items():
+            w.blocks[p] = Block(t, "a", 0.0)
+        w._analysis_cache = None
+        d = w.analysis()
+        self.assertTrue(d["enclosed"])
+        self.assertEqual((d["interior_cells"], d["doors"], d["windows"], d["leftovers"]), (45, 2, 4, 0))
+        # an agent can walk from outside into the closed house through its door
+        r = w.act("a", "move_to", x=7, y=7, z=1)
+        self.assertTrue(r.ok, r.message)
+        path = events(w)[-1]["diff"]["agents"]["a"]["path"]
+        self.assertIn([7, 5, 1], path)  # the door cell
+        # replace the door by a plain wall: still enclosed, no door, and no way in
+        for p, t in bp.cells.items():
+            if t == "oak_door":
+                w.blocks[p] = Block("oak_planks", "a", 0.0)
+        w._analysis_cache = None
+        self.assertEqual(w.analysis()["doors"], 0)
+        self.assertTrue(w.analysis()["enclosed"])
+        self.assertIsNone(w.find_path("b", (6, 6, 1)))
+
+
 class TestLimits(unittest.TestCase):
     def test_cooldown(self):
         w = make_world(action_cooldown_s=2.0)
-        self.assertTrue(w.act("a", "take", type="stone", n=1).ok)
+        self.assertTrue(w.act("a", "buy", item="stone", n=1).ok)
         w.clock.advance_to(1.0)
-        r = w.act("a", "take", type="stone", n=1)
+        r = w.act("a", "buy", item="stone", n=1)
         self.assertTrue(r.message.startswith("cooldown"))
         self.assertEqual(w.actions_used["a"], 1)
         self.assertTrue(w.act("a", "say", text="messages are not rate limited").ok)
         self.assertEqual(w.view("a")["next_action_at"], 2.0)
         w.clock.advance_to(2.0)
-        self.assertTrue(w.act("a", "take", type="stone", n=1).ok)
+        self.assertTrue(w.act("a", "buy", item="stone", n=1).ok)
         replay(w.recorder.records)
 
     def test_action_cap_and_action_limit_end(self):
         w = make_world(max_actions_per_agent=2)
         self.assertFalse(w.act("a", "place", x=0, y=0, z=0, type="stone").ok)
         self.assertFalse(w.act("a", "fly").ok)
-        r = w.act("a", "take", type="stone", n=1)
+        r = w.act("a", "buy", item="stone", n=1)
         self.assertTrue(r.message.startswith("action limit reached"))
         self.assertEqual(w.view("a")["actions_remaining"], 0)
         self.assertTrue(w.act("a", "say", text="still allowed").ok)
@@ -527,7 +647,7 @@ class TestLimits(unittest.TestCase):
     def test_time_limit(self):
         w = make_world(max_seconds=30)
         w.clock.advance_to(29.999)
-        self.assertTrue(w.act("a", "take", type="stone", n=1).ok)
+        self.assertTrue(w.act("a", "buy", item="stone", n=1).ok)
         w.clock.advance_to(30)
         n = len(w.recorder.records)
         r = w.act("b", "observe")
@@ -572,84 +692,151 @@ class TestSnapshots(unittest.TestCase):
         w.clock.advance_to(1.0)
         w.act("a", "observe")
         snap = records_of(w, "snapshot")[-1]
-        self.assertEqual(snap["positions"], {"a": NEAR_CHEST, "b": [5, 9, 0]})
+        self.assertEqual(snap["positions"], {"a": NEAR_SHOP, "b": [5, 9, 0]})
         self.assertEqual(snap["walking_until"], {"b": round(6 / 4.317, 3)})
         w.clock.advance_to(2.0)
         w.act("a", "observe")
         self.assertEqual(records_of(w, "snapshot")[-1]["walking_until"], {})
         w.finish("aborted")
-        self.assertEqual(replay(w.recorder.records)["positions"], {"a": NEAR_CHEST, "b": [5, 9, 0]})
+        self.assertEqual(replay(w.recorder.records)["positions"], {"a": NEAR_SHOP, "b": [5, 9, 0]})
 
-    def test_open_task_scores_in_records(self):
+    def test_scores_and_analysis_in_records(self):
         w = World(Config(agents=["a", "b"]), clock=SimClock())
         w.act("a", "observe")
         w.finish("aborted")
         for rec in (records_of(w, "snapshot")[0], records_of(w, "episode_end")[0]):
-            self.assertEqual(rec["team_score"], 0.0)
-            self.assertEqual(set(rec["score_details"]) >= {"enclosed", "interior_cells", "doors",
-                                                           "windows", "leftovers"}, True)
-            self.assertNotIn("correct_cells", rec)
+            self.assertEqual(rec["wallet"], 200)
+            self.assertEqual(rec["individual_scores"], {"a": 0, "b": 0})
+            self.assertEqual(set(rec["analysis"]), {"enclosed", "interior_cells", "interior", "shell_cells",
+                                                    "doors", "windows", "leftovers", "target_interior"})
+            for gone in ("team_score", "score_details", "chest"):
+                self.assertNotIn(gone, rec)
+        end = records_of(w, "episode_end")[0]
+        self.assertEqual(set(end), {"type", "t", "reason", "wallet", "individual_scores", "ranking", "deployed",
+                                    "analysis", "actions_used"})
         replay(w.recorder.records)
 
 
-class TestScoring(unittest.TestCase):
-    def test_blueprint_correct_extra_wrong_type(self):
-        w = make_world(positions=[[7, 4, 0], [5, 3, 0]])
-        w.inventories["a"] = {"stone": 3, "brick": 1}
-        w.act("a", "place", x=6, y=6, z=0, type="stone")   # correct
-        w.act("a", "place", x=7, y=6, z=0, type="stone")   # correct
-        w.act("a", "place", x=8, y=6, z=0, type="brick")   # wrong type: neither
-        w.act("a", "place", x=5, y=6, z=0, type="stone")   # extra
-        s = w.scores()
-        self.assertEqual(s["score_details"], {"correct_cells": 2, "blueprint_cells": 34, "extra_cells": 1})
-        self.assertAlmostEqual(s["team_score"], round((2 - 0.1) / 34, 6))
-        self.assertEqual(s["individual_scores"], {"a": 2, "b": 0})
+class TestIncentive(unittest.TestCase):
+    def test_ranking_ties_and_deployed(self):
+        agents = ["a", "b", "c", "d", "e"]
+        r = ranking({"a": 3, "b": 5, "c": 3, "d": 0, "e": 3}, agents)
+        self.assertEqual([(x["agent"], x["score"], x["rank"]) for x in r],
+                         [("b", 5, 1), ("a", 3, 2), ("c", 3, 2), ("e", 3, 2), ("d", 0, 5)])
+        self.assertEqual(deployed(r, 2, "competitive"), ["b", "a", "c", "e"])  # ties at the boundary all in
+        self.assertEqual(deployed(r, 1, "competitive"), ["b"])
+        self.assertEqual(deployed(r, 5, "competitive"), ["b", "a", "c", "e", "d"])
+        self.assertEqual(deployed(r, 2, "none"), [])
+        r = ranking({"a": 1, "b": 1, "c": 0}, ["a", "b", "c"])
+        self.assertEqual([x["rank"] for x in r], [1, 1, 3])
+        self.assertEqual(deployed(r, 1, "competitive"), ["a", "b"])
+
+    def test_individual_scores_count_blocks_still_in_world(self):
+        w = make_world(positions=[NEAR_SHOP, [11, 4, 0], [10, 3, 0]], agents=["a", "b", "c"])
+        w.act("a", "buy", item="stone", n=4)
+        w.act("a", "give", to="b", type="stone", n=2)
+        w.act("a", "place", x=11, y=2, z=0, type="stone")
+        w.act("a", "place", x=12, y=1, z=0, type="stone")
+        w.act("b", "place", x=10, y=2, z=0, type="stone")
+        self.assertEqual(w.individual_scores(), {"a": 2, "b": 1, "c": 0})
+        w.act("c", "remove", x=11, y=2, z=0)  # removing a's block lowers a's score
+        w.act("c", "place", x=11, y=2, z=0, type="stone")  # c gets the credit now
+        self.assertEqual(w.individual_scores(), {"a": 1, "b": 1, "c": 1})
+        self.assertEqual(w.config.deploy_top_k, 1)
+        w.finish("aborted")
+        end = records_of(w, "episode_end")[0]
+        self.assertEqual([x["rank"] for x in end["ranking"]], [1, 1, 1])
+        self.assertEqual(end["deployed"], ["a", "b", "c"])
+        replay(w.recorder.records)
+
+    def test_deploy_defaults_and_incentive_none(self):
+        for n, k in ((1, 1), (2, 1), (3, 1), (4, 2), (5, 2), (16, 8)):
+            self.assertEqual(Config(agents=[f"x{i}" for i in range(n)]).deploy_top_k, k)
+        w = make_world(incentive="none")
+        w.act("a", "buy", item="stone", n=1)
+        w.act("a", "place", x=11, y=2, z=0, type="stone")
+        w.finish("aborted")
+        end = records_of(w, "episode_end")[0]
+        self.assertEqual(end["ranking"], [{"agent": "a", "score": 1, "rank": 1}, {"agent": "b", "score": 0, "rank": 2}])
+        self.assertEqual(end["deployed"], [])
+        replay(w.recorder.records)
+        w = make_world(deploy_top_k=2)
+        w.finish("aborted")
+        self.assertEqual(records_of(w, "episode_end")[0]["deployed"], ["a", "b"])
+
+    def test_replay_checks_ranking_and_wallet(self):
+        w = make_world()
+        w.act("a", "buy", item="stone", n=1)
+        w.act("a", "place", x=11, y=2, z=0, type="stone")
+        w.finish("aborted")
+        good = json.loads(json.dumps(w.recorder.records))
+        replay(good)
+        for tamper in ("deployed", "ranking", "wallet_delta", "snapshot_wallet", "scores", "analysis"):
+            recs = json.loads(json.dumps(good))
+            end = recs[-1]
+            if tamper == "deployed":
+                end["deployed"] = ["a", "b"]
+            elif tamper == "ranking":
+                end["ranking"][1]["rank"] = 1
+            elif tamper == "wallet_delta":
+                next(r for r in recs if r["type"] == "event" and r["tool"] == "buy")["diff"]["wallet"] -= 1
+            elif tamper == "snapshot_wallet":
+                recs[-2]["wallet"] += 5
+            elif tamper == "scores":
+                end["individual_scores"]["b"] = 1
+            else:
+                end["analysis"]["leftovers"] = 0
+            with self.assertRaises(AssertionError, msg=tamper):
+                replay(recs)
 
 
 class TestEventShapes(unittest.TestCase):
     def test_diffs(self):
-        w = make_world(positions=[NEAR_CHEST, [11, 4, 0]])
-        w.act("a", "take", type="stone", n=2)
+        w = make_world(positions=[NEAR_SHOP, [11, 4, 0]])
+        w.act("a", "buy", item="stone", n=2)
         w.act("a", "place", x=11, y=2, z=0, type="stone")
         w.act("a", "give", to="b", type="stone", n=1)
         w.act("a", "remove", x=11, y=2, z=0)
-        w.act("a", "deposit", type="stone", n=1)
         w.act("a", "say", text="hi all")
         w.act("a", "whisper", to="b", text="psst")
         w.act("a", "note", text="remember")
         w.act("a", "place", x=0, y=0, z=5, type="stone")  # fails
         ev = events(w)
         for e in ev:
-            self.assertEqual(set(e["diff"]), {"grid", "chest", "inventory", "agents", "votes"})
+            self.assertEqual(list(e["diff"]), ["grid", "wallet", "inventory", "agents", "votes"])
             for k in ("event_id", "t", "agent", "tool", "args", "cost", "ok", "message", "chat"):
                 self.assertIn(k, e)
-        take, place, give, remove, deposit, say, whisper, note, bad = ev
-        self.assertEqual(take["diff"], {"grid": [], "chest": {"stone": -2}, "inventory": {"a": {"stone": 2}}, "votes": {},
-                                        "agents": {}})
+        buy, place, give, remove, say, whisper, note, bad = ev
+        self.assertEqual(buy["diff"], {"grid": [], "wallet": -2 * CATALOG["stone"].price,
+                                       "inventory": {"a": {"stone": 2}}, "votes": {}, "agents": {}})
         self.assertEqual(place["diff"]["grid"], [{"pos": [11, 2, 0], "before": None,
                                                  "after": {"type": "stone", "placed_by": "a", "placed_at": 0.0}}])
+        self.assertEqual(place["diff"]["wallet"], 0)
         self.assertEqual(give["diff"]["inventory"], {"a": {"stone": -1}, "b": {"stone": 1}})
         self.assertIsNone(remove["diff"]["grid"][0]["after"])
-        self.assertEqual(deposit["diff"]["chest"], {"stone": 1})
+        self.assertEqual(remove["diff"]["inventory"], {"a": {"stone": 1}})
         self.assertEqual(say["chat"], {"channel": "public", "from": "a", "to": None, "text": "hi all"})
         self.assertEqual(whisper["chat"], {"channel": "private", "from": "a", "to": "b", "text": "psst"})
         self.assertEqual((note["args"], note["cost"], note["chat"]), ({"text": "remember"}, "free", None))
-        self.assertEqual(bad["diff"], {"grid": [], "chest": {}, "inventory": {}, "agents": {}, "votes": {}})
+        self.assertEqual(bad["diff"], {"grid": [], "wallet": 0, "inventory": {}, "agents": {}, "votes": {}})
+        snap = w.snapshot()
+        self.assertEqual(snap["wallet"], 1000 - 2 * CATALOG["stone"].price)
+        self.assertNotIn("chest", snap)
         replay(w.recorder.records)
 
 
 class TestThreads(unittest.TestCase):
     def test_many_threads(self):
         agents = [f"agent_{i}" for i in range(16)]
-        w = World(Config(agents=agents, scarcity="abundant", max_actions_per_agent=10_000), clock=WallClock())
+        w = World(Config(agents=agents, starting_money=10_000, max_actions_per_agent=10_000), clock=WallClock())
         barrier = threading.Barrier(len(agents))
 
         def hammer(agent: str) -> None:
             barrier.wait()
             for i in range(40):
-                w.act(agent, "take", type="stone", n=1)
+                w.act(agent, "buy", item="dirt", n=1)
                 w.act(agent, "say", text=f"{agent} {i}")
-                w.act(agent, "deposit", type="stone", n=1)
+                w.act(agent, "give", to=agents[(agents.index(agent) + 1) % len(agents)], type="dirt", n=1)
                 w.act(agent, "observe")
 
         threads = [threading.Thread(target=hammer, args=(a,)) for a in agents]
@@ -664,12 +851,11 @@ class TestThreads(unittest.TestCase):
         replay(w.recorder.records)
 
     def test_run_live(self):
-        cfg = Config(agents=["a", "b", "c"], task="blueprint", blueprint="hut_small", walk_speed=400,
-                     max_seconds=60)
+        cfg = Config(agents=["a", "b", "c"], walk_speed=400, max_seconds=120)
         w = World(cfg, clock=WallClock())
         run_live(w, ScriptedBuilder(stall_s=1.0, inspect_s=0.3), think_s=0.001)
         self.assertEqual(w.end_reason, "all_done")
-        self.assertEqual(w.scores()["team_score"], 1.0)
+        self.assertTrue(w.analysis()["enclosed"])
         replay(w.recorder.records)
 
     def test_run_live_time_limit(self):
@@ -680,44 +866,47 @@ class TestThreads(unittest.TestCase):
 
 
 class TestScripted(unittest.TestCase):
-    def run_scripted(self, task: str, blueprint: str, scarcity: str, seed: int = 0) -> World:
+    def run_scripted(self, n: int = 3, seed: int = 0, **kw) -> World:
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "ep.jsonl"
             rec = Recorder(path)
-            cfg = Config(task=task, blueprint=blueprint, scarcity=scarcity, seed=seed)
+            cfg = Config(agents=[f"agent_{i}" for i in range(1, n + 1)], seed=seed, max_seconds=900, **kw)
             w = run_simulated(World(cfg, rec, clock=SimClock()))
             rec.close()
             records = load_log(path)
         self.assertEqual(records, json.loads(json.dumps(w.recorder.records)))
         replay(records)
-        self.assertFalse(any(e["tool"] == "jump" for e in events(w)))  # walk/take/place only
+        self.assertFalse(any(e["tool"] == "jump" for e in events(w)))  # walk/buy/place only
         return w
 
-    def test_blueprint_hut_small_exact(self):
-        w = self.run_scripted("blueprint", "hut_small", "exact")
+    def check_house(self, w: World) -> None:
+        d = w.analysis()
         self.assertEqual(w.end_reason, "all_done")
-        self.assertEqual(w.scores()["team_score"], 1.0)
+        self.assertTrue(d["enclosed"])
+        self.assertEqual((d["interior_cells"], d["doors"], d["windows"], d["leftovers"]), (45, 2, 4, 0))
+        self.assertEqual({tuple(b[:3]): b[3] for b in w.state()["blocks"]}, BLUEPRINTS["house"].cells)
+        self.assertLessEqual(w.config.starting_money - w.wallet, w.config.starting_money)
+        self.assertGreaterEqual(w.config.starting_money - w.wallet, BLUEPRINTS["house"].cost())
+        end = records_of(w, "episode_end")[0]
+        self.assertEqual(sum(end["individual_scores"].values()), len(BLUEPRINTS["house"].cells))
+        self.assertTrue(end["deployed"])
 
-    def test_blueprint_house_exact(self):
-        w = self.run_scripted("blueprint", "house", "exact")
-        self.assertEqual(w.scores()["team_score"], 1.0)
-        self.assertEqual(sum(w.chest.values()), 0)
-
-    def test_open_house_exact(self):
+    def test_open_house_three_agents(self):
         for seed in (0, 1):
-            w = self.run_scripted("open", "house", "exact", seed)
-            d = w.scores()["score_details"]
-            self.assertEqual(w.end_reason, "all_done")
-            self.assertEqual(w.scores()["team_score"], 1.0)
-            self.assertTrue(d["enclosed"])
-            self.assertGreaterEqual(d["doors"], 1)
-            self.assertGreaterEqual(d["windows"], 2)
-            self.assertEqual(d["leftovers"], 0)
+            self.check_house(self.run_scripted(3, seed))
 
-    def test_open_house_short(self):
-        w = self.run_scripted("open", "house", "short")
+    def test_open_house_five_agents(self):
+        w = self.run_scripted(5)
+        self.check_house(w)
+        self.assertEqual(w.analysis()["target_interior"], 20)
+        self.assertEqual(len(records_of(w, "episode_end")[0]["deployed"]) >= 2, True)
+
+    def test_not_enough_money(self):
+        w = self.run_scripted(3, starting_money=100)
         self.assertEqual(w.end_reason, "all_done")
-        self.assertFalse(w.scores()["score_details"]["enclosed"])
+        self.assertFalse(w.analysis()["enclosed"])
+        self.assertLess(w.wallet, min(i.price for i in CATALOG.values() if i.id in BLUEPRINTS["house"].counts()))
+        self.assertTrue(any("can't afford" in (e["chat"] or {}).get("text", "") for e in events(w)))
 
     def test_replay_detects_tampering(self):
         w = run_simulated(make_world())
@@ -731,18 +920,37 @@ class TestScripted(unittest.TestCase):
 
     def test_sim_determinism(self):
         def run(seed):
-            cfg = Config(task="blueprint", blueprint="hut_small", seed=seed)
+            cfg = Config(agents=["a", "b", "c"], seed=seed, max_seconds=120)
             return run_simulated(World(cfg, clock=SimClock())).recorder.records
         self.assertEqual(run(3), run(3))
         self.assertNotEqual(run(3), run(4))
 
 
+class TestReplayV3(unittest.TestCase):
+    def test_v3_log(self):
+        path = Path(__file__).resolve().parent / "data" / "v3_open_house_head.jsonl"
+        records = load_log(path)
+        self.assertEqual(records[0]["log_version"], 3)
+        state = replay(records)
+        self.assertEqual(state["version"], 3)
+        self.assertGreaterEqual(state["snapshots_checked"], 3)
+        self.assertIn("chest", state)
+        bad = json.loads(json.dumps(records))
+        snap = next(r for r in bad if r["type"] == "snapshot" and r["blocks"])
+        snap["score_details"]["shell_cells"] += 1
+        with self.assertRaises(AssertionError):
+            replay(bad)
+        self.assertEqual(replay(records[:1])["version"], 3)
+        with self.assertRaises(AssertionError):
+            replay([dict(records[0], log_version=2)])
+
+
 class TestVotes(unittest.TestCase):
     def setUp(self):
-        # a by the chest, b and c close enough to reach (11, 2, 0) and each other
-        self.w = make_world(positions=[NEAR_CHEST, [11, 4, 0], [10, 3, 0]], agents=["a", "b", "c"])
+        # a by the shop, b and c close enough to reach (11, 2, 0) and each other
+        self.w = make_world(positions=[NEAR_SHOP, [11, 4, 0], [10, 3, 0]], agents=["a", "b", "c"])
         w = self.w
-        w.act("a", "take", type="stone", n=6)
+        w.act("a", "buy", item="stone", n=6)
         w.act("a", "give", to="b", type="stone", n=3)
         w.act("a", "give", to="c", type="stone", n=3)
 
@@ -869,18 +1077,28 @@ class TestVotes(unittest.TestCase):
                 replay(records)
 
     def test_legacy_logs_without_vote_diff(self):
+        # early v3 logs: four diff keys; every successful declare_done adds a vote, nothing removes
+        records = load_log(Path(__file__).resolve().parent / "data" / "v3_open_house_head.jsonl")
+        records = [r for r in records if r["type"] in ("header", "event")]
+        for r in records[1:]:
+            del r["diff"]["votes"]
+        last = records[-1]
+        records.append(dict(last, event_id=last["event_id"] + 1, tool="declare_done", args={}, ok=True,
+                            message="declared done", chat=None,
+                            diff={"grid": [], "chest": {}, "inventory": {}, "agents": {}}))
+        self.assertEqual(replay(records)["done_votes"], [last["agent"]])
+        # a v4 log always has diff.votes
         w = self.w
         w.act("a", "declare_done")
-        w.act("b", "say", text="hi")
-        w.finish("aborted")
-        records = json.loads(json.dumps(w.recorder.records))
-        for r in records:
+        recs = json.loads(json.dumps(w.recorder.records))
+        for r in recs:
             if r["type"] == "event":
                 del r["diff"]["votes"]
-        self.assertEqual(replay(records)["done_votes"], ["a"])
+        with self.assertRaises(AssertionError):
+            replay(recs)
 
     def test_scripted_bot_revotes_after_clear(self):
-        w = make_world(positions=[NEAR_CHEST, [11, 4, 0]])
+        w = make_world(positions=[NEAR_SHOP, [11, 4, 0]])
         bot = ScriptedBuilder()
         mem = bot.memory("a")
         w.act("a", "declare_done")
@@ -1014,47 +1232,35 @@ class TestHooks(unittest.TestCase):
 
 class TestTeamSize(unittest.TestCase):
     def test_defaults_scale_with_agents(self):
-        base = World(Config(), clock=SimClock())
         for n in (1, 2, 3, 5, 8, 16):
             agents = [f"agent_{i}" for i in range(1, n + 1)]
-            for task in ("open", "blueprint"):
-                w = World(Config(agents=agents, task=task), clock=SimClock())
-                scale = 1.0 if task == "blueprint" else n / 3
-                self.assertEqual(w.config.target_interior, 4 * n)
-                self.assertAlmostEqual(w.config.chest_scale, scale)
-                for t, k in base.chest.items():
-                    self.assertEqual(w.chest[t], math.ceil(round(k * scale, 9)) if k else 0, (n, t))
-                h = w.recorder.records[0]
-                self.assertEqual(h["config"]["target_interior"], 4 * n)
-                self.assertAlmostEqual(h["config"]["chest_scale"], scale)
-                pos = list(w.positions.values())
-                self.assertEqual(len(set(pos)), n)
-                bodies = set()
-                for a, p in w.positions.items():
-                    self.assertTrue(w.standable(p, a), (n, p))
-                    bodies |= {p, (p[0], p[1], p[2] + 1)}
-                self.assertEqual(len(bodies), 2 * n)
-                replay(w.recorder.records)
-        self.assertEqual(base.chest, World(Config(chest_scale=1.0), clock=SimClock()).chest)
+            w = World(Config(agents=agents), clock=SimClock())
+            self.assertEqual(w.config.target_interior, 4 * n)
+            self.assertEqual(w.config.starting_money, 100 * n)
+            self.assertEqual(w.wallet, 100 * n)
+            self.assertEqual(w.config.deploy_top_k, max(1, n // 2))
+            h = w.recorder.records[0]
+            self.assertEqual(h["config"]["target_interior"], 4 * n)
+            self.assertEqual((h["wallet"], h["shop"]["starting_money"], h["config"]["starting_money"]),
+                             (100 * n, 100 * n, 100 * n))
+            self.assertEqual(h["config"]["deploy_top_k"], max(1, n // 2))
+            pos = list(w.positions.values())
+            self.assertEqual(len(set(pos)), n)
+            bodies = set()
+            for a, p in w.positions.items():
+                self.assertTrue(w.standable(p, a), (n, p))
+                bodies |= {p, (p[0], p[1], p[2] + 1)}
+            self.assertEqual(len(bodies), 2 * n)
+            replay(w.recorder.records)
 
     def test_explicit_values_and_limits(self):
-        w = World(Config(agents=["a", "b"], target_interior=12, chest_scale=1.0), clock=SimClock())
-        self.assertEqual(w.config.target_interior, 12)
-        self.assertEqual(w.chest, World(Config(), clock=SimClock()).chest)
-        self.assertEqual(sum(World(Config(chest_scale=2), clock=SimClock()).chest.values()),
-                         2 * sum(w.chest.values()))
-        for bad in ({"agents": [f"x{i}" for i in range(17)]}, {"chest_scale": 0}, {"chest_scale": -1},
-                    {"chest_scale": "big"}, {"target_interior": 0}):
+        w = World(Config(agents=["a", "b"], target_interior=12, starting_money=7, deploy_top_k=2),
+                  clock=SimClock())
+        self.assertEqual((w.config.target_interior, w.wallet, w.config.deploy_top_k), (12, 7, 2))
+        self.assertEqual(World(Config(starting_money=0), clock=SimClock()).wallet, 0)
+        for bad in ({"agents": [f"x{i}" for i in range(17)]}, {"target_interior": 0}):
             with self.assertRaises(ValueError, msg=str(bad)):
                 Config(**bad)
-
-    def test_scripted_five_agents_open_house(self):
-        agents = [f"agent_{i}" for i in range(1, 6)]
-        w = run_simulated(World(Config(agents=agents, max_seconds=900), clock=SimClock()))
-        replay(w.recorder.records)
-        self.assertEqual(w.end_reason, "all_done")
-        self.assertEqual(w.scores()["team_score"], 1.0)
-        self.assertEqual(w.scores()["score_details"]["target_interior"], 20)
 
 
 if __name__ == "__main__":

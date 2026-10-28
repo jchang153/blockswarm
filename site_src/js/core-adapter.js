@@ -5,8 +5,9 @@
 export {
   createLogBuilder, parseLog, taskOf, openStats, blueprintStats,
   posAtTime, walkPosition, agentPoseAt, describeEvent, typeColor, agentColors, key,
+  isV4, shopOf, setCatalog, itemInfo, purchaseOf, walletAt, leaderboard, rankAgents, deployTopK, finalResults,
 } from './core.js';
-import { parseLog } from './core.js';
+import { parseLog, purchaseOf } from './core.js';
 
 let configPromise = null;
 /** site-config.json → {title, subtitle, data_base_url}; data_base_url defaults to ./data/. */
@@ -58,10 +59,10 @@ export async function loadEpisodeLog(file) {
   return parseLog(await fetchLogText(await dataUrl(file)));
 }
 
-/** Per-agent totals over the first `upTo` events: placed, removed, taken from chest, messages, notes. */
+/** Per-agent totals over the first `upTo` events: placed, removed, taken from chest (v3), bought / coins spent (v4), messages, notes. */
 export function agentTotals(log, agents, upTo = log.events.length) {
   const out = {};
-  for (const a of agents) out[a] = { placed: 0, removed: 0, taken: 0, deposited: 0, messages: 0, notes: 0, failed: 0 };
+  for (const a of agents) out[a] = { placed: 0, removed: 0, taken: 0, deposited: 0, bought: 0, spent: 0, messages: 0, notes: 0, failed: 0 };
   for (let i = 0; i < upTo; i++) {
     const e = log.events[i], s = out[e.agent];
     if (!s) continue;
@@ -70,6 +71,7 @@ export function agentTotals(log, agents, upTo = log.events.length) {
     else if (e.tool === 'remove') s.removed++;
     else if (e.tool === 'take') for (const v of Object.values(e.diff.chest)) { if (v < 0) s.taken -= v; }
     else if (e.tool === 'deposit') for (const v of Object.values(e.diff.chest)) { if (v > 0) s.deposited += v; }
+    else if (e.tool === 'buy') { const b = purchaseOf(e); s.bought += b.n; s.spent += b.cost; }
     else if (e.tool === 'note') s.notes++;
     if (e.chat) s.messages++;
   }

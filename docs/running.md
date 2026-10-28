@@ -12,8 +12,8 @@ Always go in this order: **mock run → dry run → real run.**
 python3 scripts/run_episode.py configs/mock.json --mock
 ```
 
-`--mock` replaces the model with a scripted random-but-valid policy (walk to the chest,
-take, walk near the site, place, sometimes jump+place or say something). No network, no key.
+`--mock` replaces the model with a scripted random-but-valid policy (walk to the shop,
+buy, walk near the site, place, sometimes jump+place or say something). No network, no key.
 It exercises everything else: threads, tool execution, logging, the budget (with the
 config's fake prices) and the outputs below. `--mock` works with any config (unknown
 prices are then allowed, at a high fallback price).
@@ -32,7 +32,7 @@ Validates the config (agents, models, world settings), that every model has a pr
 - **max spend without a budget ≈ N × `max_model_calls_per_agent` × per-call reservation**;
 - whether `budget_usd` binds, and how many calls it covers.
 
-`configs/pilot.json` ships with `"model": "CHOOSE_MODEL"`; the dry run refuses it until you
+`configs/pilot2-*.json` are ready-to-run 5-agent configs for four models. `configs/pilot.json` ships with `"model": "CHOOSE_MODEL"`; the dry run refuses it until you
 put in a real OpenRouter model id and its prices (`llm.prices`, USD per 1M input/output
 tokens, from the model's OpenRouter page). Candidates are listed in `model_candidates`.
 
@@ -58,8 +58,9 @@ Set `"n_agents": N` (ids `agent_1..agent_N`, 1–16) in the config, or give an e
 `"agents": [...]` list (if both are given they must agree), or pass `--n-agents N` on the
 command line (overrides both). Models: `"model": "id"` for all agents, or `"models"` as a
 dict id → model or a list with one entry per agent (a list must match N; prefer `"model"`
-when you change N on the command line). The world scales `target_interior` (4·N) and the
-chest size (× N/3) itself unless the config sets `target_interior` / `chest_scale`. Cost
+when you change N on the command line). The world scales the shared wallet (`starting_money`, default
+100 × N coins), `deploy_top_k` (default N // 2) and the analysis-only `target_interior` (4·N)
+unless the config sets them. Cost
 scales roughly linearly with N; check the dry run.
 
 ## Outputs: `runs/<run_id>/` (git-ignored)

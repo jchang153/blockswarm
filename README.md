@@ -1,10 +1,14 @@
 # BlockSwarm
 
-A small Minecraft-like 3D grid world where several LLM agents build a shared structure
-(e.g. a house) from a shared, limited chest of blocks. Built to study how agents split up
-work and share resources, and to catch misbehavior against an exact event log.
+A small Minecraft-like 3D grid world where several LLM agents, each with a body, build a house
+together from an open-ended brief. They buy any of 131 Minecraft building blocks from a shop with
+one shared wallet, and each agent is told that the agents with the most blocks still standing at
+the end will be deployed. Built to study cooperation under competitive pressure, and to catch
+misbehavior against an exact event log.
 
 - **Spec:** [SPEC.md](SPEC.md)
+- **Shop and incentive design:** [docs/shop-and-incentives.md](docs/shop-and-incentives.md)
+- **Running LLM episodes:** [docs/running.md](docs/running.md)
 - **Log format:** [docs/log-format.md](docs/log-format.md)
 - **Running on the GCP VM:** [docs/vm.md](docs/vm.md)
 
@@ -38,11 +42,13 @@ while it runs, add `--follow` (see docs/vm.md for watching runs on the VM).
 
 | Path | What |
 | --- | --- |
-| `blockswarm/world.py` | The world: grid, chest, bodies, walking, jumping, reach and line of sight, tools, logging |
-| `blockswarm/tasks.py` | Scoring: open-ended house (default) and exact blueprint |
+| `blockswarm/world.py` | The world: grid, shop and wallet, bodies, walking, jumping, reach and line of sight, tools, logging |
+| `blockswarm/catalog.py` | The shop's 131 Minecraft items with prices and properties |
+| `blockswarm/llm/` | LLM orchestrator: prompts, observations, OpenRouter client, budget, runner |
+| `blockswarm/tasks.py` | Per-agent scores and ranking; house analysis (not shown to agents) |
 | `blockswarm/pathing.py` | Where agents can stand and how they walk |
 | `blockswarm/live.py`, `blockswarm/clock.py` | Running agents concurrently on wall-clock or simulated time |
-| `blockswarm/blueprints.py` | Reference designs (`hut_small`, `house`): chest sizing, blueprint mode, scripted bots |
+| `blockswarm/blueprints.py` | The scripted test bots' private house designs |
 | `blockswarm/scripted.py` | A scripted, honest builder policy (baseline and test agent) |
 | `blockswarm/replay.py` | Rebuilds state from a log and checks it against snapshots |
 | `viewer/index.html`, `viewer/core.js` | 3D replay viewer with live follow (static page, three.js); core.js holds the shared log/state/scoring logic |
@@ -52,4 +58,4 @@ while it runs, add `--follow` (see docs/vm.md for watching runs on the VM).
 
 ## Status
 
-Milestone 1 done: embodied live engine, open-ended scoring, scripted demo, 3D viewer with live follow, public gallery. LLM agents via OpenRouter come next.
+Live, embodied engine with a shop, shared wallet and competitive deployment incentive (log v4); LLM agents via OpenRouter; 3D viewer with live follow; public gallery at blockswarm.pages.dev. First LLM pilot batch (v3, chest and rubric) ran on 2026-10-27; `configs/pilot2-*.json` are the v4 batch.

@@ -1,7 +1,8 @@
 // Gallery: episode cards with isometric thumbnails of the final build.
-import { siteConfig, loadEpisodeIndex } from './core-adapter.js';
+import { siteConfig, loadEpisodeIndex, setCatalog } from './core-adapter.js';
 import { drawIso } from './iso.js';
-import { $, esc, fmtDuration, fmtScore, scoreBand, shortModel, reasonLabel, initTheme } from './ui.js';
+import { swatchUrl } from './textures.js';
+import { $, esc, fmtDuration, fmtScore, scoreBand, shortModel, reasonLabel, initTheme, agentLabel } from './ui.js';
 
 initTheme();
 let episodes = [];
@@ -9,7 +10,31 @@ let episodes = [];
 const taskLabel = t => (t === 'open' ? 'Open brief' : t === 'blueprint' ? 'Blueprint' : t || '–');
 const modelsOf = ep => (ep.models && ep.models.length ? ep.models : [...new Set((ep.agents || []).map(a => a.model).filter(Boolean))]);
 
+/** Log v4 cards: who got deployed, coins spent, the house analysis (never shown to agents), top items. */
+function chipsForV4(ep) {
+  const a = ep.analysis || {}, out = [];
+  const dep = ep.deployed || [];
+  out.push(`<span class="chip dep-chip" title="Agents with the most blocks still standing (top ${ep.deploy_top_k ?? '?'}, ties included)">deployed: ${dep.length ? dep.map(x => esc(agentLabel(x))).join(', ') : 'nobody'}</span>`);
+  if (ep.wallet && typeof ep.wallet.spent === 'number') out.push(`<span class="chip" title="Coins spent from the shared wallet">${ep.wallet.spent}/${ep.wallet.start} coins spent</span>`);
+  if ('enclosed' in a) out.push(`<span class="chip ${a.enclosed ? 'ok' : 'no'}" title="House analysis (not shown to agents)">${a.enclosed ? '✓ enclosed' : '✗ not enclosed'}</span>`);
+  if (a.enclosed && 'interior_cells' in a) out.push(`<span class="chip" title="House analysis (not shown to agents)">interior ${a.interior_cells}</span>`);
+  if ('doors' in a) out.push(`<span class="chip ${a.doors ? 'ok' : 'no'}">${a.doors} door${a.doors === 1 ? '' : 's'}</span>`);
+  if ('windows' in a) out.push(`<span class="chip ${a.windows ? 'ok' : 'no'}">${a.windows} window${a.windows === 1 ? '' : 's'}</span>`);
+  if (a.leftovers) out.push(`<span class="chip no">${a.leftovers} leftover${a.leftovers === 1 ? '' : 's'}</span>`);
+  return out.join('');
+}
+function itemsFor(ep) {
+  if (!ep.v4 || !(ep.items_used || []).length) return '';
+  setCatalog(ep.catalog || null);
+  const more = (ep.item_types || 0) - ep.items_used.length;
+  return `<div class="chips">${ep.items_used.map(([t, n]) => {
+    const it = (ep.catalog || []).find(c => c.id === t);
+    return `<span class="chip" title="${esc(it ? it.name : t)}"><span class="blk" style="background-image:url(${swatchUrl(t)})"></span>${esc(t.replace(/_/g, ' '))} ${n}</span>`;
+  }).join('')}${more > 0 ? `<span class="chip no">+${more} more</span>` : ''}</div>`;
+}
+
 function chipsFor(ep) {
+  if (ep.v4) return chipsForV4(ep);
   const d = ep.score_details || {};
   const out = [];
   if (ep.task === 'open') {
@@ -25,6 +50,13 @@ function chipsFor(ep) {
   return out.join('');
 }
 
+function winnerBadge(ep) {
+  const top = (ep.ranking || []).filter(r => r.rank === 1);
+  if (!top.length) return '';
+  const names = top.map(r => agentLabel(r.agent)).join(' & ');
+  return `<span class="winner" title="Most blocks still standing: ${esc(names)} (${top[0].score})">★ ${esc(names)} · ${top[0].score}</span>`;
+}
+
 function card(ep) {
   const a = document.createElement('a');
   a.className = 'ep-card';
@@ -35,20 +67,23 @@ function card(ep) {
   a.innerHTML = `
     <div class="thumb"><canvas aria-hidden="true"></canvas>
       <span class="kind">${esc(taskLabel(ep.task))}</span>
-      <span class="score s${scoreBand(ep.team_score)}" title="Team score (0–1)">${fmtScore(ep.team_score)}</span></div>
+      ${ep.v4 ? winnerBadge(ep) : `<span class="score s${scoreBand(ep.team_score)}" title="Team score (0–1)">${fmtScore(ep.team_score)}</span>`}</div>
     <div class="ep-body">
       <div class="ep-title">${esc(title)}</div>
       <div class="chips">${models.length ? models.map(m => `<span class="chip model" title="${esc(m)}">${esc(shortModel(m))}</span>`).join('') : '<span class="chip model no">model not recorded</span>'}</div>
       <div class="chips">${chipsFor(ep)}</div>
+      ${itemsFor(ep)}
       <div class="ep-meta">
         <span>${(ep.agents || []).length} agents</span>
         <span>${fmtDuration(ep.duration_s)}</span>
         <span>${esc(reasonLabel(ep.end_reason))}</span>
         <span>${ep.chat_count ?? 0} messages</span>
         ${ep.scarcity ? `<span>${esc(ep.scarcity)} blocks</span>` : ''}
+        ${ep.v4 && ep.incentive && ep.incentive !== 'competitive' ? `<span>incentive: ${esc(ep.incentive)}</span>` : ''}
       </div>
     </div>`;
-  a.setAttribute('aria-label', `${title}, ${sub}, team score ${fmtScore(ep.team_score)}`);
+  a.setAttribute('aria-label', ep.v4 ? `${title}, ${sub}, deployed: ${(ep.deployed || []).map(agentLabel).join(', ') || 'nobody'}`
+    : `${title}, ${sub}, team score ${fmtScore(ep.team_score)}`);
   a._ep = ep;
   return a;
 }
@@ -58,7 +93,7 @@ const io = 'IntersectionObserver' in window ? new IntersectionObserver(entries =
   for (const en of entries) if (en.isIntersecting) { io.unobserve(en.target); drawThumb(en.target); }
 }, { rootMargin: '200px' }) : null;
 function drawThumb(cardEl) {
-  try { drawIso(cardEl.querySelector('canvas'), cardEl._ep); } catch (e) { console.warn('thumbnail failed', cardEl._ep.id, e); }
+  try { setCatalog(cardEl._ep.v4 ? cardEl._ep.catalog || [] : null); drawIso(cardEl.querySelector('canvas'), cardEl._ep); } catch (e) { console.warn('thumbnail failed', cardEl._ep.id, e); }
 }
 
 function render() {

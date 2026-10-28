@@ -1,10 +1,12 @@
 // Isometric 2D-canvas rendering of a build (gallery thumbnails). Cheap: no WebGL context per card.
 // Uses the same procedural textures as the 3D replay. View from the south-east, like the replay camera.
-import { blockFaces, doorKey, isTransparent } from './textures.js';
+import { blockFaces, doorKey, isTransparent, isDoor } from './textures.js';
 
 /**
  * Draw blocks on a canvas (sized to its CSS box × devicePixelRatio).
- * build = {final_blocks: [[x, y, z, type], ...], grid: {width, depth, height}, chest_pos: [x, y, z] | null}
+ * build = {final_blocks: [[x, y, z, type], ...], grid: {width, depth, height}, chest_pos: [x, y, z] | null,
+ *          shop_pos: [x, y, z] | null (log v4)}. Item types resolve through the catalog registered in core
+ *          (the caller sets it per episode with setCatalog for v4 summaries).
  */
 export function drawIso(canvas, build, { pad = 0.08, island = 2 } = {}) {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -19,6 +21,8 @@ export function drawIso(canvas, build, { pad = 0.08, island = 2 } = {}) {
   for (const [x, y, z, t] of build.final_blocks || []) cells.set(k(x, y, z), t);
   const cp = Array.isArray(build.chest_pos) ? build.chest_pos : null;
   if (cp) cells.set(k(cp[0], cp[1], cp[2]), '__chest');
+  const sp = Array.isArray(build.shop_pos) ? build.shop_pos : null;
+  if (sp) cells.set(k(sp[0], sp[1], sp[2]), '__shop');
 
   // ground island: bounding box of the build (+ margin), clamped to the grid
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
@@ -46,7 +50,8 @@ export function drawIso(canvas, build, { pad = 0.08, island = 2 } = {}) {
   const vec = v => [v[0] * s, v[1] * s];
   const ex = vec(EX), ey = vec(EY), ez = vec(EZ);
 
-  const opaqueAt = (x, y, z) => { const t = cells.get(k(x, y, z)); return t !== undefined && !isTransparent(t); };
+  const special = t => t === '__chest' || t === '__shop' || t === 'grass';
+  const opaqueAt = (x, y, z) => { const t = cells.get(k(x, y, z)); return t !== undefined && (special(t) || !isTransparent(t)); };
   const typeAt = (x, y, z) => cells.get(k(x, y, z));
   const face = (img, o, u, v, shade) => {
     g.setTransform(u[0] / 16, u[1] / 16, v[0] / 16, v[1] / 16, o[0], o[1]);
@@ -59,8 +64,9 @@ export function drawIso(canvas, build, { pad = 0.08, island = 2 } = {}) {
   const neg = v => [-v[0], -v[1]];
   for (const { x, y, z, t } of list) {
     const isChest = t === '__chest';
-    const faces = isChest ? blockFaces('chest') : blockFaces(t === 'door' ? doorKey(typeAt, x, y, z) : t);
-    const glassy = isTransparent(t);
+    const faces = isChest ? blockFaces('chest') : t === '__shop' ? blockFaces('shop') : t === 'grass' ? blockFaces('grass')
+      : blockFaces(isDoor(t) ? doorKey(typeAt, x, y, z) : t);
+    const glassy = !special(t) && isTransparent(t);
     const skip = (nx, ny, nz) => opaqueAt(nx, ny, nz) || (glassy && typeAt(nx, ny, nz) === t);
     // south face (y = y plane), seen from -y; texture u → +x, v → down
     if (!skip(x, y - 1, z)) face(isChest ? faces.front : faces.side, S(x, y, z + 1), ex, neg(ez), glassy ? 0.05 : 0.28);

@@ -1,7 +1,8 @@
 /**
  * BlockSwarm viewer core — shared, DOM-free and three.js-free logic for replaying episode logs
- * (docs/log-format.md, log versions 1–3, blueprint and open tasks). Used by viewer/index.html and
- * the static gallery site. Plain ES module; also runs under Node (>= 18) for tests.
+ * (docs/log-format.md, log versions 1–4, blueprint and open tasks; v4 = shop + shared wallet +
+ * competitive incentive, docs/shop-and-incentives.md). Used by viewer/index.html and the static
+ * gallery site. Plain ES module; also runs under Node (>= 18) for tests.
  *
  * Coordinates are log coordinates throughout: x east, y north, z up (z = 0 is the ground layer).
  * Cell keys are strings "x,y,z" (see `key`).
@@ -17,28 +18,49 @@
  *     builder.addLine(line, lineNo)   parse + add one line (blank lines ignored).
  *     builder.addRecord(rec, lineNo)  add one already-parsed record.
  *     builder.log   = {header, task, events, snapshots, episodeEnd, warnings}
- *     builder.built = {states, bp, task, agents, mismatches, verified, snapshotCount, snapsAtPos}
+ *     builder.built = {states, bp, task, agents, mismatches, verified, snapshotCount, snapsAtPos,
+ *                      v4, shop, endChecked}
  *       states[p]  = state after the first p events (states[0] = start):
- *                    {grid: Map<key,{type,placed_by,placed_at|placed_at_round}>, chest: {type:n},
- *                     inv: {agent:{type:n}}, votes: [agent] (from diff.votes.after; older logs
- *                     without diff.votes: every successful declare_done adds), actions: {agent:n},
- *                     positions: {agent:[x,y,z]}, moves: {agent: last diff.agents entry (+ landZ/raiseAt
- *                     when a block was placed under a jumping agent)}, stats: see scoring below}
+ *                    {grid: Map<key,{type,placed_by,placed_at|placed_at_round}>, chest: {type:n} (v1–v3),
+ *                     wallet: coins (v4; null before), inv: {agent:{type:n}}, votes: [agent] (from
+ *                     diff.votes.after; older logs without diff.votes: every successful declare_done adds),
+ *                     actions: {agent:n}, positions: {agent:[x,y,z]}, moves: {agent: last diff.agents entry
+ *                     (+ landZ/raiseAt when a block was placed under a jumping agent)}, stats: see below}
  *       bp         = Map<key, type> of blueprint cells (empty for open tasks)
  *       mismatches = [{pos, t, seq, problems: [string]}] snapshots that disagree with the replay
+ *                    (v4: also the episode_end record, seq 'end', checked against the final state:
+ *                    wallet, individual_scores, ranking, deployed, analysis)
  *       snapsAtPos = Map<p, [snapshot]>
+ *       v4         = true for log v4 (shop + wallet); shop = {pos, catalog, startingMoney} | null
  *     Errors (bad JSON, missing/invalid header) throw Error with a readable "Line N: ..." message.
  * parseLog(text) -> log      Whole-file parse; log.built holds the replay. Throws if there is no header.
  * buildStates(log) -> built  Same object as log.built (kept for older callers).
  * checkSnapshot(snapshot, state) -> [problem strings]
  * taskOf(header) -> {kind: 'open'|'blueprint', brief, blueprint|null, targetInterior}
  *
- * ── Scoring (matches docs/log-format.md › Scoring) ────────────────────────────────────────────
+ * ── Scoring / analysis (matches docs/log-format.md › Scoring) ────────────────────────────────
  * blueprintStats(grid, bp, agents, extraPenalty)
- *     -> {kind:'blueprint', correct, wrong, extra, perAgent, team, blueprintCells}
- * openStats(grid, dims{width,depth,height}, chestKey|null, agents, targetInterior)
+ *     -> {kind:'blueprint', correct, wrong, extra, perAgent, team, blueprintCells, placed}
+ * openStats(grid, dims{width,depth,height}, solidKeys ("x,y,z" | [keys] | null), agents, targetInterior, classify?)
  *     -> {kind:'open', enclosed, interior:[key], interiorCells, shellCells, doors, windows,
- *         leftovers, leftoverSet:Set<key>, team, perAgent, targetInterior}
+ *         leftovers, leftoverSet:Set<key>, team, perAgent, placed, targetInterior}
+ *     classify(type) -> 'door' | 'window' | null (default: v3 types 'door' / 'glass'; v4: catalog
+ *     door / transparent flags, see classifyItem). placed = {agent: blocks it placed still in the world}.
+ *     For v4 logs the builder sets stats.v4 = true, stats.team = null (no team score) and
+ *     stats.perAgent = stats.placed (the v4 individual score); stats.shellPerAgent keeps the shell count.
+ *
+ * ── v4: shop, wallet, ranking ─────────────────────────────────────────────────────────────────
+ * isV4(header) -> bool; shopOf(header) -> {pos:[x,y,z], catalog:[item], startingMoney} | null
+ * itemInfo(type) -> {id, name, family, price, color, transparent, door, legacy?} (from the catalog of the
+ *     last loaded header; v1–v3 block types get a legacy entry). classifyItem(type) -> 'door'|'window'|null
+ * purchaseOf(event) -> {agent, item, n, cost, ok} for buy events (cost = coins spent, 0 if failed), else null
+ * walletAt(built, p) -> coins after the first p events (v4) | null
+ * leaderboard(state, agents) -> [{agent, score, rank}] by blocks placed still standing (rank 1 = best, ties share)
+ * rankAgents(scores{agent:n}, agents, k) -> {ranking:[{agent, score, rank}], deployed:[agent]}
+ *     (competition ranking; the top k plus everyone tied with the k-th are deployed)
+ * deployTopK(header) -> config.deploy_top_k or max(1, floor(N / 2)); 0 when config.incentive is "none"
+ * finalResults(log) -> {ranking, deployed, wallet, startingMoney, spent, individual, analysis, reason, t, source}
+ *     v4 summary: the engine's episode_end values when present, else recomputed from the final state.
  *
  * ── Time + bodies ─────────────────────────────────────────────────────────────────────────────
  * posAtTime(events, t) -> number of events with event.t <= t (binary search)
@@ -51,8 +73,10 @@
  * ── Presentation helpers (no DOM) ─────────────────────────────────────────────────────────────
  * describeEvent(event) -> short text for feeds ("place stone at (4, 5, 0)", "walks to (…) (1.9 s)",
  *     "jumps", "places wood under itself at …", "remove … — agent_1 fell 1", "votes the house is finished
- *     (2 votes)", "withdraws its finished vote (1 vote)", "place … — finished votes cleared", ...)
- * typeColor(type) -> '#rrggbb' (fixed palette for known block types, stable hash colour otherwise)
+ *     (2 votes)", "withdraws its finished vote (1 vote)", "place … — finished votes cleared",
+ *     "buys 12 × oak_planks (−24)", ...)
+ * typeColor(type) -> '#rrggbb' (catalog colour for v4 items; fixed palette for the v1–v3 block types,
+ *     stable hash colour otherwise)
  * agentColors(agents) -> {agent: '#rrggbb'} in order (8-colour palette, repeats after 8)
  * TYPE_COLORS, AGENT_COLORS, HOP_HEIGHT, key(x, y, z)
  */
@@ -65,6 +89,82 @@ const AGENT_COLORS = ['#3b7dd8', '#f28e2b', '#4bab5a', '#d1495b', '#9467bd', '#1
 const EXTRA_TYPE_COLORS = ['#c2185b', '#7cb342', '#5e35b1', '#00897b', '#f4511e', '#6d4c41'];
 
 const key = (x, y, z) => x + ',' + y + ',' + z;
+
+// ---------- v4 shop catalog ----------
+/** Legacy (log v1–v3) block types as catalog-like items, so callers can treat both alike. */
+const LEGACY_ITEMS = {
+  wood: { name: 'Wood', family: 'wood', id: 'wood_log' }, plank: { name: 'Plank', family: 'wood', id: 'plank_planks' },
+  stone: { name: 'Stone', family: 'stone' }, brick: { name: 'Brick', family: 'bricks' },
+  glass: { name: 'Glass', family: 'glass', transparent: true }, roof: { name: 'Roof', family: 'roof' },
+  door: { name: 'Door', family: 'door', door: true },
+};
+let CATALOG = new Map();
+/** Register the item catalog of the log being read (header.shop.catalog); [] / null clears it. */
+function setCatalog(list) {
+  CATALOG = new Map();
+  for (const it of Array.isArray(list) ? list : []) if (it && typeof it.id === 'string') CATALOG.set(it.id, it);
+}
+const itemCache = new Map();
+function itemInfo(t) {
+  const c = CATALOG.get(t);
+  if (c) return c;
+  const k = String(t);
+  if (!itemCache.has(k)) {
+    const L = LEGACY_ITEMS[k] || {};
+    itemCache.set(k, { id: k, name: L.name || k.replace(/_/g, ' '), family: L.family || 'misc', price: null,
+      color: TYPE_COLORS[k] || hashColor(k), transparent: !!L.transparent, door: !!L.door, legacy: true,
+      styleId: L.id || k });
+  }
+  return itemCache.get(k);
+}
+/** 'door' | 'window' | null for the house analysis (v4: catalog flags; v3: types door / glass). */
+function classifyItem(t) {
+  const it = itemInfo(t);
+  return it.door ? 'door' : it.transparent ? 'window' : null;
+}
+const legacyClassify = t => (t === 'door' ? 'door' : t === 'glass' ? 'window' : null);
+function isV4(header) { return !!header && ((typeof header.log_version === 'number' && header.log_version >= 4) || !!header.shop); }
+function shopOf(header) {
+  if (!header) return null;
+  const s = header.shop && typeof header.shop === 'object' ? header.shop : null;
+  const c = header.config || {};
+  const pos = (s && s.pos) || c.shop_pos || header.shop_pos;
+  if (!s && !Array.isArray(pos)) return null;
+  const money = s && typeof s.starting_money === 'number' ? s.starting_money
+    : typeof c.starting_money === 'number' ? c.starting_money : (typeof header.wallet === 'number' ? header.wallet : null);
+  return { pos: Array.isArray(pos) ? pos : null, catalog: (s && Array.isArray(s.catalog)) ? s.catalog : [], startingMoney: money };
+}
+function deployTopK(header) {
+  const c = (header && header.config) || {};
+  if (c.incentive === 'none') return 0;
+  if (typeof c.deploy_top_k === 'number') return c.deploy_top_k;
+  const n = ((header && header.agents) || c.agents || []).length;
+  return Math.max(1, Math.floor(n / 2));
+}
+/** Competition ranking (1, 1, 3, …) by score, ties by agent order; top k plus ties at the boundary are deployed. */
+function rankAgents(scores, agents, k) {
+  const order = [...agents].map((a, i) => ({ a, i, s: (scores && scores[a]) || 0 }))
+    .sort((p, q) => q.s - p.s || p.i - q.i);
+  const ranking = [];
+  order.forEach((o, i) => {
+    const rank = i > 0 && o.s === order[i - 1].s ? ranking[i - 1].rank : i + 1;
+    ranking.push({ agent: o.a, score: o.s, rank });
+  });
+  const deployed = k > 0 && order.length ? order.filter(o => o.s >= order[Math.min(k, order.length) - 1].s).map(o => o.a) : [];
+  return { ranking, deployed };
+}
+function leaderboard(state, agents) { return rankAgents((state && state.stats && state.stats.placed) || {}, agents, 0).ranking; }
+function walletAt(built, p) { const st = built.states[Math.max(0, Math.min(built.states.length - 1, p))]; return st ? st.wallet : null; }
+/** {agent, item, n, cost, ok} for a buy event (cost: coins that left the wallet), else null. */
+function purchaseOf(e) {
+  if (!e || e.tool !== 'buy') return null;
+  const a = e.args || {};
+  let item = a.item ?? a.type ?? a.id ?? null, n = typeof a.n === 'number' ? a.n : null;
+  const got = e.diff && e.diff.inventory && e.diff.inventory[e.agent];
+  if (e.ok && got) for (const t in got) if (got[t] > 0) { item = t; n = got[t]; break; }
+  const w = e.diff && typeof e.diff.wallet === 'number' ? e.diff.wallet : 0;
+  return { agent: e.agent, item, n: n ?? 1, cost: Math.max(0, -w), ok: !!e.ok };
+}
 
 function addDelta(obj, t, d) {
   const v = (obj[t] || 0) + d;
@@ -82,6 +182,13 @@ function taskOf(header) {
     targetInterior: typeof c.target_interior === 'number' ? c.target_interior : 12 };
 }
 
+function placedCounts(grid, agents) {
+  const out = {};
+  for (const a of agents) out[a] = 0;
+  for (const b of grid.values()) if (b.placed_by != null) out[b.placed_by] = (out[b.placed_by] || 0) + 1;
+  return out;
+}
+
 function blueprintStats(grid, bp, agents, extraPenalty) {
   let correct = 0, wrong = 0, extra = 0;
   const perAgent = {};
@@ -94,11 +201,14 @@ function blueprintStats(grid, bp, agents, extraPenalty) {
   }
   const n = bp.size;
   const team = n ? Math.max(0, (correct - extraPenalty * extra) / n) : 0;
-  return { kind: 'blueprint', correct, wrong, extra, perAgent, team: Math.round(team * 1e6) / 1e6, blueprintCells: n };
+  return { kind: 'blueprint', correct, wrong, extra, perAgent, team: Math.round(team * 1e6) / 1e6, blueprintCells: n, placed: placedCounts(grid, agents) };
 }
 
-/** Open task scoring (docs/log-format.md › Scoring › open). dims = {width, depth, height}; chestKey = "x,y,z" or null. */
-function openStats(grid, dims, chestKey, agents, targetInterior) {
+/**
+ * Open task scoring / v4 house analysis (docs/log-format.md › Scoring › open). dims = {width, depth, height};
+ * solidKeys = "x,y,z" or an array of them (chest / shop cells) or null; classify(type) -> 'door'|'window'|null.
+ */
+function openStats(grid, dims, solidKeys, agents, targetInterior, classify = legacyClassify) {
   const W = dims.width, D = dims.depth, H = dims.height;
   const idx = (x, y, z) => (z * D + y) * W + x;
   const N = W * D * H;
@@ -107,8 +217,8 @@ function openStats(grid, dims, chestKey, agents, targetInterior) {
     const [x, y, z] = k.split(',').map(Number);
     if (x >= 0 && x < W && y >= 0 && y < D && z >= 0 && z < H) solid[idx(x, y, z)] = 1;
   }
-  if (chestKey) {
-    const [x, y, z] = chestKey.split(',').map(Number);
+  for (const sk of (Array.isArray(solidKeys) ? solidKeys : solidKeys ? [solidKeys] : [])) {
+    const [x, y, z] = sk.split(',').map(Number);
     if (x >= 0 && x < W && y >= 0 && y < D && z >= 0 && z < H) solid[idx(x, y, z)] = 1;
   }
   const NB = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
@@ -165,7 +275,8 @@ function openStats(grid, dims, chestKey, agents, targetInterior) {
     if (!inShell) { leftovers.add(k); continue; }
     shell.add(k);
     perAgent[b.placed_by] = (perAgent[b.placed_by] || 0) + 1;
-    if (b.type !== 'door' && b.type !== 'glass') continue;
+    const cls = classify(b.type);
+    if (!cls) continue;
     // door / window: face contact with both interior and outside air
     let faceInterior = false, faceOutside = false;
     for (const [dx, dy, dz] of NB) {
@@ -174,7 +285,7 @@ function openStats(grid, dims, chestKey, agents, targetInterior) {
       if (nx >= 0 && ny >= 0 && nz >= 0 && nx < W && ny < D && nz < H) { if (outside[idx(nx, ny, nz)]) faceOutside = true; }
       else if (nz >= H && nx >= 0 && ny >= 0 && nx < W && ny < D) faceOutside = true; // open sky above the top layer
     }
-    if (faceInterior && faceOutside) { if (b.type === 'door') doors++; else windows++; }
+    if (faceInterior && faceOutside) { if (cls === 'door') doors++; else windows++; }
   }
   let team = 0;
   if (enclosed) {
@@ -183,7 +294,7 @@ function openStats(grid, dims, chestKey, agents, targetInterior) {
     team = Math.round(Math.min(1, Math.max(0, team)) * 1e6) / 1e6;
   }
   return { kind: 'open', enclosed, interior: [...interiorSet], interiorCells: interiorSet.size, shellCells: shell.size,
-    doors, windows, leftovers: leftovers.size, leftoverSet: leftovers, team, perAgent, targetInterior };
+    doors, windows, leftovers: leftovers.size, leftoverSet: leftovers, team, perAgent, targetInterior, placed: placedCounts(grid, agents) };
 }
 
 /**
@@ -195,7 +306,8 @@ function openStats(grid, dims, chestKey, agents, targetInterior) {
  */
 function createLogBuilder() {
   const log = { header: null, task: null, events: [], snapshots: [], episodeEnd: null, warnings: [] };
-  const built = { states: [], bp: new Map(), task: null, agents: [], mismatches: [], verified: 0, snapshotCount: 0, snapsAtPos: new Map() };
+  const built = { states: [], bp: new Map(), task: null, agents: [], mismatches: [], verified: 0, snapshotCount: 0, snapsAtPos: new Map(),
+    v4: false, shop: null, endChecked: false };
   let lastId = -Infinity, lastT = -Infinity;
   const idToPos = new Map();
   let cur = null, computeStats = null;
@@ -210,18 +322,26 @@ function createLogBuilder() {
     built.agents = agents;
     const extraPenalty = header.config && typeof header.config.extra_penalty === 'number' ? header.config.extra_penalty : 0;
     if (task.blueprint) for (const [x, y, z, t] of task.blueprint.cells) built.bp.set(key(x, y, z), t);
-    const cp = header.chest_pos || (header.config && header.config.chest_pos);
-    const chestKey = Array.isArray(cp) ? key(cp[0], cp[1], cp[2]) : null;
-    computeStats = (grid) => task.kind === 'open'
-      ? openStats(grid, g, chestKey, agents, task.targetInterior)
-      : blueprintStats(grid, built.bp, agents, extraPenalty);
+    const v4 = isV4(header);
+    const shop = v4 ? shopOf(header) : null;
+    built.v4 = v4; built.shop = shop;
+    setCatalog(shop ? shop.catalog : null);
+    const cp = v4 ? shop && shop.pos : header.chest_pos || (header.config && header.config.chest_pos);
+    const solidKey = Array.isArray(cp) ? key(cp[0], cp[1], cp[2]) : null;
+    computeStats = (grid) => {
+      if (task.kind !== 'open') return blueprintStats(grid, built.bp, agents, extraPenalty);
+      const s = openStats(grid, g, solidKey, agents, task.targetInterior, v4 ? classifyItem : legacyClassify);
+      if (v4) { s.v4 = true; s.team = null; s.shellPerAgent = s.perAgent; s.perAgent = s.placed; }
+      return s;
+    };
     const inv = {};
     for (const a of agents) inv[a] = { ...((header.inventories || {})[a] || {}) };
     for (const a in (header.inventories || {})) if (!inv[a]) inv[a] = { ...header.inventories[a] };
     const actions = {};
     for (const a of agents) actions[a] = 0;
     // [v3] bodies: current cell per agent (position jumps to `to` immediately) + last move for animation
-    cur = { grid: new Map(), chest: { ...(header.chest || {}) }, inv, votes: [], actions,
+    const wallet = v4 ? (typeof header.wallet === 'number' ? header.wallet : (shop && shop.startingMoney) ?? 0) : null;
+    cur = { grid: new Map(), chest: { ...(header.chest || {}) }, wallet, inv, votes: [], actions,
             positions: { ...(header.positions || {}) }, moves: {} };
     pushState();
   }
@@ -239,7 +359,7 @@ function createLogBuilder() {
 
   function applyEvent(e) {
     const d = e.diff;
-    let { grid, chest, inv, votes, actions, positions, moves } = cur;
+    let { grid, chest, wallet, inv, votes, actions, positions, moves } = cur;
     if (d.grid.length) {
       grid = new Map(grid);
       for (const g of d.grid) {
@@ -251,6 +371,7 @@ function createLogBuilder() {
       chest = { ...chest };
       for (const t in d.chest) chest[t] = (chest[t] || 0) + d.chest[t];
     }
+    if (typeof d.wallet === 'number' && d.wallet && wallet !== null) wallet += d.wallet;
     if (Object.keys(d.inventory).length) {
       inv = { ...inv };
       for (const a in d.inventory) {
@@ -280,7 +401,7 @@ function createLogBuilder() {
     } else if (e.tool === 'declare_done' && e.ok && !votes.includes(e.agent)) {
       votes = [...votes, e.agent]; // older logs without diff.votes: votes only ever accumulate
     }
-    cur = { grid, chest, inv, votes, actions, positions, moves };
+    cur = { grid, chest, wallet, inv, votes, actions, positions, moves };
     pushState();
   }
 
@@ -305,6 +426,7 @@ function createLogBuilder() {
         rec.diff = rec.diff || {};
         rec.diff.grid = rec.diff.grid || [];
         rec.diff.chest = rec.diff.chest || {};
+        if (typeof rec.diff.wallet !== 'number') rec.diff.wallet = 0;
         rec.diff.inventory = rec.diff.inventory || {};
         rec.diff.agents = rec.diff.agents || {};
         rec.args = rec.args || {};
@@ -323,7 +445,15 @@ function createLogBuilder() {
         checkAt(p, rec);
         break;
       }
-      case 'episode_end': log.episodeEnd = rec; break;
+      case 'episode_end':
+        log.episodeEnd = rec;
+        if (built.v4 && !built.endChecked) {
+          built.endChecked = true;
+          const p = built.states.length - 1;
+          const problems = checkEnd(rec, built.states[p], built.agents, deployTopK(log.header));
+          if (problems.length) built.mismatches.push({ pos: p, t: rec.t, seq: 'end', problems });
+        }
+        break;
       default: break; // unknown record types are ignored by contract
     }
   }
@@ -375,6 +505,56 @@ function parseLog(text) {
 /** Kept for callers/tests: the replay of a parsed log. */
 function buildStates(log) { return log.built; }
 
+/** v4: episode_end vs. the replayed final state (wallet, individual scores, ranking, deployed, analysis). */
+function checkEnd(end, st, agents, k) {
+  const out = [];
+  if (typeof end.wallet === 'number' && st.wallet !== null && end.wallet !== st.wallet) out.push(`final wallet: replay ${st.wallet}, logged ${end.wallet}`);
+  const S = st.stats;
+  if (end.individual_scores) for (const a in end.individual_scores)
+    if ((S.placed[a] || 0) !== end.individual_scores[a]) out.push(`final score ${a}: replay ${S.placed[a] || 0}, logged ${end.individual_scores[a]}`);
+  const mine = rankAgents(S.placed, agents, k);
+  if (Array.isArray(end.ranking)) {
+    const want = new Map(mine.ranking.map(r => [r.agent, r]));
+    for (const r of end.ranking) {
+      const m = want.get(r.agent);
+      if (!m) out.push(`ranking lists unknown agent ${r.agent}`);
+      else if (m.score !== r.score || m.rank !== r.rank) out.push(`ranking ${r.agent}: replay #${m.rank} (${m.score}), logged #${r.rank} (${r.score})`);
+    }
+  }
+  if (Array.isArray(end.deployed)) {
+    const A = [...mine.deployed].sort().join(','), B = [...end.deployed].sort().join(',');
+    if (A !== B) out.push(`deployed: replay [${A}], logged [${B}]`);
+  }
+  const det = end.analysis || {};
+  const want = { enclosed: S.enclosed, interior_cells: S.interiorCells, shell_cells: S.shellCells, doors: S.doors, windows: S.windows, leftovers: S.leftovers };
+  if (S.kind === 'open') for (const kk in want) if (kk in det && det[kk] !== want[kk]) out.push(`final ${kk}: replay ${want[kk]}, logged ${det[kk]}`);
+  return out.slice(0, 8);
+}
+
+/** v4 results: the engine's episode_end numbers when present, else recomputed from the final replayed state. */
+function finalResults(log) {
+  const built = log.built, header = log.header;
+  if (!built || !built.v4) return null;
+  const st = built.states[built.states.length - 1];
+  const end = log.episodeEnd;
+  const k = deployTopK(header);
+  const mine = rankAgents(st.stats.placed || {}, built.agents, k);
+  const start = built.shop && built.shop.startingMoney != null ? built.shop.startingMoney : built.states[0].wallet;
+  const wallet = end && typeof end.wallet === 'number' ? end.wallet : st.wallet;
+  const S = st.stats;
+  const replayAnalysis = S.kind === 'open' ? { enclosed: S.enclosed, interior_cells: S.interiorCells, shell_cells: S.shellCells,
+    doors: S.doors, windows: S.windows, leftovers: S.leftovers, target_interior: S.targetInterior } : {};
+  return {
+    ranking: end && Array.isArray(end.ranking) ? end.ranking : mine.ranking,
+    deployed: end && Array.isArray(end.deployed) ? end.deployed : mine.deployed,
+    individual: end && end.individual_scores ? end.individual_scores : { ...(S.placed || {}) },
+    wallet, startingMoney: start, spent: typeof start === 'number' && typeof wallet === 'number' ? start - wallet : null,
+    analysis: { ...replayAnalysis, ...((end && end.analysis) || {}) },
+    deployTopK: k, incentive: (header.config || {}).incentive || 'competitive',
+    reason: end ? end.reason : null, t: end ? end.t : null, source: end ? 'episode_end' : 'replay',
+  };
+}
+
 function checkSnapshot(snap, st) {
   const out = [];
   if (Array.isArray(snap.blocks)) {
@@ -394,6 +574,8 @@ function checkSnapshot(snap, st) {
       if ((A[t] || 0) !== (B[t] || 0)) out.push(`${label} ${t}: replay ${A[t] || 0}, snapshot ${B[t] || 0}`);
   };
   if (snap.chest) cmp('chest', st.chest, snap.chest);
+  if (typeof snap.wallet === 'number' && st.wallet !== null && st.wallet !== undefined && snap.wallet !== st.wallet)
+    out.push(`wallet: replay ${st.wallet}, snapshot ${snap.wallet}`);
   if (snap.inventories) for (const a in snap.inventories) cmp(`${a} inventory`, st.inv[a], snap.inventories[a]);
   if (snap.actions_used) cmp('actions used by', st.actions, snap.actions_used);
   if (Array.isArray(snap.done_votes)) {
@@ -405,7 +587,7 @@ function checkSnapshot(snap, st) {
     if (A !== B) out.push(`${a} position: replay (${A}), snapshot (${B})`);
   }
   // scores: our own computation vs. what the engine logged
-  const S = st.stats, det = snap.score_details || {};
+  const S = st.stats, det = snap.score_details || snap.analysis || {};
   const num = k => (typeof det[k] === 'number' || typeof det[k] === 'boolean') ? det[k] : snap[k];
   const want = S.kind === 'open'
     ? { enclosed: S.enclosed, interior_cells: S.interiorCells, shell_cells: S.shellCells, doors: S.doors, windows: S.windows, leftovers: S.leftovers }
@@ -445,7 +627,8 @@ function describeAction(e, a, pos, target) {
   switch (e.tool) {
     case 'place': {
       const m = e.diff.agents && e.diff.agents[e.agent];
-      return m && m.to ? `places ${a.type ?? '?'} under itself at ${pos}` : `place ${a.type ?? '?'} at ${pos}`;
+      const t = a.type ?? a.item ?? '?';
+      return m && m.to ? `places ${t} under itself at ${pos}` : `place ${t} at ${pos}`;
     }
     case 'remove': {
       const g = e.diff.grid[0];
@@ -454,9 +637,13 @@ function describeAction(e, a, pos, target) {
         .map(([who, m]) => `${who} fell ${m.from[2] - m.to[2]}`);
       return `remove ${b ? b.type + ' ' : ''}at ${pos}` + (b && b.placed_by && b.placed_by !== e.agent ? ` (placed by ${b.placed_by})` : '') + (falls.length ? ` — ${falls.join(', ')}` : '');
     }
+    case 'buy': {
+      const b = purchaseOf(e);
+      return e.ok ? `buys ${b.n} × ${b.item} (−${b.cost})` : `buy ${b.n} × ${b.item ?? '?'}`;
+    }
     case 'take': return `take ${a.n ?? ''} ${a.type ?? ''} from chest`;
     case 'deposit': return `deposit ${a.n ?? ''} ${a.type ?? ''} into chest`;
-    case 'give': return `give ${a.n ?? ''} ${a.type ?? ''} → ${target ?? '?'}`;
+    case 'give': return `give ${a.n ?? ''} ${a.type ?? a.item ?? ''} → ${target ?? '?'}`;
     case 'say': return 'says (public)';
     case 'whisper': return `whispers → ${(e.chat && e.chat.to) || target || '?'}`;
     case 'note': return 'writes a note';
@@ -523,13 +710,17 @@ function agentPoseAt(state, agent, t) {
 }
 
 const typeColorCache = {};
-function typeColor(t) {
-  if (TYPE_COLORS[t]) return TYPE_COLORS[t];
+function hashColor(t) {
   if (!typeColorCache[t]) {
     let h = 0; for (const c of String(t)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
     typeColorCache[t] = EXTRA_TYPE_COLORS[h % EXTRA_TYPE_COLORS.length];
   }
   return typeColorCache[t];
+}
+function typeColor(t) {
+  const c = CATALOG.get(t);
+  if (c && c.color) return c.color;
+  return TYPE_COLORS[t] || hashColor(t);
 }
 function agentColors(agents) {
   const out = {};
@@ -540,6 +731,7 @@ function agentColors(agents) {
 export {
   createLogBuilder, parseLog, buildStates, checkSnapshot, taskOf,
   blueprintStats, openStats,
+  isV4, shopOf, setCatalog, itemInfo, classifyItem, purchaseOf, walletAt, leaderboard, rankAgents, deployTopK, finalResults,
   posAtTime, walkPosition, agentPoseAt, HOP_HEIGHT,
   describeEvent, typeColor, agentColors, TYPE_COLORS, AGENT_COLORS, key,
 };

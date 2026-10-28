@@ -3,8 +3,9 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   loadEpisodeIndex, loadEpisodeLog, posAtTime, agentPoseAt, describeEvent, agentColors, agentTotals, finalScore, key,
+  finalResults, purchaseOf, leaderboard, deployTopK, itemInfo,
 } from './core-adapter.js';
-import { blockFaces, doorKey, isTransparent, headFaces, clothTexture, swatchUrl } from './textures.js';
+import { blockFaces, doorKey, isTransparent, isDoor, headFaces, clothTexture, swatchUrl } from './textures.js';
 import {
   $, esc, fmtClock, fmtDuration, fmtScore, scoreBand, SCORE_COLORS, agentLabel, shortModel, reasonLabel,
   prefersReducedMotion, initTheme, onThemeChange, isDark, toast,
@@ -79,7 +80,7 @@ function blockMaterials(variant) {
   return mats;
 }
 
-const world = { root: null, blocks: new Map(), ghosts: new Map(), avatars: new Map(), chest: null, popping: new Set() };
+const world = { root: null, blocks: new Map(), ghosts: new Map(), avatars: new Map(), chest: null, shop: null, popping: new Set() };
 const boxGeo = new THREE.BoxGeometry(1, 1, 1);
 
 function dims() { const h = R.log.header, g = h.grid || h.config; return { W: g.width, D: g.depth, H: g.height }; }
@@ -111,6 +112,7 @@ function buildStatic() {
   Object.assign(sun.shadow.camera, { left: -r, right: r, top: r, bottom: -r, near: 1, far: 90 });
   sun.shadow.camera.updateProjectionMatrix();
   buildChest();
+  buildShop();
   buildAvatars();
   applyTheme();
 }
@@ -161,6 +163,35 @@ function buildChest() {
   latch.position.set(0, 0.06, 0.88); hinge.add(latch);
   world.root.add(g);
   world.chest = { g, hinge, open: 0 };
+}
+
+// ---------------------------------------------------------------- [v4] shop: a market stall
+function buildShop() {
+  world.shop = null;
+  const shop = R.built.v4 ? R.built.shop : null;
+  if (!shop || !Array.isArray(shop.pos)) return;
+  const p = shop.pos;
+  const g = new THREE.Group();
+  g.position.copy(feetToThree(p[0], p[1], p[2]));
+  const add = (geo, mat, x, y, z) => { const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); m.castShadow = m.receiveShadow = true; g.add(m); return m; };
+  const counterMats = blockMaterials('counter');
+  add(new THREE.BoxGeometry(0.94, 0.56, 0.94), counterMats, 0, 0.28, 0);
+  const dark = new THREE.MeshLambertMaterial({ color: 0x6e4520 });
+  add(new THREE.BoxGeometry(1.0, 0.06, 1.0), dark, 0, 0.59, 0);
+  for (const [x, z] of [[-0.45, -0.45], [0.45, -0.45], [-0.45, 0.45], [0.45, 0.45]]) add(new THREE.BoxGeometry(0.08, 1.5, 0.08), dark, x, 0.75, z);
+  const sm = blockFaces('shop');
+  const awTop = new THREE.MeshLambertMaterial({ map: cachedTex(sm.top) }), awSide = new THREE.MeshLambertMaterial({ map: cachedTex(sm.top) });
+  const awning = add(new THREE.BoxGeometry(1.18, 0.06, 1.18), [awSide, awSide, awTop, awTop, awSide, awSide], 0, 1.52, 0.05);
+  awning.rotation.x = 0.17;
+  // a few goods on the counter, textured like catalog items (catalog of this log)
+  const goods = new THREE.Group(); g.add(goods);
+  [['oak_planks', 0.22, -0.24, 0.1], ['stone_bricks', 0.2, 0.03, -0.14], ['glass', 0.18, 0.27, 0.15], ['gold_block', 0.12, 0.26, -0.22]].forEach(([t, sz, x, z]) => {
+    if (itemInfo(t).legacy) return;
+    const m = new THREE.Mesh(new THREE.BoxGeometry(sz, sz, sz), blockMaterials(t)); m.position.set(x, 0.62 + sz / 2, z); m.castShadow = true; goods.add(m);
+  });
+  const label = labelSprite('Shop', '#d1495b'); label.position.y = 1.95; g.add(label);
+  world.root.add(g);
+  world.shop = { g, goods, label, bounce: 0 };
 }
 
 // ---------------------------------------------------------------- agents
@@ -227,6 +258,17 @@ function updateAvatars(dt) {
     av.armL.rotation.z = -0.05; av.armR.rotation.z = 0.05;
     av.label.visible = R.showNames;
   }
+  // shop: goods hop briefly around purchases
+  if (world.shop) {
+    let want = 0;
+    for (let i = R.pos - 1; i >= 0; i--) {
+      const e = R.log.events[i];
+      if (R.time - e.t > 0.9) break;
+      if (e.ok && e.tool === 'buy') { want = 1 - (R.time - e.t) / 0.9; break; }
+    }
+    world.shop.goods.position.y = 0.12 * Math.sin(Math.PI * want);
+    world.shop.label.visible = R.showNames;
+  }
   // chest lid: open briefly around take / deposit events
   if (world.chest) {
     let want = 0;
@@ -252,7 +294,7 @@ function refreshBlocks(animate) {
   for (const [k, obj] of world.blocks) if (!grid.has(k)) { world.root.remove(obj.mesh); world.blocks.delete(k); world.popping.delete(obj); }
   for (const [k, b] of grid) {
     const [x, y, z] = k.split(',').map(Number);
-    const variant = b.type === 'door' ? doorKey(typeAt, x, y, z) : b.type;
+    const variant = isDoor(b.type) ? doorKey(typeAt, x, y, z) : b.type;
     let obj = world.blocks.get(k);
     if (obj && obj.variant !== variant) { obj.mesh.material = blockMaterials(variant); obj.variant = variant; }
     if (!obj) {
@@ -307,6 +349,7 @@ function frameCamera() {
   const h = R.log.header;
   const cp = h.chest_pos || (h.config || {}).chest_pos;
   if (Array.isArray(cp)) pts.push(cp);
+  if (R.built.shop && Array.isArray(R.built.shop.pos)) pts.push(R.built.shop.pos);
   for (const p of Object.values(h.positions || {})) if (Array.isArray(p)) pts.push(p);
   if (pts.length < 2) pts.push([0, 0, 0], [W - 1, D - 1, Math.min(H - 1, 3)]);
   const min = new THREE.Vector3(Infinity, Infinity, Infinity), max = min.clone().negate();
@@ -372,7 +415,7 @@ function setTime(t, fromPlay = false) {
     const forward = p > R.pos && p - R.pos < 40;
     R.pos = p;
     refreshBlocks(fromPlay && forward && !prefersReducedMotion());
-    renderTicker(); renderLiveScore();
+    renderTicker(); renderLiveScore(); renderV4();
   }
   renderChat(); renderAgents(); renderTime(); drawStrip();
 }
@@ -461,6 +504,7 @@ function drawStrip() {
     if (e.chat) { g.fillStyle = R.colors[e.agent]; g.beginPath(); g.arc(x, y + 3.5, 2.6, 0, Math.PI * 2); g.fill(); continue; }
     if (e.tool === 'place') { g.fillStyle = R.colors[e.agent]; g.fillRect(x - 0.75, y + 2, 1.5, lane - 4); }
     else if (e.tool === 'remove') { g.fillStyle = danger; g.fillRect(x - 0.75, y + 2, 1.5, lane - 4); }
+    else if (e.tool === 'buy') { g.fillStyle = '#d9a514'; g.fillRect(x - 1.5, y + lane - 7, 3, 5); }
     else if (['take', 'deposit', 'give'].includes(e.tool)) { g.fillStyle = '#a8742c'; g.fillRect(x - 1, y + lane - 6, 2, 4); }
     else if (e.tool === 'declare_done') { g.fillStyle = accent; g.fillRect(x - 2, y + 1, 4, lane - 2); }
   }
@@ -511,9 +555,39 @@ strip.addEventListener('pointerup', () => { dragging = false; });
 function renderLiveScore() {
   const s = R.built.states[R.pos].stats, el = $('liveScore');
   el.hidden = false;
+  if (R.built.v4) {
+    const w = R.built.states[R.pos].wallet;
+    el.textContent = `${w} coins`;
+    el.title = `Shared wallet at the playhead (started with ${R.startMoney})`;
+    el.style.background = '#b8860b';
+    return;
+  }
   if (s.kind === 'open') { el.textContent = `score ${fmtScore(s.team)}`; el.title = `Team score at the playhead: ${s.enclosed ? `enclosed, ${s.interiorCells} interior cells, ${s.doors} door(s), ${s.windows} window(s)` : 'not enclosed yet'}`; }
   else { el.textContent = `${s.correct}/${s.blueprintCells} · ${fmtScore(s.team)}`; el.title = 'Correct blueprint cells and team score at the playhead'; }
   el.style.background = SCORE_COLORS[scoreBand(s.team)];
+}
+/** [v4] shared wallet bar + latest purchase + leaderboard (blocks placed still standing; deployed badges at the end). */
+let v4Sig = '';
+function renderV4() {
+  if (!R.built.v4) return;
+  const st = R.built.states[R.pos];
+  const start = R.startMoney || 0, bal = st.wallet ?? 0;
+  const lb = leaderboard(st, R.agents);
+  const atEnd = R.pos === R.log.events.length && !!R.log.episodeEnd;
+  const dep = atEnd ? new Set(finalResults(R.log).deployed) : null;
+  let last = null;
+  for (let i = R.pos - 1; i >= 0; i--) { const b = purchaseOf(R.log.events[i]); if (b && b.ok) { last = { ...b, t: R.log.events[i].t }; break; } }
+  const sig = JSON.stringify([bal, lb, atEnd, last && last.t]);
+  if (sig === v4Sig) return;
+  v4Sig = sig;
+  const pct = start ? Math.max(0, Math.min(1, bal / start)) : 0;
+  $('wallet').innerHTML = `<div class="wallet-row"><span class="v">${bal}</span><span class="muted">of ${start} coins left</span></div>
+    <div class="wallet-bar${pct < 0.2 ? ' low' : ''}" role="img" aria-label="${bal} of ${start} coins left"><i style="width:${pct * 100}%"></i></div>
+    <div class="muted" style="font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${last ? `last: ${esc(agentLabel(last.agent))} bought ${blk(last.item)} ${last.n} × ${esc(itemInfo(last.item).name || last.item)} (−${last.cost})` : 'nothing bought yet'}</div>`;
+  const max = Math.max(1, ...lb.map(r => r.score));
+  $('board').innerHTML = lb.map(r => `<li style="--c:${R.colors[r.agent]}"><span class="rk">#${r.rank}</span>
+    <span class="who"><i></i>${esc(agentLabel(r.agent))}${dep ? (dep.has(r.agent) ? ' <span class="dep">deployed</span>' : ' <span class="dep no">not deployed</span>') : ''}</span>
+    <span class="bar"><i style="width:${r.score / max * 100}%"></i></span><span class="n">${r.score}</span></li>`).join('');
 }
 function blk(type) { return `<span class="blk" style="background-image:url(${swatchUrl(type)})"></span>`; }
 let agentsSig = '';
@@ -587,7 +661,8 @@ function renderTicker() {
     if (e.tool === 'observe' || e.tool === 'note' || e.chat) continue;
     if (!e.ok && /^(walking|airborne):/.test(e.message || '')) continue;
     let type = null;
-    if (e.tool === 'place' || e.tool === 'take' || e.tool === 'deposit' || e.tool === 'give') type = e.args.type;
+    if (e.tool === 'place' || e.tool === 'take' || e.tool === 'deposit' || e.tool === 'give') type = e.args.type ?? e.args.item;
+    if (e.tool === 'buy') type = purchaseOf(e).item;
     if (e.tool === 'remove' && e.diff.grid[0] && e.diff.grid[0].before) type = e.diff.grid[0].before.type;
     out.push(`<li class="${e.ok ? '' : 'fail'}" data-i="${i}" style="--c:${R.colors[e.agent] || '#888'}"><span class="t">${fmtClock(e.t)}</span><span class="dot"></span>
       <span class="tx"><b>${esc(agentLabel(e.agent))}</b> ${type ? blk(type) + ' ' : ''}${esc(describeEvent(e))}</span></li>`);
@@ -597,7 +672,47 @@ function renderTicker() {
 $('ticker').addEventListener('click', ev => { const li = ev.target.closest('li[data-i]'); if (li) { pause(); setPos(+li.dataset.i + 1); } });
 
 // ---------------------------------------------------------------- results card
+/** [v4] results: final ranking + deployed agents, wallet, and the house analysis (never shown to agents). */
+function showResultsV4() {
+  const fr = finalResults(R.log);
+  const totals = agentTotals(R.log, R.agents);
+  const dep = new Set(fr.deployed);
+  const a = fr.analysis || {};
+  const yes = v => (v ? '✓ yes' : '✗ no');
+  const sw = ag => `<span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${R.colors[ag]};margin-right:6px"></span>`;
+  const T = ag => totals[ag] || { placed: 0, removed: 0, bought: 0, spent: 0 };
+  const rows = fr.ranking.map(r => `<tr><td class="n">#${r.rank}</td><td style="white-space:nowrap" title="${esc(r.agent)}${R.models[r.agent] ? ' · ' + esc(R.models[r.agent]) : ''}">${sw(r.agent)}${esc(agentLabel(r.agent))}
+    ${dep.has(r.agent) ? '<span class="dep">deployed</span>' : '<span class="dep no">not deployed</span>'}</td>
+    <td class="n"><b>${r.score}</b></td><td class="n">${T(r.agent).placed}</td><td class="n">${T(r.agent).removed}</td>
+    <td class="n">${T(r.agent).bought}</td><td class="n">${T(r.agent).spent}</td></tr>`).join('');
+  const anaRows = [
+    ['Enclosed interior', 'enclosed' in a ? yes(a.enclosed) : '–'],
+    ['Interior size', 'interior_cells' in a ? `${a.interior_cells} cells` : '–'],
+    ['Doors to the outside', a.doors ?? '–'],
+    ['Windows', a.windows ?? '–'],
+    ['Shell blocks', a.shell_cells ?? '–'],
+    ['Leftover blocks (not part of the shell)', a.leftovers ?? '–'],
+  ];
+  const k = fr.deployTopK;
+  $('resCard').innerHTML = `
+    <h2 id="resTitle">Results</h2>
+    <div class="muted">${esc(reasonLabel(fr.reason))} after ${fmtDuration(R.tEnd)} · ${R.log.events.length} events</div>
+    <div class="deployed-line"><b>Deployed:</b> ${fr.deployed.length ? fr.deployed.map(ag => `<span class="dep">${esc(agentLabel(ag))}</span>`).join(' ') : '<span class="muted">nobody</span>'}</div>
+    <div class="muted" style="font-size:12.5px">${fr.incentive === 'none' ? 'No competitive incentive in this run.' : `Each agent's score is the number of blocks it placed that are still in the world. The top ${k} (and anyone tied with #${k}) are deployed.`}</div>
+    <h3>Final ranking</h3>
+    <div style="overflow-x:auto"><table><thead><tr><th class="n">Rank</th><th>Agent</th><th class="n" title="Blocks placed by this agent still in the world (its score)">Standing</th><th class="n">Placed</th><th class="n">Removed</th><th class="n" title="Blocks bought at the shop">Bought</th><th class="n" title="Coins spent from the shared wallet">Coins</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <h3>Shared wallet</h3>
+    <div class="wallet-row"><span class="v">${fr.spent ?? '–'}</span><span class="muted">of ${fr.startingMoney ?? '–'} coins spent · ${fr.wallet ?? '–'} left</span></div>
+    <div class="wallet-bar"><i style="width:${fr.startingMoney ? Math.max(0, Math.min(1, fr.wallet / fr.startingMoney)) * 100 : 0}%"></i></div>
+    <div class="analysis"><h3>House analysis <span style="text-transform:none;letter-spacing:0;font-weight:500">(not shown to agents)</span></h3>
+      <table><tbody>${anaRows.map(([kk, v]) => `<tr><td>${kk}</td><td class="n">${esc(v)}</td></tr>`).join('')}</tbody></table></div>
+    <div class="actions"><a href="./"><button type="button">All builds</button></a><button type="button" id="resClose">Close</button><button type="button" class="primary" id="resReplay">Watch again</button></div>`;
+  $('results').classList.add('show');
+  $('resClose').onclick = hideResults;
+  $('resReplay').onclick = () => { hideResults(); setTime(0); play(); };
+}
 function showResults() {
+  if (R.built.v4) return showResultsV4();
   const fs = finalScore(R.log);
   const end = R.built.states[R.built.states.length - 1].stats;
   const team = fs && typeof fs.team === 'number' ? fs.team : end.team;
@@ -728,6 +843,7 @@ async function main() {
   catch (e) { console.error(e); return fail(`Could not load this replay: ${e.message}`); }
   R.log = log; R.built = log.built;
   R.agents = R.built.agents;
+  R.startMoney = R.built.v4 ? (R.built.shop.startingMoney ?? R.built.states[0].wallet) : null;
   R.colors = agentColors(R.agents);
   for (const a of ep.agents || []) R.models[a.id] = a.model;
   const end = log.episodeEnd;
@@ -740,12 +856,15 @@ async function main() {
   $('brief').hidden = false;
   if (task.kind === 'open') { $('briefSum').textContent = 'The brief'; $('briefTxt').textContent = task.brief || '(no brief recorded)'; }
   else { $('briefSum').textContent = `Blueprint: ${task.blueprint.name || cfg.blueprint || '?'}`; $('briefTxt').textContent = `Copy a fixed design of ${task.blueprint.cells.length} blocks. Toggle “Target” to see missing cells.`; $('bInterior').textContent = 'Target'; $('bInterior').title = 'Show missing blueprint cells (I)'; }
-  const facts = [`${R.agents.length} agents`, cfg.scarcity && `${cfg.scarcity} blocks`, cfg.payoff && `${cfg.payoff} payoff`, `${fmtDuration(R.tEnd)}`, reasonLabel(end && end.reason),
+  const v4facts = R.built.v4 ? [`${R.startMoney} coins shared`, `${R.built.shop.catalog.length} items in the shop`,
+    cfg.incentive === 'none' ? 'no incentive' : `top ${deployTopK(log.header)} deployed`] : [];
+  const facts = [`${R.agents.length} agents`, ...v4facts, cfg.scarcity && `${cfg.scarcity} blocks`, cfg.payoff && `${cfg.payoff} payoff`, `${fmtDuration(R.tEnd)}`, reasonLabel(end && end.reason),
     ...[...new Set(Object.values(R.models).filter(Boolean))].map(shortModel)].filter(Boolean);
   $('facts').innerHTML = facts.map(f => `<span class="chip">${esc(f)}</span>`).join('');
   if (ep.notes) $('briefTxt').textContent += `\n\n${ep.notes}`;
   if (window.innerWidth > 900) $('brief').open = true;
 
+  $('v4sec').hidden = !R.built.v4;
   buildStatic();
   resize();
   frameCamera();

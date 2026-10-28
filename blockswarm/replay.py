@@ -1,4 +1,7 @@
-"""Replay an episode log from its header by applying event diffs; check every snapshot."""
+"""Replay an episode log from its header by applying event diffs; check every snapshot.
+
+Reads v4 logs (shop and shared wallet) and v3 logs (physical chest; see docs/log-format.md).
+"""
 
 from __future__ import annotations
 
@@ -6,9 +9,10 @@ import json
 from pathlib import Path
 
 from blockswarm.pathing import path_length
-from blockswarm.tasks import make_task
+from blockswarm.tasks import analysis, deployed, individual_scores, ranking
 from blockswarm.world import AIRBORNE_MSG, COOLDOWN_MSG, DIFF_KEYS, LIMIT_MSG, WALKING_MSG
 
+V3_DIFF_KEYS = {"grid", "chest", "inventory", "agents", "votes"}
 LEGACY_DIFF_KEYS = {"grid", "chest", "inventory", "agents"}  # v3 logs written before diff.votes
 
 
@@ -38,29 +42,49 @@ def _counted(rec: dict) -> bool:
 def replay(records: list[dict]) -> dict:
     """Rebuild state from the header + event diffs, asserting it matches every snapshot.
 
-    Checks blocks, chest, inventories, positions, walkers, actions used, votes and scores.
+    v4: checks blocks, wallet (every `buy` costs price x n from the header catalog; nothing else
+    changes it), inventories, positions, walkers, actions used, votes, `individual_scores` and
+    `analysis` (recomputed) in every snapshot and the `episode_end`, plus `ranking` and
+    `deployed` at the end (recomputed from the config's incentive and deploy_top_k).
+    v3: the same physical checks with the chest instead of the wallet; of the old scores only
+    the open task's `score_details` are recomputed (with v3's `door` / `glass` types).
     Finished votes are recomputed from the rules (declare_done adds, cancel_done removes, any
     successful grid change clears all) and checked against every `diff.votes` and snapshot.
-    Logs written before `diff.votes` existed (four diff keys) are replayed with the old rule
+    v3 logs written before `diff.votes` existed (four diff keys) are replayed with the old rule
     (declare_done adds; nothing removes).
 
-    Returns the final state: blocks, chest, inventories, actions_used, done_votes,
-    snapshots_checked, end. Raises AssertionError on any mismatch.
+    Returns the final state: version, blocks, wallet (v4) or chest (v3), inventories,
+    actions_used, positions, done_votes, snapshots_checked, end. Raises AssertionError on any
+    mismatch.
     """
     if not records or records[0].get("type") != "header":
         raise AssertionError("first record must be the header")
     header = records[0]
+    version = header.get("log_version")
+    if version not in (3, 4):
+        raise AssertionError(f"unsupported log_version {version!r} (this reader handles 3 and 4)")
+    v4 = version == 4
     agents = header["agents"]
     cfg = header["config"]
-    task = make_task(cfg["task"], brief=cfg["brief"], blueprint=cfg["blueprint"],
-                     reference_design=cfg["reference_design"], target_interior=cfg["target_interior"],
-                     extra_penalty=cfg["extra_penalty"])
     dims = (cfg["width"], cfg["depth"], cfg["height"])
-    chest_pos = tuple(header["chest_pos"])
+    if v4:
+        shop = header["shop"]
+        solid_pos = tuple(shop["pos"])
+        catalog = {i["id"]: i for i in shop["catalog"]}
+        doors = {i for i, it in catalog.items() if it.get("door")}
+        windows = {i for i, it in catalog.items() if it.get("transparent")}
+        wallet = header["wallet"]
+        if wallet != shop["starting_money"]:
+            raise AssertionError(f"header wallet {wallet} != shop.starting_money {shop['starting_money']}")
+        chest: dict[str, int] = {}
+    else:
+        solid_pos = tuple(header["chest_pos"])
+        catalog, doors, windows = {}, {"door"}, {"glass"}
+        wallet = 0
+        chest = dict(header["chest"])
     positions = {a: list(p) for a, p in header["positions"].items()}
     walking_until = {a: 0.0 for a in agents}
     blocks: dict[tuple, list] = {}
-    chest = dict(header["chest"])
     inventories = {a: dict(header["inventories"].get(a, {})) for a in agents}
     actions_used = {a: 0 for a in agents}
     done_votes: list[str] = []
@@ -69,24 +93,36 @@ def replay(records: list[dict]) -> dict:
     snapshots_checked = 0
     next_seq = 0
     end: dict | None = None
-    legacy: bool | None = None  # decided by the first event's diff keys
+    legacy: bool | None = None  # v3 only: decided by the first event's diff keys
 
-    def scores() -> dict:
-        s = task.score({p: {"type": b[0], "placed_by": b[1], "placed_at": b[2]} for p, b in blocks.items()},
-                       agents, dims, [chest_pos])
-        return {k: s[k] for k in ("team_score", "individual_scores", "score_details")}
+    def house() -> dict:
+        return analysis({p: b[0] for p, b in blocks.items()}, dims, [solid_pos], doors=doors,
+                        windows=windows, target_interior=cfg.get("target_interior"))
+
+    def check_scores(rec: dict, where: str) -> None:
+        if v4:
+            want = {"individual_scores": individual_scores({p: {"placed_by": b[1]} for p, b in blocks.items()},
+                                                           agents),
+                    "analysis": house()}
+            if rec.get("wallet") != wallet:
+                raise AssertionError(f"{where}: wallet mismatch {rec.get('wallet')} vs {wallet}")
+        elif cfg.get("task") == "open" and isinstance(rec.get("score_details"), dict):
+            want = {"score_details": house()}
+        else:
+            return  # v3 blueprint task: its grader is gone; nothing to recompute
+        for key, val in json.loads(json.dumps(want)).items():
+            if rec.get(key) != val:
+                raise AssertionError(f"{where}: {key} mismatch {rec.get(key)} vs {val}")
 
     def check_state(rec: dict, where: str) -> None:
-        for key, val in json.loads(json.dumps(scores())).items():
-            if rec[key] != val:
-                raise AssertionError(f"{where}: {key} mismatch {rec[key]} vs {val}")
+        check_scores(rec, where)
         if rec.get("actions_used", actions_used) != actions_used:
             raise AssertionError(f"{where}: actions_used mismatch {rec['actions_used']} vs {actions_used}")
         if "blocks" not in rec:
             return
         if [[x, y, z, *b] for (x, y, z), b in sorted(blocks.items())] != rec["blocks"]:
             raise AssertionError(f"{where}: blocks mismatch")
-        if _nonzero(chest) != _nonzero(rec["chest"]):
+        if not v4 and _nonzero(chest) != _nonzero(rec["chest"]):
             raise AssertionError(f"{where}: chest mismatch {chest} vs {rec['chest']}")
         for a in agents:
             if _nonzero(inventories[a]) != _nonzero(rec["inventories"].get(a, {})):
@@ -113,9 +149,13 @@ def replay(records: list[dict]) -> dict:
                 raise AssertionError(f"event_id {eid} does not follow {last_event_id}")
             last_event_id = eid
             diff = rec["diff"]
-            if legacy is None:
-                legacy = set(diff) == LEGACY_DIFF_KEYS
-            if set(diff) != (LEGACY_DIFF_KEYS if legacy else set(DIFF_KEYS)):
+            if v4:
+                want_keys = set(DIFF_KEYS)
+            else:
+                if legacy is None:
+                    legacy = set(diff) == LEGACY_DIFF_KEYS
+                want_keys = LEGACY_DIFF_KEYS if legacy else V3_DIFF_KEYS
+            if set(diff) != want_keys:
                 raise AssertionError(f"event {eid}: bad diff keys {sorted(diff)}")
             if not rec["ok"] and any(diff[k] for k in diff):
                 raise AssertionError(f"event {eid}: failed event has a non-empty diff")
@@ -131,8 +171,28 @@ def replay(records: list[dict]) -> dict:
                 else:
                     if a["placed_at"] != rec["t"] or a["placed_by"] != rec["agent"]:
                         raise AssertionError(f"event {eid}: placed block metadata mismatch")
+                    if v4 and a["type"] not in catalog:
+                        raise AssertionError(f"event {eid}: block type {a['type']!r} is not a catalog item")
                     blocks[pos] = [a["type"], a["placed_by"], a["placed_at"]]
-            _add(chest, diff["chest"], f"event {eid} chest")
+            if v4:
+                dw = diff["wallet"]
+                if not isinstance(dw, int) or isinstance(dw, bool):
+                    raise AssertionError(f"event {eid}: diff.wallet must be an int, got {dw!r}")
+                if rec["ok"] and rec["tool"] == "buy":
+                    item, n = rec["args"].get("item"), rec["args"].get("n")
+                    if item not in catalog:
+                        raise AssertionError(f"event {eid}: bought unknown item {item!r}")
+                    if dw != -catalog[item]["price"] * n:
+                        raise AssertionError(f"event {eid}: wallet delta {dw} != -{catalog[item]['price']} x {n}")
+                    if diff["inventory"] != {rec["agent"]: {item: n}}:
+                        raise AssertionError(f"event {eid}: buy inventory delta {diff['inventory']}")
+                elif dw != 0:
+                    raise AssertionError(f"event {eid}: only a successful buy changes the wallet")
+                wallet += dw
+                if wallet < 0:
+                    raise AssertionError(f"event {eid}: wallet went negative ({wallet})")
+            else:
+                _add(chest, diff["chest"], f"event {eid} chest")
             for agent, delta in diff["inventory"].items():
                 _add(inventories[agent], delta, f"event {eid} inventory {agent}")
             for agent, mv in diff["agents"].items():
@@ -177,12 +237,20 @@ def replay(records: list[dict]) -> dict:
             snapshots_checked += 1
         elif kind == "episode_end":
             check_state(rec, "episode_end")
+            if v4:
+                scores = rec["individual_scores"]
+                rank = ranking(scores, agents)
+                if rec.get("ranking") != rank:
+                    raise AssertionError(f"episode_end: ranking mismatch {rec.get('ranking')} vs {rank}")
+                dep = deployed(rank, cfg["deploy_top_k"], cfg["incentive"])
+                if rec.get("deployed") != dep:
+                    raise AssertionError(f"episode_end: deployed mismatch {rec.get('deployed')} vs {dep}")
             end = rec
         # unknown record types are ignored
 
-    return {
+    out = {
+        "version": version,
         "blocks": [[x, y, z, *b] for (x, y, z), b in sorted(blocks.items())],
-        "chest": chest,
         "inventories": inventories,
         "actions_used": actions_used,
         "positions": positions,
@@ -190,3 +258,8 @@ def replay(records: list[dict]) -> dict:
         "snapshots_checked": snapshots_checked,
         "end": end,
     }
+    if v4:
+        out["wallet"] = wallet
+    else:
+        out["chest"] = chest
+    return out

@@ -1,9 +1,11 @@
-"""World engine: grid, physical chest, embodied agents, rules, live timing, scoring and logging.
+"""World engine: grid, shop and shared wallet, embodied agents, rules, live timing and logging.
 
 Agents act live and concurrently: any agent may call `act` at any time. Calls are applied
 one at a time under a lock, and that commit order is the `event_id` order. Every tool call
 is written to the episode log as one `event` record (see docs/log-format.md).
-Scoring and chest sizing come from the task (blockswarm/tasks.py).
+There is no team score: the house analysis and the competitive incentive (ranking by blocks
+placed that are still in the world) come from blockswarm/tasks.py; the shop's items and
+prices from blockswarm/catalog.py (design: docs/shop-and-incentives.md).
 The engine is deterministic given the clock readings and has no network or LLM code.
 """
 
@@ -16,20 +18,21 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Optional, Protocol
 
-from blockswarm.blueprints import BLUEPRINTS, Pos
+from blockswarm.blueprints import Pos
+from blockswarm.catalog import CATALOG, ITEM_IDS, catalog_json
 from blockswarm.clock import WallClock
 from blockswarm.pathing import Terrain
 from blockswarm.recorder import LOG_VERSION, Recorder
-from blockswarm.tasks import make_task
+from blockswarm.tasks import INCENTIVES, TASK_KINDS, analysis, deployed, individual_scores, ranking, task_header
 
-BLOCK_TYPES = ("wood", "stone", "brick", "glass", "plank", "roof", "door")
-SCARCITY = ("abundant", "exact", "short")
-PAYOFFS = ("team", "individual", "mixed")
-TASK_KINDS = ("open", "blueprint")
+BLOCK_TYPES = ITEM_IDS  # every catalog item is a full-cube block type
+TRANSPARENT = frozenset(i for i in ITEM_IDS if CATALOG[i].transparent)  # don't block sight
+DOORS = frozenset(i for i in ITEM_IDS if CATALOG[i].door)               # bodies may stand in them
 NEIGHBOURS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
-# Default start offsets around the chest: diagonals first, then the sides (then wider rings).
+# Default start offsets around the shop: diagonals first, then the sides (then wider rings).
 START_RING = ((-1, 1), (1, 1), (-1, -1), (1, -1), (0, 1), (0, -1), (-1, 0), (1, 0))
 FALL_S_PER_CELL = 0.1
+STARTING_MONEY_PER_AGENT = 100
 
 # Messages of rejected action calls that consume nothing (not counted in actions_used).
 # replay.py relies on these prefixes to recount actions_used from the log.
@@ -38,13 +41,12 @@ COOLDOWN_MSG = "cooldown"
 WALKING_MSG = "walking"
 AIRBORNE_MSG = "airborne"
 
-# tool -> (cost, ordered arg spec). Arg kinds: int, block, agent, text.
+# tool -> (cost, ordered arg spec). Arg kinds: int, block (a catalog item id), agent, text.
 TOOLS: dict[str, tuple[str, tuple[tuple[str, str], ...]]] = {
     "observe": ("free", ()),
     "move_to": ("action", (("x", "int"), ("y", "int"), ("z", "int"))),
     "jump": ("action", ()),
-    "take": ("action", (("type", "block"), ("n", "int"))),
-    "deposit": ("action", (("type", "block"), ("n", "int"))),
+    "buy": ("action", (("item", "block"), ("n", "int"))),
     "give": ("action", (("to", "agent"), ("type", "block"), ("n", "int"))),
     "place": ("action", (("x", "int"), ("y", "int"), ("z", "int"), ("type", "block"))),
     "remove": ("action", (("x", "int"), ("y", "int"), ("z", "int"))),
@@ -58,7 +60,7 @@ TOOLS: dict[str, tuple[str, tuple[tuple[str, str], ...]]] = {
 END_REASONS = ("all_done", "time_limit", "action_limit", "aborted", "budget", "error")
 # Record types the engine writes itself; World.record() refuses them.
 ENGINE_RECORD_TYPES = ("header", "event", "snapshot", "episode_end")
-DIFF_KEYS = ("grid", "chest", "inventory", "agents", "votes")
+DIFF_KEYS = ("grid", "wallet", "inventory", "agents", "votes")
 
 
 class Clock(Protocol):
@@ -69,23 +71,19 @@ class Clock(Protocol):
 
 @dataclass
 class Config:
-    width: int = 16
-    depth: int = 16
-    height: int = 8
+    width: int = 24
+    depth: int = 24
+    height: int = 10
     agents: list[str] = field(default_factory=lambda: ["agent_1", "agent_2", "agent_3"])
-    blueprint: str = "house"
-    scarcity: str = "exact"
     inventory_cap: int = 12
     max_seconds: float = 600
     max_actions_per_agent: int = 300
     action_cooldown_s: float = 0.0
     snapshot_interval_s: float = 10
-    payoff: str = "team"
-    mixed_alpha: float = 0.5
-    extra_penalty: float = 0.1
     seed: int = 0
     max_message_chars: int = 1000
-    chest_pos: tuple[int, int, int] = (13, 2, 0)
+    shop_pos: tuple[int, int, int] = (12, 4, 0)
+    starting_money: Optional[int] = None         # None -> 100 x number of agents (shared wallet)
     start_positions: Optional[list[list[int]]] = None
     walk_speed: float = 4.317
     reach: float = 4.5
@@ -94,44 +92,44 @@ class Config:
     jump_airtime: float = 0.6
     task: str = "open"
     brief: Optional[str] = None
-    reference_design: str = "house"
-    target_interior: Optional[int] = None        # None -> 4 x number of agents
+    target_interior: Optional[int] = None        # None -> 4 x number of agents (analysis only)
+    incentive: str = "competitive"               # "competitive" | "none"
+    deploy_top_k: Optional[int] = None           # None -> max(1, number of agents // 2)
+    show_leaderboard: bool = False               # observations include everyone's current score
     reach_line_of_sight: bool = True
     view_occlusion: bool = True
     models: Optional[dict[str, str]] = None      # agent id -> model name (logged as-is)
     run_meta: Optional[dict] = None              # free-form JSON metadata (run id, prompt version, ...)
-    chest_scale: Optional[float] = None          # None -> agents / 3 (open task), 1.0 (blueprint)
 
     MAX_AGENTS = 16
 
     def __post_init__(self) -> None:
         self.agents = list(self.agents)
-        self.chest_pos = tuple(self.chest_pos)  # type: ignore[assignment]
+        self.shop_pos = tuple(self.shop_pos)  # type: ignore[assignment]
         if self.start_positions is not None:
             self.start_positions = [list(p) for p in self.start_positions]
         if self.task not in TASK_KINDS:
             raise ValueError(f"task must be one of {TASK_KINDS}, got {self.task!r}")
-        if self.blueprint not in BLUEPRINTS:
-            raise ValueError(f"unknown blueprint {self.blueprint!r}; known: {sorted(BLUEPRINTS)}")
-        if self.reference_design not in BLUEPRINTS:
-            raise ValueError(f"unknown reference_design {self.reference_design!r}")
-        if self.scarcity not in SCARCITY:
-            raise ValueError(f"scarcity must be one of {SCARCITY}, got {self.scarcity!r}")
-        if self.payoff not in PAYOFFS:
-            raise ValueError(f"payoff must be one of {PAYOFFS}, got {self.payoff!r}")
+        if self.incentive not in INCENTIVES:
+            raise ValueError(f"incentive must be one of {INCENTIVES}, got {self.incentive!r}")
         if not 1 <= len(self.agents) <= self.MAX_AGENTS:
             raise ValueError(f"need 1 to {self.MAX_AGENTS} agents, got {len(self.agents)}")
         n = len(self.agents)
         # Defaults that scale with the team size; the resolved values are logged in the header.
         if self.target_interior is None:
             self.target_interior = 4 * n
-        if self.chest_scale is None:
-            # A blueprint is the same structure for any team size, so its chest isn't scaled.
-            self.chest_scale = 1.0 if self.task == "blueprint" else n / 3
-        if isinstance(self.chest_scale, bool) or not isinstance(self.chest_scale, (int, float)) \
-                or not self.chest_scale > 0:
-            raise ValueError(f"chest_scale must be a number > 0, got {self.chest_scale!r}")
-        self.chest_scale = float(self.chest_scale)
+        if self.starting_money is None:
+            self.starting_money = STARTING_MONEY_PER_AGENT * n
+        if self.deploy_top_k is None:
+            self.deploy_top_k = max(1, n // 2)
+        if isinstance(self.starting_money, bool) or not isinstance(self.starting_money, int) \
+                or self.starting_money < 0:
+            raise ValueError(f"starting_money must be an integer >= 0, got {self.starting_money!r}")
+        if isinstance(self.deploy_top_k, bool) or not isinstance(self.deploy_top_k, int) \
+                or not 1 <= self.deploy_top_k <= n:
+            raise ValueError(f"deploy_top_k must be an integer in 1..{n}, got {self.deploy_top_k!r}")
+        if not isinstance(self.show_leaderboard, bool):
+            raise ValueError(f"show_leaderboard must be true or false, got {self.show_leaderboard!r}")
         if len(set(self.agents)) != len(self.agents):
             raise ValueError(f"agent ids must be unique: {self.agents}")
         if min(self.width, self.depth, self.height) < 2:
@@ -144,18 +142,8 @@ class Config:
             raise ValueError("walk_speed, reach and view_radius must be > 0, eye_height >= 0")
         if self.jump_airtime <= 0:
             raise ValueError("jump_airtime must be > 0")
-        if not 0.0 <= self.mixed_alpha <= 1.0:
-            raise ValueError("mixed_alpha must be in [0, 1]")
-        if len(self.chest_pos) != 3 or not self.in_bounds(self.chest_pos):
-            raise ValueError(f"chest_pos {self.chest_pos} is outside the grid")
-        if self.task == "blueprint":
-            for (x, y, z), t in BLUEPRINTS[self.blueprint].cells.items():
-                if not self.in_bounds((x, y, z)):
-                    raise ValueError(f"blueprint {self.blueprint!r} cell {(x, y, z)} is outside the grid")
-                if t not in BLOCK_TYPES:
-                    raise ValueError(f"blueprint {self.blueprint!r} uses unknown block type {t!r}")
-            if self.chest_pos in BLUEPRINTS[self.blueprint].cells:
-                raise ValueError(f"chest_pos {self.chest_pos} overlaps the blueprint")
+        if len(self.shop_pos) != 3 or not self.in_bounds(self.shop_pos):
+            raise ValueError(f"shop_pos {self.shop_pos} is outside the grid")
         if self.start_positions is not None:
             if len(self.start_positions) != len(self.agents):
                 raise ValueError("start_positions needs one position per agent")
@@ -165,7 +153,7 @@ class Config:
                 feet, head = (x, y, z), (x, y, z + 1)
                 if not (self.in_bounds(feet) and self.in_bounds(head)):
                     raise ValueError(f"start position {p} is outside the grid")
-                if self.chest_pos in (feet, head) or not (z == 0 or (x, y, z - 1) == self.chest_pos):
+                if self.shop_pos in (feet, head) or not (z == 0 or (x, y, z - 1) == self.shop_pos):
                     raise ValueError(f"start position {p} is not standable")
                 if feet in bodies or head in bodies:
                     raise ValueError(f"start positions overlap at {p}")
@@ -251,11 +239,6 @@ def ray_cells(start: tuple[float, float, float], target: Pos) -> list[Pos]:
     return out
 
 
-def scale_count(n: int, scale: float) -> int:
-    """Chest count for one block type scaled by `chest_scale`: rounded up, zero stays zero."""
-    return math.ceil(round(n * scale, 9)) if n > 0 else 0
-
-
 class World:
     """One live, embodied episode. Any agent may call `act` at any time; each call is atomic."""
 
@@ -264,17 +247,12 @@ class World:
         self.config = config
         self.recorder = recorder if recorder is not None else Recorder()
         self.clock: Clock = clock if clock is not None else WallClock()
-        name = config.blueprint if config.task == "blueprint" else config.reference_design
-        self.episode_id = episode_id or f"{config.task}-{name}-{config.scarcity}-seed{config.seed}"
-        self.task = make_task(config.task, brief=config.brief, blueprint=config.blueprint,
-                              reference_design=config.reference_design,
-                              target_interior=config.target_interior, extra_penalty=config.extra_penalty)
+        self.episode_id = episode_id or f"{config.task}-{config.incentive}-seed{config.seed}"
+        self.task: dict = task_header(config.brief)
         self.agents: list[str] = list(config.agents)
-        self.chest_pos: Pos = tuple(config.chest_pos)  # type: ignore[assignment]
+        self.shop_pos: Pos = tuple(config.shop_pos)  # type: ignore[assignment]
         self.blocks: dict[Pos, Block] = {}
-        base = self.task.chest_counts(config.scarcity)
-        self.chest: dict[str, int] = {t: scale_count(int(base.get(t, 0)), config.chest_scale)  # type: ignore[arg-type]
-                                      for t in BLOCK_TYPES}
+        self.wallet: int = int(config.starting_money)  # type: ignore[arg-type]
         self.inventories: dict[str, dict[str, int]] = {a: {} for a in self.agents}
         self.notes: dict[str, list[str]] = {a: [] for a in self.agents}
         self.messages: list[dict] = []
@@ -284,7 +262,6 @@ class World:
         self.walking_until: dict[str, float] = {a: 0.0 for a in self.agents}
         self.airborne_until: dict[str, float] = {a: 0.0 for a in self.agents}
         self._lifted: set[str] = set()  # airborne agents already lifted by a block this jump
-        self._chest_seen: dict[str, dict | None] = {a: None for a in self.agents}
         self._last_action_t: dict[str, float | None] = {a: None for a in self.agents}
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)  # notified on every committed event and at the end
@@ -292,7 +269,7 @@ class World:
         self._next_event_id = 0
         self._snapshot_seq = 0
         self._next_snapshot_t = 0.0
-        self._scores_cache: dict | None = None
+        self._analysis_cache: dict | None = None
         self._done = False
         self._end_reason: str | None = None
         self.recorder.write({
@@ -300,14 +277,15 @@ class World:
             "log_version": LOG_VERSION,
             "episode_id": self.episode_id,
             "config": json.loads(json.dumps(asdict(config))),
-            "task": self.task.header(),
+            "task": dict(self.task),
             "clock": getattr(self.clock, "kind", "wall"),
             "grid": {"width": config.width, "depth": config.depth, "height": config.height},
             "agents": list(self.agents),
-            "chest_pos": list(self.chest_pos),
+            "shop": {"pos": list(self.shop_pos), "catalog": catalog_json(),
+                     "starting_money": config.starting_money},
+            "wallet": self.wallet,
             "positions": {a: list(p) for a, p in self.positions.items()},
             "block_types": list(BLOCK_TYPES),
-            "chest": dict(self.chest),
             "inventories": {a: {} for a in self.agents},
         })
 
@@ -315,28 +293,19 @@ class World:
         c = self.config
         if c.start_positions is not None:
             return [tuple(p) for p in c.start_positions]  # type: ignore[misc]
-        cx, cy, cz = self.chest_pos
-        z = 0
+        cx, cy, cz = self.shop_pos
         out: list[Pos] = []
         offsets = list(START_RING)
         for r in range(2, max(c.width, c.depth)):
-            ring = [(dx, dy) for dy in range(r, -r - 1, -1) for dx in range(-r, r + 1)
-                    if max(abs(dx), abs(dy)) == r]
-            offsets += ring
-        footprint = {(x, y) for x, y, _ in self.task_cells()}
+            offsets += [(dx, dy) for dy in range(r, -r - 1, -1) for dx in range(-r, r + 1)
+                        if max(abs(dx), abs(dy)) == r]
         for dx, dy in offsets:
-            p = (cx + dx, cy + dy, z)
-            if (c.in_bounds(p) and c.in_bounds((p[0], p[1], 1)) and (p[0], p[1]) not in footprint
-                    and (p[0], p[1]) != (cx, cy)):
+            p = (cx + dx, cy + dy, 0)
+            if c.in_bounds(p) and c.in_bounds((p[0], p[1], 1)) and (p[0], p[1]) != (cx, cy):
                 out.append(p)
             if len(out) == len(self.agents):
                 return out
         raise ValueError("could not find default start positions; set start_positions")
-
-    def task_cells(self) -> list[tuple[int, int, int]]:
-        """Blueprint cells in blueprint mode (empty in open mode)."""
-        bp = self.task.header().get("blueprint")
-        return [(x, y, z) for x, y, z, _ in bp["cells"]] if bp else []
 
     # ------------------------------------------------------------------ time and ending
 
@@ -382,8 +351,13 @@ class World:
             self._end_reason = reason
             t = self.now()
             self._write_snapshot(t)
-            self.recorder.write({"type": "episode_end", "t": t, "reason": reason, **self.scores(),
-                                 "actions_used": dict(self.actions_used)})
+            scores = self.individual_scores()
+            rank = ranking(scores, self.agents)
+            self.recorder.write({"type": "episode_end", "t": t, "reason": reason, "wallet": self.wallet,
+                                 "individual_scores": scores, "ranking": rank,
+                                 "deployed": deployed(rank, self.config.deploy_top_k,  # type: ignore[arg-type]
+                                                      self.config.incentive),
+                                 "analysis": self.analysis(), "actions_used": dict(self.actions_used)})
             self._changed.notify_all()
 
     # ------------------------------------------------------------------ orchestrator hooks
@@ -439,13 +413,13 @@ class World:
     # ------------------------------------------------------------------ state
 
     def state(self) -> dict:
-        """Blocks, chest, inventories, actions, votes, positions and walkers in log format."""
+        """Blocks, wallet, inventories, actions, votes, positions and walkers in log format."""
         with self._lock:
             t = self._t
             return {
                 "blocks": [[x, y, z, b.type, b.placed_by, b.placed_at]
                            for (x, y, z), b in sorted(self.blocks.items())],
-                "chest": dict(self.chest),
+                "wallet": self.wallet,
                 "inventories": {a: dict(sorted(self.inventories[a].items())) for a in self.agents},
                 "actions_used": dict(self.actions_used),
                 "done_votes": list(self.done_votes),
@@ -460,7 +434,8 @@ class World:
 
     def _snapshot_record(self, t: float) -> dict:
         return {"type": "snapshot", "seq": self._snapshot_seq, "t": t,
-                "after_event_id": self._next_event_id - 1, **self.scores(), **self.state()}
+                "after_event_id": self._next_event_id - 1, "individual_scores": self.individual_scores(),
+                "analysis": self.analysis(), **self.state()}
 
     def _write_snapshot(self, t: float) -> None:
         self.recorder.write(self._snapshot_record(t))
@@ -468,17 +443,26 @@ class World:
         interval = self.config.snapshot_interval_s
         self._next_snapshot_t = (math.floor(t / interval) + 1) * interval
 
-    def scores(self) -> dict:
-        """team_score, individual_scores and score_details from the task (cached per grid)."""
+    def individual_scores(self) -> dict[str, int]:
+        """Each agent's score: blocks it placed that are still in the world (zeros included)."""
         with self._lock:
-            if self._scores_cache is None:
+            return individual_scores(self.blocks, self.agents)
+
+    def ranking(self) -> tuple[list[dict], list[str]]:
+        """(ranking, deployed) if the episode ended now; see tasks.ranking / tasks.deployed."""
+        with self._lock:
+            rank = ranking(self.individual_scores(), self.agents)
+            return rank, deployed(rank, self.config.deploy_top_k, self.config.incentive)  # type: ignore[arg-type]
+
+    def analysis(self) -> dict:
+        """House metrics (tasks.analysis) for the current grid, cached per grid. Analysis only:
+        never shown to agents."""
+        with self._lock:
+            if self._analysis_cache is None:
                 c = self.config
-                s = self.task.score({p: b.to_json() for p, b in self.blocks.items()}, self.agents,
-                                    (c.width, c.depth, c.height), [self.chest_pos])
-                self._scores_cache = {"team_score": s["team_score"],
-                                      "individual_scores": s["individual_scores"],
-                                      "score_details": s["score_details"]}
-            return json.loads(json.dumps(self._scores_cache))
+                self._analysis_cache = analysis(self.blocks, (c.width, c.depth, c.height), [self.shop_pos],
+                                                target_interior=c.target_interior)
+            return json.loads(json.dumps(self._analysis_cache))
 
     def held(self, agent: str) -> int:
         return sum(self.inventories[agent].values())
@@ -486,7 +470,20 @@ class World:
     # ------------------------------------------------------------------ geometry
 
     def solid(self, c: Pos) -> bool:
-        return c in self.blocks or c == self.chest_pos
+        """A block (any item, doors included) or the shop: closed for air, support and placing."""
+        return c in self.blocks or c == self.shop_pos
+
+    def passable(self, c: Pos) -> bool:
+        """A door block: solid, but a body may be in it (agents open doors)."""
+        b = self.blocks.get(c)
+        return b is not None and b.type in DOORS
+
+    def opaque(self, c: Pos) -> bool:
+        """Blocks line of sight and view: solid and not a transparent item (glass, panes)."""
+        if c == self.shop_pos:
+            return True
+        b = self.blocks.get(c)
+        return b is not None and b.type not in TRANSPARENT
 
     def body_cells(self, exclude: str | None = None) -> dict[Pos, str]:
         """Cells occupied by agents' bodies (an airborne agent's feet cell is free)."""
@@ -505,13 +502,15 @@ class World:
         return self.is_airborne(agent) and agent not in self._lifted
 
     def terrain(self, agent: str | None = None, extra_solid: Iterable[Pos] = ()) -> Terrain:
-        """Standing/walking rules with `agent`'s own body ignored."""
+        """Standing/walking rules with `agent`'s own body ignored (`extra_solid`: hypothetical
+        non-door blocks)."""
         bodies = self.body_cells(exclude=agent)
         extra = set(extra_solid)
         c = self.config
         return Terrain(c.width, c.depth, c.height,
-                       solid=lambda p: p in self.blocks or p == self.chest_pos or p in extra,
-                       occupied=lambda p: p in bodies)
+                       solid=lambda p: p in self.blocks or p == self.shop_pos or p in extra,
+                       occupied=lambda p: p in bodies,
+                       passable=lambda p: p not in extra and self.passable(p))
 
     def standable(self, pos: Pos, agent: str | None = None) -> bool:
         with self._lock:
@@ -525,9 +524,10 @@ class World:
         return math.dist(e, (target[0] + 0.5, target[1] + 0.5, target[2] + 0.5))
 
     def line_of_sight(self, from_pos: Pos, target: Pos, extra_solid: Iterable[Pos] = ()) -> bool:
-        """Clear ray from the eye at `from_pos` to the centre of `target` (target itself may be solid)."""
+        """Clear ray from the eye at `from_pos` to the centre of `target` (target itself may be
+        solid). Transparent blocks (glass) don't block it; `extra_solid` cells do."""
         extra = set(extra_solid)
-        return not any(self.solid(c) or c in extra for c in ray_cells(self.eye(from_pos), target))
+        return not any(self.opaque(c) or c in extra for c in ray_cells(self.eye(from_pos), target))
 
     def can_reach(self, from_pos: Pos, target: Pos, extra_solid: Iterable[Pos] = ()) -> bool:
         """Within reach of the eye at `from_pos` (and in line of sight, if that rule is on)."""
@@ -569,20 +569,21 @@ class World:
             return ter.path(self.positions[agent], tuple(dest))  # type: ignore[arg-type]
 
     def cut_off_if_solid(self, cells: Iterable[Pos]) -> list[str]:
-        """Agents that could no longer walk to a spot within reach of the chest if `cells`
-        became solid (other agents' bodies are ignored, since they move). Internal helper for
-        the scripted bot and tests, not an agent tool."""
+        """Agents that could no longer walk to a spot within reach of the shop if `cells`
+        became solid, non-door blocks (other agents' bodies are ignored, since they move).
+        Internal helper for the scripted bot and tests, not an agent tool."""
         with self._lock:
             extra = set(cells)
             c = self.config
             ter = Terrain(c.width, c.depth, c.height,
-                          solid=lambda p: p in self.blocks or p == self.chest_pos or p in extra,
-                          occupied=lambda p: False)
+                          solid=lambda p: p in self.blocks or p == self.shop_pos or p in extra,
+                          occupied=lambda p: False,
+                          passable=lambda p: p not in extra and self.passable(p))
             r = int(math.ceil(c.reach)) + 1
-            cx, cy, cz = self.chest_pos
+            cx, cy, cz = self.shop_pos
             goals = {(x, y, z) for x in range(cx - r, cx + r + 1) for y in range(cy - r, cy + r + 1)
                      for z in range(max(0, cz - r - 1), cz + r + 1)
-                     if ter.standable((x, y, z)) and self.can_reach((x, y, z), self.chest_pos, extra)}
+                     if ter.standable((x, y, z)) and self.can_reach((x, y, z), self.shop_pos, extra)}
             out = []
             for a in self.agents:
                 x, y, z = self.positions[a]
@@ -597,8 +598,11 @@ class World:
     def is_walking(self, agent: str, t: float | None = None) -> bool:
         return self.walking_until[agent] > (self._t if t is None else t)
 
-    def _sees_chest(self, agent: str) -> bool:
-        return not self.is_walking(agent) and self.can_reach(self.positions[agent], self.chest_pos)
+    def shop_in_reach(self, agent: str) -> bool:
+        """Whether a `buy` would pass the reach check now (not walking; shop within reach and,
+        with reach_line_of_sight, in sight)."""
+        with self._lock:
+            return not self.is_walking(agent) and self.can_reach(self.positions[agent], self.shop_pos)
 
     def visible(self, from_pos: Pos, target: Pos) -> bool:
         """Whether `target` shows up in a view from `from_pos` (radius and occlusion rules)."""
@@ -611,8 +615,10 @@ class World:
     def view(self, agent: str, since_event_id: int | None = None) -> dict:
         """Everything `agent` may see, JSON-serializable, for building prompts.
 
-        Blocks and agents within view_radius of the eyes (and in sight, with view_occlusion);
-        chest counts only while within reach of the chest, else the counts last seen.
+        Blocks and agents within view_radius of the eyes (and in sight, with view_occlusion;
+        transparent blocks don't hide what is behind them). The shared wallet balance is
+        always shown; the catalog is static and comes from the header. `scores` (everyone's
+        current score) only with show_leaderboard. No house analysis is shown.
         Messages are public ones, private ones to/from `agent`, and system notices about
         finished votes (channel "system", from/to null); with `since_event_id`, only those with
         a larger event_id. `last_event_id` can be passed back next time.
@@ -625,11 +631,6 @@ class World:
             last = self._last_action_t[agent]
             cooldown_until = 0.0 if last is None else last + self.config.action_cooldown_s
             used = self.actions_used[agent]
-            if self._sees_chest(agent):
-                self._chest_seen[agent] = {"counts": dict(self.chest), "t": t}
-                chest = dict(self.chest)
-            else:
-                chest = None
             blocks = [{"pos": [x, y, z], "offset": [x - pos[0], y - pos[1], z - pos[2]],
                        "type": b.type, "placed_by": b.placed_by, "placed_at": b.placed_at}
                       for (x, y, z), b in sorted(self.blocks.items()) if self.visible(pos, (x, y, z))]
@@ -641,14 +642,13 @@ class World:
                                    "airborne": self.is_airborne(a, t)})
             walking = self.walking_until[agent]
             airborne = self.airborne_until[agent]
-            return {
+            out = {
                 "t": t,
                 "max_seconds": self.config.max_seconds,
                 "done": self._done,
                 "you": agent,
                 "agents": list(self.agents),
-                "payoff": self.config.payoff,
-                "task": self.task.header(),
+                "task": dict(self.task),
                 "position": list(pos),
                 "eye": list(self.eye(pos)),
                 "walking_until": walking if walking > t else None,
@@ -660,9 +660,9 @@ class World:
                 "actions_used": used,
                 "actions_remaining": max(0, self.config.max_actions_per_agent - used),
                 "next_action_at": max(t, cooldown_until, walking),
-                "chest_pos": list(self.chest_pos),
-                "chest": chest,
-                "chest_last_seen": json.loads(json.dumps(self._chest_seen[agent])),
+                "shop_pos": list(self.shop_pos),
+                "shop_in_reach": self.shop_in_reach(agent),
+                "wallet": self.wallet,
                 "grid": {"width": self.config.width, "depth": self.config.depth,
                          "height": self.config.height},
                 "blocks": blocks,
@@ -673,8 +673,10 @@ class World:
                 "last_event_id": self._next_event_id - 1,
                 "notes": list(self.notes[agent]),
                 "done_votes": list(self.done_votes),
-                "scores": self.scores(),
             }
+            if self.config.show_leaderboard:
+                out["scores"] = self.individual_scores()
+            return out
 
     # ------------------------------------------------------------------ actions
 
@@ -693,14 +695,12 @@ class World:
             if t >= self._next_snapshot_t:
                 self._write_snapshot(t)
             result = self._apply(agent, tool, args, t)
-            if self._sees_chest(agent):
-                self._chest_seen[agent] = {"counts": dict(self.chest), "t": t}
             self.check_end()
             return result
 
     def _apply(self, agent: str, tool: str, args: dict, t: float) -> ToolResult:
         cost, spec = TOOLS.get(tool, ("action", ()))
-        diff: dict = {"grid": [], "chest": {}, "inventory": {}, "agents": {}, "votes": {}}
+        diff: dict = {"grid": [], "wallet": 0, "inventory": {}, "agents": {}, "votes": {}}
         chat: dict | None = None
         data: dict | None = None
         ok = False
@@ -718,7 +718,7 @@ class World:
             if cost == "action":
                 self.actions_used[agent] += 1
                 self._last_action_t[agent] = t
-            work: dict = {"grid": [], "chest": {}, "inventory": {}, "agents": {}, "votes": {}}
+            work: dict = {"grid": [], "wallet": 0, "inventory": {}, "agents": {}, "votes": {}}
             votes_before = sorted(self.done_votes)
             try:
                 if tool not in TOOLS:
@@ -728,7 +728,7 @@ class World:
                 message, chat, data = handler(agent, work, t, **clean)
                 ok, diff = True, work
                 if work["grid"]:
-                    self._scores_cache = None
+                    self._analysis_cache = None
                     if self.done_votes:
                         # any change to the build clears every finished vote
                         self.done_votes.clear()
@@ -771,8 +771,9 @@ class World:
                 if not isinstance(v, int) or isinstance(v, bool):
                     raise _Fail(f"{name} must be an integer, got {v!r}")
             elif kind == "block":
-                if v not in BLOCK_TYPES:
-                    raise _Fail(f"unknown block type {v!r}; types: {', '.join(BLOCK_TYPES)}")
+                if not isinstance(v, str) or v not in CATALOG:
+                    raise _Fail(f"unknown item {v!r}: {name} must be an item id from the shop catalog "
+                                "(e.g. stone, oak_planks, glass, oak_door)")
             elif kind == "agent":
                 if v not in self.inventories:
                     raise _Fail(f"unknown agent {v!r}")
@@ -799,9 +800,6 @@ class World:
         d = work["inventory"].setdefault(agent, {})
         d[btype] = d.get(btype, 0) + n
 
-    def _chest_add(self, work: dict, btype: str, n: int) -> None:
-        self.chest[btype] = self.chest.get(btype, 0) + n
-        work["chest"][btype] = work["chest"].get(btype, 0) + n
 
     def _move(self, work: dict, agent: str, path: list[Pos], depart: float, arrive: float,
               kind: str = "walk") -> None:
@@ -846,7 +844,7 @@ class World:
         if d > self.config.reach:
             raise _Fail(f"out of reach: {what} at {target} is {d:.2f} from your eyes (reach {self.config.reach})")
         if self.config.reach_line_of_sight and not self.line_of_sight(pos, target):
-            blocker = next(c for c in ray_cells(self.eye(pos), target) if self.solid(c))
+            blocker = next(c for c in ray_cells(self.eye(pos), target) if self.opaque(c))
             raise _Fail(f"no line of sight to {what} at {target}: blocked at {blocker}")
 
     def supported(self, pos: Pos) -> bool:
@@ -860,8 +858,8 @@ class World:
         dest = self._check_pos(x, y, z)
         ter = self.terrain(agent)
         if not ter.standable(dest):
-            raise _Fail(f"{dest} is not standable (needs an empty 2-high space on the ground, "
-                        "a block or the chest, not occupied by an agent)")
+            raise _Fail(f"{dest} is not standable (needs a 2-high space that is empty or a door, on the "
+                        "ground, a block or the shop, not occupied by an agent)")
         found = ter.path(self.positions[agent], dest)
         if found is None:
             raise _Fail(f"no path from {self.positions[agent]} to {dest}")
@@ -876,21 +874,18 @@ class World:
         self._move(work, agent, [pos], t, land, kind="jump")
         return f"jumped: airborne until t={land:.3f}", None, None
 
-    def _tool_take(self, agent: str, work: dict, t: float, type: str, n: int):
-        self._need_reach(agent, self.chest_pos, "the chest")
-        if self.chest.get(type, 0) < n:
-            raise _Fail(f"chest has {self.chest.get(type, 0)} {type}, asked for {n}")
+    def _tool_buy(self, agent: str, work: dict, t: float, item: str, n: int):
+        self._need_reach(agent, self.shop_pos, "the shop")
+        price = CATALOG[item].price
+        cost = price * n
+        if cost > self.wallet:
+            raise _Fail(f"not enough money: {n} {item} cost {cost} coins ({price} each) and the team "
+                        f"wallet has {self.wallet}")
         self._need_room(agent, n)
-        self._chest_add(work, type, -n)
-        self._inv_add(work, agent, type, n)
-        return f"took {n} {type} from the chest", None, None
-
-    def _tool_deposit(self, agent: str, work: dict, t: float, type: str, n: int):
-        self._need_reach(agent, self.chest_pos, "the chest")
-        self._need_held(agent, type, n)
-        self._inv_add(work, agent, type, -n)
-        self._chest_add(work, type, n)
-        return f"deposited {n} {type} into the chest", None, None
+        self.wallet -= cost
+        work["wallet"] -= cost
+        self._inv_add(work, agent, item, n)
+        return f"bought {n} {item} for {cost} coins; the team wallet has {self.wallet} left", None, None
 
     def _tool_give(self, agent: str, work: dict, t: float, to: str, type: str, n: int):
         tx, ty, tz = self.positions[to]
@@ -905,8 +900,8 @@ class World:
 
     def _tool_place(self, agent: str, work: dict, t: float, x: int, y: int, z: int, type: str):
         pos = self._check_pos(x, y, z)
-        if pos == self.chest_pos:
-            raise _Fail(f"{pos} is the chest")
+        if pos == self.shop_pos:
+            raise _Fail(f"{pos} is the shop")
         if pos in self.blocks:
             b = self.blocks[pos]
             raise _Fail(f"{pos} is occupied by {b.type} (placed by {b.placed_by})")
@@ -917,7 +912,8 @@ class World:
         if jumper is not None:
             x, y, z = pos
             above = (x, y, z + 2)
-            if not self.config.in_bounds(above) or self.solid(above) or above in bodies:
+            if (not self.config.in_bounds(above) or (self.solid(above) and not self.passable(above))
+                    or above in bodies):
                 raise _Fail(f"{pos} is under airborne {jumper}, and the cell above their head {above} "
                             "is not free")
         self._need_reach(agent, pos, "cell")
@@ -936,8 +932,8 @@ class World:
 
     def _tool_remove(self, agent: str, work: dict, t: float, x: int, y: int, z: int):
         pos = self._check_pos(x, y, z)
-        if pos == self.chest_pos:
-            raise _Fail("the chest cannot be removed")
+        if pos == self.shop_pos:
+            raise _Fail("the shop cannot be removed")
         block = self.blocks.get(pos)
         if block is None:
             raise _Fail(f"{pos} is empty")

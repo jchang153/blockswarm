@@ -4,16 +4,18 @@ Design (see also prompts.py):
 - Exact coordinates first: every visible block is listed with copyable absolute coordinates,
   grouped by layer z and merged into rectangles ("(4..10, 5, 1) brick" = x 4 to 10, y 5, z 1).
   LLMs reconstruct 3D layouts poorly from raw lists, so we also give precomputed facts
-  (offsets and distances to agents and the chest, what changed since the last look) and a
-  small top-down ASCII map per layer, labelled as an approximate picture only.
-- No invented facts: chest counts appear only when the view has them (within reach), else the
-  last-seen counts and time. "Now empty" is reported only for a remembered block whose cell is
-  within view radius with a clear line from the eyes (judged from blocks this agent knows of);
-  otherwise the block stays in a "remembered, not in sight" list with its last-seen time.
-- No strategy: no to-do list, no design, no suggestions. In blueprint mode the blueprint cells
-  and which of them this agent has seen built are shown (the agents are given the plan there).
+  (offsets and distances to agents and the shop, what changed since the last look) and a
+  small top-down ASCII map per layer, labelled as an approximate picture only. Block types are
+  catalog item ids, so the map uses a legend built per observation for the ids it draws.
+- Blocks are listed per layer and per placer ("[agent_2] (4..6, 2, 1) oak_planks x3"); the
+  world shows `placed_by` for every visible block.
+- No invented facts: "now empty" is reported only for a remembered block whose cell is within
+  view radius with a clear line from the eyes (judged from the non-transparent blocks this
+  agent knows of); otherwise the block stays in a "remembered, not in sight" list with its
+  last-seen time. The wallet balance is shown as the view gives it (always visible).
+- No strategy: no to-do list, no design, no suggestions.
 - The brief is in the system prompt and repeated only in the first observation.
-- Scores are hidden unless SHOW_SCORES is True (open research question, SPEC §12).
+- Scores appear only when the view has them (config show_leaderboard).
 - The agent's own tool results are not repeated here; the loop returns them as tool results
   (render_tool_result).
 """
@@ -24,15 +26,18 @@ import json
 import math
 from typing import Any, Iterable
 
+from blockswarm.catalog import CATALOG
 from blockswarm.world import ray_cells
 
-SHOW_SCORES = False   # show team/individual scores in observations (off by default)
 MAX_NOTES_CHARS = 2000  # newest notes shown up to this many characters in total
 MAX_MAP_LAYERS = 8
 
-BLOCK_LETTERS = {"wood": "W", "stone": "S", "brick": "B", "glass": "G", "plank": "P",
-                 "roof": "R", "door": "D"}
 AGENT_MARKS = "123456789abcdefghijklmnopqrstuvwxyz"
+# Map letters for item ids, assigned per observation in order of first appearance on the map.
+# Kept disjoint from agent marks (digits, lowercase), '@', '$' and '.'.
+ITEM_MARKS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ#%&*=<>~^!?"
+OTHER_MARK = "+"  # any further item ids, if more distinct ids are drawn than ITEM_MARKS holds
+SHOP_MARK = "$"
 
 Pos = tuple[int, int, int]
 
@@ -78,15 +83,36 @@ def rectangles(cells: dict[Pos, str]) -> list[tuple[int, int, int, int, int, str
     return out
 
 
-def format_cells(cells: dict[Pos, str], indent: str = "  ") -> list[str]:
-    """One line per layer: 'z=1 (12): (4..10, 5, 1) brick; (4, 6..8, 1) brick'."""
-    by_z: dict[int, list[str]] = {}
+def format_cells(cells: dict[Pos, str], indent: str = "  ",
+                 owners: dict[Pos, str] | None = None) -> list[str]:
+    """One line per layer: 'z=1 (12): (4..10, 5, 1) bricks x7; (4, 6..8, 1) bricks x3'.
+    With `owners` ({pos: label}) each layer is split by placer:
+    'z=1 (12): [agent_2] (4..10, 5, 1) bricks x7 | [you] (4, 6..8, 1) bricks x3'."""
+    if owners is None:
+        groups = {"": cells}
+    else:
+        groups = {}
+        for p, t in cells.items():
+            groups.setdefault(owners.get(p) or "?", {})[p] = t
+    by_z: dict[int, dict[str, list[str]]] = {}
     count: dict[int, int] = {}
-    for x0, x1, y0, y1, z, t in rectangles(cells):
-        n = (x1 - x0 + 1) * (y1 - y0 + 1)
-        by_z.setdefault(z, []).append(f"({_span(x0, x1)}, {_span(y0, y1)}, {z}) {t}" + (f" x{n}" if n > 1 else ""))
-        count[z] = count.get(z, 0) + n
-    return [f"{indent}z={z} ({count[z]}): " + "; ".join(parts) for z, parts in sorted(by_z.items())]
+    for label in sorted(groups, key=lambda o: (o == "you", o == "?", o)):
+        for x0, x1, y0, y1, z, t in rectangles(groups[label]):
+            n = (x1 - x0 + 1) * (y1 - y0 + 1)
+            by_z.setdefault(z, {}).setdefault(label, []).append(
+                f"({_span(x0, x1)}, {_span(y0, y1)}, {z}) {t}" + (f" x{n}" if n > 1 else ""))
+            count[z] = count.get(z, 0) + n
+    out = []
+    for z, parts in sorted(by_z.items()):
+        body = " | ".join((f"[{o}] " if o else "") + "; ".join(r) for o, r in parts.items())
+        out.append(f"{indent}z={z} ({count[z]}): {body}")
+    return out
+
+
+def is_opaque(btype: str) -> bool:
+    """Whether a block of this type blocks sight (catalog `transparent`; unknown ids block it)."""
+    item = CATALOG.get(btype)
+    return not (item is not None and item.transparent)
 
 
 def _group_by(cells: dict[Pos, tuple[str, str]]) -> dict[str, dict[Pos, str]]:
@@ -148,6 +174,32 @@ def _message_line(m: dict, me: str) -> str | None:
     return None
 
 
+def shop_pos(view: dict) -> Pos:
+    """The shop cell from a view (`shop_pos`, or `shop.pos`)."""
+    p = view.get("shop_pos")
+    if p is None:
+        p = (view.get("shop") or {}).get("pos")
+    return tuple(p)  # type: ignore[return-value]
+
+
+def _who(placed_by: str | None, me: str) -> str:
+    return "you" if placed_by == me else (placed_by or "?")
+
+
+def _leaderboard(scores: Any, agents: list[str]) -> list[tuple[str, int]]:
+    """[(agent, count)] from a view's `scores` ({agent: n} or {"individual_scores": {...}}),
+    in team order; [] when absent."""
+    if not isinstance(scores, dict):
+        return []
+    if "team_score" in scores:  # v3 views carried the team grade; never shown
+        return []
+    ind = scores.get("individual_scores", scores)
+    if not isinstance(ind, dict):
+        return []
+    order = [a for a in agents if a in ind] + sorted(a for a in ind if a not in agents)
+    return [(a, ind[a]) for a in order if isinstance(ind[a], (int, float))]
+
+
 def render_observation(view: dict, memory: ObservationMemory) -> str:
     """Text observation for the model. Updates `memory` (call once per view)."""
     me = view["you"]
@@ -179,20 +231,14 @@ def render_observation(view: dict, memory: ObservationMemory) -> str:
     held = sum(inv.values())
     out.append(f"Inventory ({held}/{view['inventory_cap']}): {_counts(inv)}")
 
-    # ---- chest
-    cpos = tuple(view["chest_pos"])
-    cdist = math.dist(eye, (cpos[0] + 0.5, cpos[1] + 0.5, cpos[2] + 0.5))
-    where = (f"Chest at {fmt_pos(cpos)}, offset {_fmt_off(c - p for c, p in zip(cpos, pos))}, "
-             f"{cdist:.1f} from your eyes")
-    if view.get("chest") is not None:
-        out.append(f"{where}; within reach, contents now: {_counts(view['chest'], all_types=True)}")
-    else:
-        seen = view.get("chest_last_seen")
-        if seen:
-            out.append(f"{where}; not within reach, contents not visible. "
-                       f"Last seen at t={seen['t']:.1f}: {_counts(seen['counts'], all_types=True)}")
-        else:
-            out.append(f"{where}; not within reach, contents not seen yet")
+    # ---- wallet and shop
+    if view.get("wallet") is not None:
+        out.append(f"Wallet ({'shared by the team' if len(agents) > 1 else 'yours'}): {view['wallet']} coins")
+    spos = shop_pos(view)
+    sdist = math.dist(eye, (spos[0] + 0.5, spos[1] + 0.5, spos[2] + 0.5))
+    reach_txt = {True: "within reach", False: "not within reach"}.get(view.get("shop_in_reach"), "")
+    out.append(f"Shop at {fmt_pos(spos)}, offset {_fmt_off(c - p for c, p in zip(spos, pos))}, "
+               f"{sdist:.1f} from your eyes" + (f"; {reach_txt}" if reach_txt else ""))
 
     # ---- blocks: visible now, changes, remembered
     visible: dict[Pos, dict] = {}
@@ -202,11 +248,11 @@ def render_observation(view: dict, memory: ObservationMemory) -> str:
     for p, b in visible.items():
         k = memory.known.get(p)
         if not first and (k is None or k["type"] != b["type"] or k["placed_at"] != b.get("placed_at")):
-            who = b.get("placed_by") or "unknown"
-            appeared[p] = (b["type"], "you" if who == me else who)
+            appeared[p] = (b["type"], _who(b.get("placed_by"), me))
     gone: dict[Pos, str] = {}
     candidates = {p: k for p, k in memory.known.items() if p not in visible}
-    solids = set(visible) | set(candidates) | {cpos}
+    solids = ({p for p, b in visible.items() if is_opaque(b["type"])}
+              | {p for p, k in candidates.items() if is_opaque(k["type"])} | {spos})
     changed = True
     while changed:  # a removed near block can uncover a removed far one
         changed = False
@@ -224,14 +270,16 @@ def render_observation(view: dict, memory: ObservationMemory) -> str:
     out.append("")
     out.append(f"BLOCKS YOU CAN SEE NOW ({len(visible)}; within {radius:g} of your eyes and in line of sight)"
                + (":" if visible else ": none"))
-    out.extend(format_cells({p: b["type"] for p, b in visible.items()}))
+    out.extend(format_cells({p: b["type"] for p, b in visible.items()},
+                            owners={p: _who(b.get("placed_by"), me) for p, b in visible.items()}))
 
     remembered = {p: k for p, k in memory.known.items() if p not in visible}
     if remembered:
         ts = [k["seen_t"] for k in remembered.values()]
         out.append(f"REMEMBERED, NOT IN SIGHT NOW ({len(remembered)}; last seen t={min(ts):.1f}"
                    + (f"..{max(ts):.1f}" if max(ts) - min(ts) >= 0.05 else "") + "; may have changed):")
-        out.extend(format_cells({p: k["type"] for p, k in remembered.items()}))
+        out.extend(format_cells({p: k["type"] for p, k in remembered.items()},
+                                owners={p: _who(k.get("placed_by"), me) for p, k in remembered.items()}))
 
     if not first:
         since = f"t={memory.last_t:.1f}" if memory.last_t is not None else "last observation"
@@ -241,13 +289,14 @@ def render_observation(view: dict, memory: ObservationMemory) -> str:
             out.append("  none seen")
         last = memory.last_t if memory.last_t is not None else -1.0
         fresh = {p: v for p, v in appeared.items() if (visible[p].get("placed_at") or 0.0) >= last}
-        older = {p: v[0] for p, v in appeared.items() if p not in fresh}
+        older = {p: v for p, v in appeared.items() if p not in fresh}
         for who, cells in sorted(_group_by(fresh).items()):
             out.append(f"  placed by {who} since then:")
             out.extend(format_cells(cells, indent="    "))
         if older:
             out.append("  now in sight for the first time (placed before your last observation):")
-            out.extend(format_cells(older, indent="    "))
+            out.extend(format_cells({p: v[0] for p, v in older.items()}, indent="    ",
+                                    owners={p: v[1] for p, v in older.items()}))
         if gone:
             out.append("  blocks no longer there (cell now empty):")
             out.extend(format_cells(gone, indent="    "))
@@ -280,9 +329,6 @@ def render_observation(view: dict, memory: ObservationMemory) -> str:
 
     # ---- task
     task = view.get("task") or {}
-    if task.get("kind") == "blueprint" and task.get("blueprint"):
-        out.append("")
-        out.extend(_blueprint_status(task["blueprint"], memory, visible))
     if first and task.get("brief"):
         out.append("")
         out.append(f"BRIEF: {task['brief']}")
@@ -322,10 +368,11 @@ def render_observation(view: dict, memory: ObservationMemory) -> str:
         out.append(f"YOUR NOTES ({len(notes)}" + (f"; oldest {hidden} not shown" if hidden else "") + "):")
         out.extend(reversed(shown))
 
-    if SHOW_SCORES and view.get("scores"):
-        s = view["scores"]
+    board = _leaderboard(view.get("scores"), agents)
+    if board:
         out.append("")
-        out.append(f"SCORES: team {s.get('team_score')}; individual {json.dumps(s.get('individual_scores'))}")
+        out.append("SCORES (blocks each agent placed that are still in the world): "
+                   + ", ".join(f"{'you' if a == me else a} {v}" for a, v in board))
 
     memory.count += 1
     memory.last_t = t
@@ -336,32 +383,49 @@ def render_observation(view: dict, memory: ObservationMemory) -> str:
 
 def _ascii_map(view: dict, visible: dict[Pos, dict], vis_agents: dict[str, dict],
                agents: list[str], me: str) -> list[str]:
-    """Top-down picture of each layer that has something visible. Approximate aid only."""
+    """Top-down picture of each layer that has something visible. Approximate aid only.
+    Item ids get letters in order of first appearance (reading the drawn layers bottom-up,
+    each from the top row, left to right); the legend lists the ones drawn."""
     marks: dict[Pos, str] = {}
-    for p, b in visible.items():
-        marks[p] = BLOCK_LETTERS.get(b["type"], "?")
-    cpos = tuple(view["chest_pos"])
+    spos = shop_pos(view)
     pos = tuple(view["position"])
     radius = float(view["view_radius"])
     eye = tuple(view["eye"])
-    if math.dist(eye, (cpos[0] + 0.5, cpos[1] + 0.5, cpos[2] + 0.5)) <= radius:
-        marks[cpos] = "C"
+    if math.dist(eye, (spos[0] + 0.5, spos[1] + 0.5, spos[2] + 0.5)) <= radius:
+        marks[spos] = SHOP_MARK
     for a, o in vis_agents.items():
         marks[tuple(o["pos"])] = agent_mark(agents, a)
     marks[pos] = "@"
+    cells = {p: b["type"] for p, b in visible.items()}
     g = view["grid"]
-    xs = [p[0] for p in marks]
-    ys = [p[1] for p in marks]
+    every = set(marks) | set(cells)
+    xs = [p[0] for p in every]
+    ys = [p[1] for p in every]
     x0, x1 = max(0, min(xs) - 1), min(g["width"] - 1, max(xs) + 1)
     y0, y1 = max(0, min(ys) - 1), min(g["depth"] - 1, max(ys) + 1)
-    layers = sorted({p[2] for p in marks})
+    layers = sorted({p[2] for p in every})
+    clipped = len(layers) > MAX_MAP_LAYERS
+    total = len(layers)
+    layers = layers[:MAX_MAP_LAYERS]
+    legend: dict[str, str] = {}
+    for p in sorted((p for p in cells if p[2] in layers), key=lambda p: (p[2], -p[1], p[0])):
+        t = cells[p]
+        if t not in legend:
+            legend[t] = ITEM_MARKS[len(legend)] if len(legend) < len(ITEM_MARKS) else OTHER_MARK
+        marks.setdefault(p, legend[t])
+    items = " ".join(f"{m}={t}" for t, m in legend.items() if m != OTHER_MARK)
+    if OTHER_MARK in legend.values():
+        items += f" {OTHER_MARK}=any other item id (see the lists above)"
     out = [f"MAP (approximate picture; exact coordinates are listed above). Top-down, one grid per "
            f"layer z; columns = x ({x0}..{x1}, increasing to the right), rows = y ({y1} at top down "
-           f"to {y0}). {' '.join(f'{v}={k}' for k, v in BLOCK_LETTERS.items())} C=chest @=you "
-           f"{'digits/letters=teammates (see TEAMMATES), ' if len(agents) > 1 else ''}.=no visible block. Agents are drawn at their feet layer."]
-    if len(layers) > MAX_MAP_LAYERS:
-        out.append(f"(showing the {MAX_MAP_LAYERS} lowest of {len(layers)} layers)")
-        layers = layers[:MAX_MAP_LAYERS]
+           f"to {y0}). Agents are drawn at their feet layer.",
+           "Map legend (letters are assigned for this map only): "
+           + (items + " " if items else "")
+           + f"{SHOP_MARK}=shop @=you "
+           + ("digits/letters=teammates (see TEAMMATES) " if len(agents) > 1 else "")
+           + ".=no visible block"]
+    if clipped:
+        out.append(f"(showing the {MAX_MAP_LAYERS} lowest of {total} layers)")
     tens = "".join(str(x // 10) if x >= 10 else " " for x in range(x0, x1 + 1))
     units = "".join(str(x % 10) for x in range(x0, x1 + 1))
     for z in layers:
@@ -372,34 +436,6 @@ def _ascii_map(view: dict, visible: dict[Pos, dict], vis_agents: dict[str, dict]
         for y in range(y1, y0 - 1, -1):
             row = "".join(marks.get((x, y, z), ".") for x in range(x0, x1 + 1))
             out.append(f"y={y:>2}  {row}")
-    return out
-
-
-def _blueprint_status(bp: dict, memory: ObservationMemory, visible: dict[Pos, dict]) -> list[str]:
-    """Blueprint cells, split by what this agent has seen (now or remembered)."""
-    cells = {(x, y, z): t for x, y, z, t in bp["cells"]}
-    done, wrong, other = {}, {}, {}
-    for p, want in cells.items():
-        k = memory.known.get(p)
-        if k is None:
-            other[p] = want
-        elif k["type"] == want:
-            done[p] = want
-        else:
-            wrong[p] = want
-    extra = {p: k["type"] for p, k in memory.known.items() if p not in cells}
-    out = [f"BLUEPRINT '{bp.get('name', '')}' ({len(cells)} cells). From blocks you can see or remember: "
-           f"{len(done)} built as planned, {len(wrong)} hold a different type, {len(other)} not seen built "
-           f"(empty, or out of your sight), {len(extra)} blocks outside the blueprint."]
-    if other:
-        out.append(" not seen built (planned type shown):")
-        out.extend(format_cells(other, indent="   "))
-    if wrong:
-        out.append(" holding a different type (planned type shown):")
-        out.extend(format_cells(wrong, indent="   "))
-    if extra:
-        out.append(" blocks outside the blueprint:")
-        out.extend(format_cells(extra, indent="   "))
     return out
 
 

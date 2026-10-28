@@ -259,13 +259,13 @@ class TestAgent(unittest.TestCase):
         w = make_world(1)
         x, y, z = w.positions["agent_1"]
         client = MockClient({"agent_1": [
-            mock_result(tool_call("take", type="stone", n=1)),
+            mock_result(tool_call("buy", item="stone", n=1)),
             mock_result(tool_call("jump"), tool_call("place", x=x, y=y, z=z, type="stone")),
         ]}, latency_s=0.5)  # model latency must not matter: both run inside one response
         ag = make_agent(w, "agent_1", client, max_model_calls_per_agent=2)
         self.run_agents(w, [ag])
         ev = [r for r in w.recorder.records if r["type"] == "event"]
-        self.assertEqual([(e["tool"], e["ok"]) for e in ev], [("take", True), ("jump", True), ("place", True)])
+        self.assertEqual([(e["tool"], e["ok"]) for e in ev], [("buy", True), ("jump", True), ("place", True)])
         self.assertEqual(w.positions["agent_1"], (x, y, z + 1))
 
     def test_invalid_tool_calls(self):

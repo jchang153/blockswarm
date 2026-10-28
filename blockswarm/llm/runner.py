@@ -7,7 +7,7 @@ Outputs go to runs/<run_id>/ (see docs/running.md):
   ledger.jsonl        every budget reservation / commit (no secrets, no prompts)
   late_records.jsonl  model calls whose responses arrived after the episode ended (if any)
 
-Config keys: any World Config field (width, scarcity, max_seconds, ...), plus
+Config keys: any World Config field (width, starting_money, incentive, max_seconds, ...), plus
   "n_agents": N (ids agent_1..agent_N) and/or "agents": [...] (must agree),
   "model": "id" or "models": {agent: id} | [id, ...] (one per agent),
   "llm": LLMConfig fields (max_tokens, temperature, reasoning, provider, history_steps,
@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from blockswarm.blueprints import BLUEPRINTS
+from blockswarm.catalog import CATALOG
 from blockswarm.clock import WallClock
 from blockswarm.llm.agent import LLMAgent, LLMConfig
 from blockswarm.llm.budget import Budget, UnknownPrice, estimate_cost, price_for
@@ -175,8 +176,8 @@ class MockPolicy:
         self.world = world
         self.prices = prices
         self.seed = seed
-        self.design = sorted(BLUEPRINTS[world.config.reference_design if world.config.task == "open"
-                                        else world.config.blueprint].cells)
+        self.design = sorted(BLUEPRINTS["house"].cells)
+        self.design_types = sorted(set(BLUEPRINTS["house"].cells.values()))
 
     def __call__(self, state: dict, messages: list) -> ChatResult:
         agent = state["agent"]
@@ -200,19 +201,20 @@ class MockPolicy:
             pos = w.positions[agent]
             inv = dict(w.inventories[agent])
             if not inv:
-                if w.can_reach(pos, w.chest_pos):
-                    avail = [(k, v) for k, v in sorted(w.chest.items()) if v > 0]
+                if w.can_reach(pos, w.shop_pos):
+                    cheap = [(CATALOG[k].price, k) for k in sorted(set(self.design_types))]
+                    avail = [(p, k) for p, k in cheap if p <= w.wallet]
                     if not avail:
                         return [tool_call("declare_done")]
-                    k, v = rng.choice(avail)
-                    return [tool_call("take", type=k, n=min(v, rng.randint(2, 5)))]
-                stands = w.reachable_stand_cells(w.chest_pos, agent)
+                    p, k = rng.choice(avail)
+                    return [tool_call("buy", item=k, n=max(1, min(w.wallet // p, rng.randint(2, 5))))]
+                stands = w.reachable_stand_cells(w.shop_pos, agent)
                 if not stands:
                     return [tool_call("wait", seconds=2)]
                 return [tool_call("move_to", x=stands[0][0], y=stands[0][1], z=stands[0][2])]
             btype = rng.choice(sorted(inv))
             bodies = w.body_cells()
-            cands = [c for c in self.design if c not in w.blocks and c != w.chest_pos and c not in bodies
+            cands = [c for c in self.design if c not in w.blocks and c != w.shop_pos and c not in bodies
                      and w.supported(c)]
             if not cands:
                 return [tool_call("declare_done")]
@@ -316,8 +318,9 @@ def run_episode(config_path: str | Path, *, run_dir: str | Path | None = None, d
                 f"${a['price']['output_per_m']}{' (UNKNOWN, fallback)' if a['price'].get('unknown') else ''}  "
                 f"reservation/call ~${a['per_call_reservation_usd~']:.4f}")
         c = rc["world_cfg"]
-        say(f"  world: task={c.task} scarcity={c.scarcity} payoff={c.payoff} max_seconds={c.max_seconds} "
-            f"target_interior={c.target_interior} chest_scale={c.chest_scale:.3f}")
+        say(f"  world: task={c.task} grid={c.width}x{c.depth}x{c.height} shop_pos={list(c.shop_pos)} "
+            f"starting_money={c.starting_money} incentive={c.incentive} deploy_top_k={c.deploy_top_k} "
+            f"show_leaderboard={c.show_leaderboard} max_seconds={c.max_seconds}")
         say(f"  llm: max_tokens={llm.max_tokens} temperature={llm.temperature} reasoning={llm.reasoning} "
             f"history_steps={llm.history_steps} max_calls/agent={llm.max_model_calls_per_agent}")
         say(f"  max spend without budget: ~${plan['max_spend_if_uncapped_usd~']:.2f} = {plan['formula']}")
@@ -424,8 +427,9 @@ def run_episode(config_path: str | Path, *, run_dir: str | Path | None = None, d
         "status": "finished", "end_utc": ended.isoformat(timespec="seconds"),
         "wall_seconds": round((ended - started).total_seconds(), 1), "episode_seconds": end.get("t"),
         "end_reason": world.end_reason, "interrupted": interrupted,
-        "team_score": end.get("team_score"), "individual_scores": end.get("individual_scores"),
-        "score_details": end.get("score_details"), "actions_used": end.get("actions_used"),
+        "wallet": end.get("wallet"), "individual_scores": end.get("individual_scores"),
+        "ranking": end.get("ranking"), "deployed": end.get("deployed"),
+        "analysis": end.get("analysis"), "actions_used": end.get("actions_used"),
         "cost": {**bsum, "provider_reported_usd": round(sum(a.stats["cost_usd"] for a in agents), 8)},
         "agents": {a.agent: {"model": a.model, "stop_reason": results.get(a.agent, "still_running"), **a.stats}
                    for a in agents},
@@ -434,7 +438,8 @@ def run_episode(config_path: str | Path, *, run_dir: str | Path | None = None, d
     })
     _write_json(out / "manifest.json", manifest)
     say(f"\nepisode over: {world.end_reason}  (episode t={end.get('t')} s, wall {manifest['wall_seconds']} s)")
-    say(f"  team score {end.get('team_score')}  individual {end.get('individual_scores')}")
+    say(f"  wallet left {end.get('wallet')}  individual {end.get('individual_scores')}  "
+        f"deployed {end.get('deployed')}")
     say(f"  cost ${bsum['spent_usd']:.4f} of ${bsum['limit_usd']:.2f} (provider-reported "
         f"${manifest['cost']['provider_reported_usd']:.4f}; uncertain ${bsum['uncertain_usd']:.4f}; "
         f"open reservations {bsum['open_reservations']})")
@@ -445,7 +450,7 @@ def run_episode(config_path: str | Path, *, run_dir: str | Path | None = None, d
     say(f"  records: {counts}" + (f"; {late_count[0]} late records in late_records.jsonl" if late_count[0] else ""))
     say(f"  outputs: {out}")
     say(f"  replay: python3 scripts/serve_viewer.py {_rel(out / 'episode.jsonl')}")
-    return {"run_dir": str(out), "interrupted": interrupted, **{k: manifest[k] for k in ("run_id", "end_reason", "team_score", "cost",
+    return {"run_dir": str(out), "interrupted": interrupted, **{k: manifest[k] for k in ("run_id", "end_reason", "deployed", "cost",
                                                                "agents", "record_counts", "late_records")}}
 
 

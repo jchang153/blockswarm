@@ -19,7 +19,7 @@
   <div class="ep-head">
     <a class="back" href="./" title="Back to all builds">← <span class="hide-xs">Builds</span></a>
     <h1 id="title">Loading…</h1>
-    <span id="liveScore" class="livescore" hidden title="Team score at the playhead (recomputed from the blocks)"></span>
+    <span id="liveScore" class="livescore" hidden></span>
   </div>
   <nav>
     <a class="hide-sm" href="about.html">About</a>
@@ -73,6 +73,12 @@
 
   <aside class="side" aria-label="Team, chat and events">
     <div class="panel-sec"><h2>Team</h2><div class="agents-row" id="agents"></div></div>
+    <div class="panel-sec v4sec" id="v4sec" hidden>
+      <h2>Shared wallet <span class="muted" id="walletNote" style="text-transform:none;letter-spacing:0;font-weight:500"></span></h2>
+      <div id="wallet"></div>
+      <h2 style="margin-top:10px">Leaderboard <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500" title="Blocks each agent placed that are still standing. At the end, the top agents are deployed.">blocks still standing</span></h2>
+      <ol id="board" class="board"></ol>
+    </div>
     <div class="panel-sec chat-sec">
       <h2>Chat <span class="muted" id="chatCount" style="text-transform:none;letter-spacing:0;font-weight:500"></span>
         <label title="Show agents' private notes to themselves"><input type="checkbox" id="optNotes"> notes</label></h2>

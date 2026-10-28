@@ -3,10 +3,8 @@
   "episode_id": "mock",
   "n_agents": 3,
   "model": "mock/random-builder",
-  "budget_usd": 1.00,
+  "budget_usd": 1.0,
   "task": "open",
-  "scarcity": "exact",
-  "payoff": "team",
   "max_seconds": 60,
   "seed": 0,
   "llm": {
@@ -15,7 +13,18 @@
     "history_steps": 6,
     "max_model_calls_per_agent": 200,
     "stagger_s": 1.0,
-    "prices": {"mock/random-builder": {"input_per_m": 0.10, "output_per_m": 0.40}}
+    "prices": {
+      "mock/random-builder": {
+        "input_per_m": 0.1,
+        "output_per_m": 0.4
+      }
+    }
   },
-  "mock": {"latency_s": [0.2, 0.6], "seed": 0}
+  "mock": {
+    "latency_s": [
+      0.2,
+      0.6
+    ],
+    "seed": 0
+  }
 }

@@ -12,6 +12,12 @@ What it does:
   * writes data/episodes.json (one summary per episode incl. its final blocks for the gallery
     thumbnails, so the gallery never downloads full logs).
 
+Log v4 (shop + shared wallet + competitive incentive, docs/shop-and-incentives.md) and v1-v3 are
+both read. A v4 summary has no team score; instead it carries "v4": true, "ranking", "deployed",
+"deploy_top_k", "incentive", "wallet" {start, end, spent}, "analysis" (house metrics, never shown to
+agents), "items_used" (top 5 item ids by count in the final build), "shop_pos", and "catalog": the
+catalog entries for just the items in its final build (colours / flags for the thumbnails).
+
 Split hosting (pages on one host, data elsewhere, e.g. a public Hugging Face dataset):
     python3 scripts/export_site.py runs/*.jsonl --data-only --out hf_data
     python3 scripts/export_site.py --site-only --data-base-url https://huggingface.co/datasets/<user>/<repo>/resolve/main/ --out site
@@ -48,6 +54,7 @@ MARKER = ".blockswarm-site"  # marks a folder this script built (safe to wipe on
 
 KNOWN_TYPES = {"header", "event", "snapshot", "episode_end"}
 OPEN_DETAIL_KEYS = ("enclosed", "interior_cells", "shell_cells", "doors", "windows", "leftovers", "target_interior")
+CATALOG_KEYS = ("id", "name", "family", "price", "color", "transparent", "door")
 BLUEPRINT_DETAIL_KEYS = ("correct_cells", "blueprint_cells", "extra_cells")
 
 
@@ -97,8 +104,37 @@ def public_filter(records: list[dict], keep_model_calls: bool, drop_notes: bool)
     return out, dropped
 
 
+def is_v4(header: dict) -> bool:
+    v = header.get("log_version")
+    return (isinstance(v, (int, float)) and v >= 4) or isinstance(header.get("shop"), dict)
+
+
+def deploy_top_k(header: dict, n_agents: int) -> int:
+    """Mirrors deployTopK() in viewer/core.js."""
+    cfg = header.get("config") or {}
+    if cfg.get("incentive") == "none":
+        return 0
+    k = cfg.get("deploy_top_k")
+    return k if isinstance(k, int) else max(1, n_agents // 2)
+
+
+def rank_agents(scores: dict, agents: list[str], k: int) -> tuple[list[dict], list[str]]:
+    """Competition ranking (ties share a rank); the top k plus ties at the boundary are deployed."""
+    order = sorted(range(len(agents)), key=lambda i: (-(scores.get(agents[i]) or 0), i))
+    ranking: list[dict] = []
+    for j, i in enumerate(order):
+        a, sc = agents[i], scores.get(agents[i]) or 0
+        rank = ranking[-1]["rank"] if j and sc == ranking[-1]["score"] else j + 1
+        ranking.append({"agent": a, "score": sc, "rank": rank})
+    deployed = []
+    if k > 0 and ranking:
+        cut = ranking[min(k, len(ranking)) - 1]["score"]
+        deployed = [r["agent"] for r in ranking if r["score"] >= cut]
+    return ranking, deployed
+
+
 def task_of(header: dict) -> tuple[str, str | None, str | None]:
-    """(kind, brief, blueprint name) — mirrors taskOf() in viewer/core.js (log v1-v3)."""
+    """(kind, brief, blueprint name) — mirrors taskOf() in viewer/core.js (log v1-v4)."""
     cfg = header.get("config") or {}
     task = header.get("task") if isinstance(header.get("task"), dict) else None
     bp = (task or {}).get("blueprint") or header.get("blueprint")
@@ -203,6 +239,59 @@ def summarize(records: list[dict], meta: dict) -> dict:
             if a in per_agent:
                 per_agent[a]["individual_score"] = v
 
+    blocks = final_blocks(records)
+    v4 = is_v4(header)
+    v4_fields: dict = {}
+    if v4:
+        shop = header.get("shop") if isinstance(header.get("shop"), dict) else {}
+        start = shop.get("starting_money", cfg.get("starting_money", header.get("wallet")))
+        wallet = header.get("wallet", start)
+        for e in events:
+            w = (e.get("diff") or {}).get("wallet")
+            if isinstance(w, (int, float)) and isinstance(wallet, (int, float)):
+                wallet += w
+            if e.get("tool") == "buy" and e.get("ok") and e.get("agent") in per_agent:
+                pa = per_agent[e["agent"]]
+                got = ((e.get("diff") or {}).get("inventory") or {}).get(e["agent"]) or {}
+                pa["bought"] = pa.get("bought", 0) + sum(v for v in got.values() if isinstance(v, int) and v > 0)
+                pa["spent"] = pa.get("spent", 0) + (-w if isinstance(w, (int, float)) and w < 0 else 0)
+        if end and isinstance(end.get("wallet"), (int, float)):
+            wallet = end["wallet"]
+        standing = {a: 0 for a in agents}
+        for b in blocks:
+            if b[4] in standing:
+                standing[b[4]] += 1
+        k = deploy_top_k(header, len(agents))
+        ranking, deployed = rank_agents(standing, agents, k)
+        if end and isinstance(end.get("ranking"), list):
+            ranking = end["ranking"]
+        if end and isinstance(end.get("deployed"), list):
+            deployed = end["deployed"]
+        ana_src = (end or {}).get("analysis") or (snaps[-1].get("analysis") if snaps else None) or {}
+        analysis = {k2: ana_src[k2] for k2 in OPEN_DETAIL_KEYS if k2 in ana_src}
+        counts: dict[str, int] = {}
+        for b in blocks:
+            counts[b[3]] = counts.get(b[3], 0) + 1
+        used = sorted(counts.items(), key=lambda kv: (-kv[1], str(kv[0])))
+        cat = {it.get("id"): it for it in (shop.get("catalog") or []) if isinstance(it, dict)}
+        for a in per_agent:
+            per_agent[a]["individual_score"] = standing.get(a, 0) if not (end and end.get("individual_scores")) else per_agent[a]["individual_score"]
+        v4_fields = {
+            "v4": True,
+            "incentive": cfg.get("incentive", "competitive"),
+            "deploy_top_k": k,
+            "ranking": ranking,
+            "deployed": deployed,
+            "wallet": {"start": start, "end": wallet,
+                       "spent": (start - wallet) if isinstance(start, (int, float)) and isinstance(wallet, (int, float)) else None},
+            "analysis": analysis,
+            "items_used": [[t, n] for t, n in used[:5]],
+            "item_types": len(used),
+            "shop_pos": shop.get("pos") or cfg.get("shop_pos"),
+            "catalog": [{k2: cat[t].get(k2) for k2 in CATALOG_KEYS} for t, _ in used if t in cat],
+        }
+        team_score, details = None, {}
+
     grid = header.get("grid") or {k: cfg.get(k) for k in ("width", "depth", "height")}
     created = (meta.get("created") or header.get("created") or header.get("created_at")
                or header.get("started_at") or header.get("timestamp") or cfg.get("created_at"))
@@ -229,8 +318,9 @@ def summarize(records: list[dict], meta: dict) -> dict:
         "chat_count": len(chats),
         "created": created,
         "grid": {"width": grid.get("width"), "depth": grid.get("depth"), "height": grid.get("height")},
-        "chest_pos": header.get("chest_pos") or cfg.get("chest_pos"),
-        "final_blocks": [b[:4] for b in final_blocks(records)],
+        "chest_pos": None if v4 else header.get("chest_pos") or cfg.get("chest_pos"),
+        "final_blocks": [b[:4] for b in blocks],
+        **v4_fields,
     }
 
 
@@ -311,8 +401,10 @@ def write_data(data_dir: Path, logs: list[Path], keep_model_calls: bool, drop_no
         episodes.append(summary)
         drop_txt = ", ".join(f"{v} {k}" for k, v in sorted(dropped.items())) or "nothing"
         score = summary["team_score"]
+        result = (f"v4 deployed={','.join(summary['deployed']) or '-'} spent={summary['wallet']['spent']}" if summary.get("v4")
+                  else f"score={'-' if score is None else f'{score:.3f}'}")
         print(f"  {ep_id:<32} {summary['task']:<9} events={summary['event_count']:<5} chat={summary['chat_count']:<4} "
-              f"score={'-' if score is None else f'{score:.3f}'}  {summary['bytes'] / 1024:.1f} KiB  (dropped: {drop_txt})")
+              f"{result}  {summary['bytes'] / 1024:.1f} KiB  (dropped: {drop_txt})")
     (data_dir / "episodes.json").write_text(json.dumps(episodes, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
     return episodes, failed
 

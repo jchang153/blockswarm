@@ -151,6 +151,17 @@ select { background: var(--panel); border: 1px solid var(--border); border-radiu
 .ev.move { padding-top: 1px; padding-bottom: 1px; }
 .ev.move .meta { display: inline; margin-right: 6px; }
 .ev .note { font-style: italic; color: var(--muted); white-space: pre-wrap; word-break: break-word; }
+.deployed { display: inline-block; font-size: 10px; font-weight: 700; padding: 0 6px; border-radius: 8px; background: #12805c22; color: var(--ok); border: 1px solid var(--ok); margin-left: 4px; vertical-align: 1px; }
+.notdeployed { display: inline-block; font-size: 10px; padding: 0 6px; border-radius: 8px; background: var(--chip); color: var(--muted); margin-left: 4px; vertical-align: 1px; }
+.lbrow { display: grid; grid-template-columns: 22px 92px 1fr 34px; gap: 6px; align-items: center; font-size: 12px; margin: 2px 0; font-variant-numeric: tabular-nums; }
+.lbrow .rk { color: var(--muted); text-align: right; }
+.lbrow .n { text-align: right; font-weight: 600; }
+.wallet .big { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.buyrow { display: flex; gap: 6px; align-items: baseline; font-size: 12px; margin: 2px 0; }
+.buyrow .c { margin-left: auto; color: var(--warn); font-variant-numeric: tabular-nums; }
+.ev.buy .who + .txt { font-weight: 500; }
+.analysis { margin-top: 8px; padding: 6px 8px; border: 1px dashed var(--border); border-radius: 6px; font-size: 12px; }
+.analysis .t { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 3px; }
 .roundsep { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 6px 4px 0; }
 
 /* empty state, errors, drop */
@@ -172,6 +183,20 @@ body.dragging #drop { display: flex; }
   #app { grid-template-columns: minmax(0, 1fr) 300px; }
   #legend, #caption { max-width: 90%; }
 }
+/* phones: stack scene, timeline and panel; the page scrolls */
+@media (max-width: 640px) {
+  body { overflow: auto; }
+  #app { display: flex; flex-direction: column; height: auto; }
+  #stage { height: 62vh; height: 62svh; flex: none; }
+  #panel { border-left: 0; border-top: 1px solid var(--border); overflow: visible; }
+  #feedSec { min-height: 0; }
+  #feed { max-height: 60vh; }
+  #viewCtl { font-size: 12px; max-width: 62%; padding: 6px 8px; gap: 3px; }
+  #legend { max-width: 70%; max-height: 34%; overflow: auto; font-size: 11px; }
+  #caption { display: none; }
+  #timeline .kbd, #timeline .label { min-width: 0; }
+  #timeline .kbd { display: none; }
+}
 </style>
 <script type="importmap">
 { "imports": {
@@ -185,13 +210,13 @@ body.dragging #drop { display: flex; }
   <div id="stage">
     <div id="viewCtl" class="card">
       <div class="row"><span class="muted">Color</span>
-        <span class="seg"><button id="cmType" class="on">by type</button><button id="cmAgent">by agent</button></span></div>
+        <span class="seg"><button id="cmType" class="on">by item</button><button id="cmAgent">by agent</button></span></div>
       <label><input type="checkbox" id="optGhost" checked> <span id="optGhostLbl">Blueprint ghost (missing cells)</span></label>
       <label><input type="checkbox" id="optFlags" checked> <span id="optFlagsLbl">Flag wrong-type / extra blocks</span></label>
       <label><input type="checkbox" id="optHighlight" checked> Highlight current event</label>
       <div class="row"><span class="muted">Max height</span>
         <input type="range" id="cut" min="0" max="7" value="7" style="flex:1;width:90px"><span id="cutLbl" style="min-width:42px">all</span></div>
-      <label id="optAgentsRow"><input type="checkbox" id="optAgents" checked> Agents &amp; chest</label>
+      <label id="optAgentsRow"><input type="checkbox" id="optAgents" checked> <span id="optAgentsLbl">Agents &amp; chest</span></label>
       <div class="row" id="reachRow"><span class="muted">Reach / view of</span>
         <select id="reachSel" style="flex:1"><option value="">nobody</option></select></div>
       <div class="row"><button id="resetCam">Reset camera</button></div>
@@ -231,8 +256,8 @@ body.dragging #drop { display: flex; }
       <button id="openBtn" title="Open another log file">Open log…</button>
     </div>
     <div class="sec"><h3>Episode</h3><div id="info"></div></div>
-    <div class="sec"><h3>Score <span id="scoreNote" style="text-transform:none;letter-spacing:0"></span></h3><div id="scores"></div></div>
-    <div class="sec"><h3>Chest <span class="muted" style="text-transform:none;letter-spacing:0">now / start</span></h3><div id="chest"></div></div>
+    <div class="sec"><h3><span id="scoreTitle">Score</span> <span id="scoreNote" style="text-transform:none;letter-spacing:0"></span></h3><div id="scores"></div></div>
+    <div class="sec"><h3><span id="chestTitle">Chest</span> <span class="muted" id="chestNote" style="text-transform:none;letter-spacing:0">now / start</span></h3><div id="chest"></div></div>
     <div class="sec"><h3>Agents <span class="muted" style="text-transform:none;letter-spacing:0">actions used · done vote · inventory</span></h3><div id="invs"></div></div>
     <div class="sec" id="feedSec">
       <h3>Events <select id="feedFilter" style="font-size:11px;text-transform:none;letter-spacing:0"></select></h3>
@@ -277,7 +302,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   createLogBuilder, parseLog, buildStates, posAtTime, walkPosition, describeEvent,
-  typeColor, agentColors, key,
+  typeColor, agentColors, key, itemInfo, purchaseOf, leaderboard, finalResults, deployTopK,
 } from './core.js';
 
 
@@ -330,6 +355,16 @@ function blockMat(color, glass) {
   }
   return matCache.get(k);
 }
+// doors: a recessed panel outline on the four side faces + a knob, so they read as doors in any colour mode
+const doorDecalGeo = (() => {
+  const pts = [], i = 0.3, top = 0.42, bot = -0.5, o = 0.505;
+  const rect = (f) => { const c = [[-i, bot], [i, bot], [i, top], [-i, top]]; for (let k = 0; k < 4; k++) { pts.push(...f(c[k]), ...f(c[(k + 1) % 4])); } };
+  rect(([u, v]) => [u, v, o]); rect(([u, v]) => [u, v, -o]); rect(([u, v]) => [o, v, u]); rect(([u, v]) => [-o, v, u]);
+  pts.push(-i, 0.02, o, i, 0.02, o, -i, 0.02, -o, i, 0.02, -o, o, 0.02, -i, o, 0.02, i, -o, 0.02, -i, -o, 0.02, i);
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3)); return g;
+})();
+const knobGeo = new THREE.BoxGeometry(0.08, 0.08, 1.04);
+const knobMat = new THREE.MeshStandardMaterial({ color: '#d4a63a', metalness: 0.6, roughness: 0.35 });
 const lineMatCache = new Map();
 function lineMat(color, opacity = 1) {
   const k = color + '|' + opacity;
@@ -393,12 +428,39 @@ function cfgNum(name, dflt) {
   const c = R.log.header.config || {};
   return typeof c[name] === 'number' ? c[name] : dflt;
 }
+/** [v4] the shop: a small market stall (counter, posts, striped awning, crates) on the shop cell. */
+function marketStall(pos) {
+  const g = new THREE.Group(); g.position.copy(feetToThree(pos[0], pos[1], pos[2]));
+  const M = (color, o = {}) => new THREE.MeshStandardMaterial({ color, roughness: 0.8, ...o });
+  const box = (w, hgt, d, mat, x, y, z) => { const m = new THREE.Mesh(new THREE.BoxGeometry(w, hgt, d), mat); m.position.set(x, y, z); g.add(m); return m; };
+  const wood = M('#9a6a3f'), dark = M('#6e4520');
+  box(0.94, 0.55, 0.94, wood, 0, 0.275, 0);            // counter
+  box(1.0, 0.07, 1.0, dark, 0, 0.585, 0);              // counter top
+  for (const [x, z] of [[-0.44, -0.44], [0.44, -0.44], [-0.44, 0.44], [0.44, 0.44]]) box(0.07, 1.45, 0.07, dark, x, 0.725, z);
+  // striped awning (canvas texture), sloping towards the south (+three z)
+  const c = document.createElement('canvas'); c.width = 64; c.height = 8;
+  const cg = c.getContext('2d'); for (let i = 0; i < 8; i++) { cg.fillStyle = i % 2 ? '#f4f1ea' : '#d1495b'; cg.fillRect(i * 8, 0, 8, 8); }
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const aw = new THREE.Mesh(new THREE.BoxGeometry(1.16, 0.05, 1.16), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9 }));
+  aw.position.set(0, 1.47, 0.04); aw.rotation.x = 0.16; g.add(aw);
+  // goods on the counter
+  box(0.22, 0.22, 0.22, M('#b8945f'), -0.25, 0.73, 0.1);
+  box(0.2, 0.2, 0.2, M('#7d7d7d'), 0.02, 0.72, -0.12);
+  box(0.18, 0.18, 0.18, M('#c0dce4', { transparent: true, opacity: 0.6 }), 0.26, 0.71, 0.14);
+  box(0.12, 0.12, 0.12, M('#f6d03d', { metalness: 0.5, roughness: 0.3 }), 0.24, 0.68, -0.22);
+  const e = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(0.94, 0.55, 0.94)), lineMat('#3a2410', 0.6));
+  e.position.y = 0.275; g.add(e);
+  const l = textSprite('shop', '#a1272f', 0.32); l.position.y = 1.85; g.add(l);
+  return g;
+}
 function buildBodies() {
   if (world.bodies) scene.remove(world.bodies);
   world.bodies = new THREE.Group(); scene.add(world.bodies);
   world.avatars.clear();
   const h = R.log.header;
-  const cp = h.chest_pos || (h.config && h.config.chest_pos);
+  const shop = R.built.v4 ? R.built.shop : null;
+  if (shop && Array.isArray(shop.pos)) world.bodies.add(marketStall(shop.pos));
+  const cp = R.built.v4 ? null : h.chest_pos || (h.config && h.config.chest_pos);
   if (Array.isArray(cp)) {
     const g = new THREE.Group(); g.position.copy(toThree(cp[0], cp[1], cp[2]));
     const body = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.62, 0.9), new THREE.MeshStandardMaterial({ color: '#8a5a2b', roughness: 0.8 }));
@@ -488,7 +550,7 @@ function frameCamera() {
   }
   let min = new THREE.Vector3(Infinity, Infinity, Infinity), max = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
   const h = R.log.header;
-  const extraPts = [h.chest_pos || (h.config || {}).chest_pos, ...Object.values(h.positions || {})].filter(Array.isArray);
+  const extraPts = [h.chest_pos || (h.config || {}).chest_pos, R.built.shop && R.built.shop.pos, ...Object.values(h.positions || {})].filter(Array.isArray);
   if (cells.length) for (const [x, y, z] of [...cells, ...extraPts]) { const p = toThree(x, y, z); min.min(p); max.max(p); }
   else { min.set(0, 0, -D); max.set(W, H, 0); }
   min.subScalar(0.5); max.addScalar(0.5);
@@ -540,7 +602,12 @@ function initView(log, built, sourceName) {
   document.title = `${log.header.episode_id || sourceName || 'episode'} · BlockSwarm Replay`;
   buildStaticScene();
   frameCamera();
-  const hasBodies = !!(log.header.positions || log.header.chest_pos || (log.header.config || {}).chest_pos);
+  const hasBodies = !!(log.header.positions || log.header.chest_pos || (log.header.config || {}).chest_pos || built.shop);
+  $('optAgentsLbl').textContent = built.v4 ? 'Agents & shop' : 'Agents & chest';
+  $('scoreTitle').textContent = built.v4 ? 'Leaderboard' : 'Score';
+  $('chestTitle').textContent = built.v4 ? 'Wallet' : 'Chest';
+  $('chestNote').textContent = built.v4 ? 'shared by the team' : 'now / start';
+  R.legendItemsHtml = R.legendFlagsHtml = null;
   $('optAgentsRow').style.display = $('reachRow').style.display = hasBodies ? '' : 'none';
   $('reachSel').innerHTML = '<option value="">nobody</option>' + built.agents.map(a => `<option value="${esc(a)}">${esc(a)}</option>`).join('');
   R.reachAgent = ''; R.walkSig = '';
@@ -584,6 +651,7 @@ function applyPos(p, force) {
   if (changed) {
     refreshScene();
     renderScores(); renderChest(); renderInvs(); updateFeed(); renderCaption();
+    if (R.built.v4 && R.colorMode === 'type') renderLegend();
     const N = R.log.events.length;
     $('bPrev').disabled = p === 0; $('bNext').disabled = p === N;
   }
@@ -600,13 +668,15 @@ function renderTimelineLabel() {
 
 function blockSig(b, want, k, stats) {
   const color = R.colorMode === 'agent' ? agentColor(b.placed_by) : typeColor(b.type);
-  const glass = R.colorMode === 'type' && b.type === 'glass';
+  const info = itemInfo(b.type);
+  const glass = R.colorMode === 'type' && info.transparent;
+  const door = info.door;
   let flag = null;
   if (R.showFlags) {
     if (stats.kind === 'open') flag = stats.enclosed && stats.leftoverSet.has(k) ? 'extra' : null;
     else flag = want === undefined ? 'extra' : (want !== b.type ? 'wrong' : null);
   }
-  return { color, glass, flag, s: color + glass + flag };
+  return { color, glass, door, flag, s: color + glass + door + flag };
 }
 
 const interiorMat = new THREE.MeshBasicMaterial({ color: '#ffc83d', transparent: true, opacity: 0.38, depthWrite: false });
@@ -641,6 +711,11 @@ function refreshScene() {
         g.add(new THREE.LineSegments(cg, lineMat(sig.flag === 'wrong' ? FLAG_WRONG : FLAG_EXTRA)));
       } else edges.scale.setScalar(1.001);
       g.add(edges);
+      if (sig.door) {
+        g.add(new THREE.LineSegments(doorDecalGeo, lineMat(isDark() ? '#e8d9b8' : '#2a1a0c', 0.9)));
+        const knob = new THREE.Mesh(knobGeo, knobMat); knob.position.set(0.18, -0.02, 0); g.add(knob);
+        const knob2 = knob.clone(); knob2.rotation.y = Math.PI / 2; knob2.position.set(0, -0.02, 0.18); g.add(knob2);
+      }
       g.userData.z = z;
       world.group.add(g);
       obj = { g, mesh, sig: sig.s + darkEdge };
@@ -705,13 +780,19 @@ function renderInfo() {
   const h = R.log.header, c = h.config || {}, end = R.log.episodeEnd;
   const g = gridDims();
   const payoff = c.payoff === 'mixed' ? `mixed (α = ${c.mixed_alpha})` : (c.payoff ?? '–');
+  const v4 = R.built.v4;
   const rows = [
     ['Episode', esc(h.episode_id ?? '–')],
     R.built.task.kind === 'open'
       ? ['Task', `open-ended${c.reference_design ? ` <span class="muted">(reference design: ${esc(c.reference_design)})</span>` : ''}<div style="margin-top:3px;padding:6px 8px;border-radius:6px;background:var(--panel-2);border:1px solid var(--border);white-space:pre-wrap">${esc(R.built.task.brief || '(no brief in log)')}</div>`]
       : ['Blueprint', `${esc(R.built.task.blueprint.name ?? c.blueprint ?? '–')} <span class="muted">(${R.built.task.blueprint.cells.length} cells)</span>`],
-    ['Scarcity', esc(c.scarcity ?? '–')],
-    ['Payoff', esc(payoff) + (c.extra_penalty != null ? ` <span class="muted">· extra penalty ${c.extra_penalty}</span>` : '')],
+    ...(v4 ? [
+      ['Shop', `${R.built.shop.pos ? `at (${R.built.shop.pos.join(', ')}) · ` : ''}${R.built.shop.catalog.length} items · starting money <b>${fmt(R.built.shop.startingMoney)}</b> coins (shared wallet)`],
+      ['Incentive', c.incentive === 'none' ? 'none' : `competitive: the top ${deployTopK(h)} by blocks still standing are deployed (ties at the boundary too)${c.show_leaderboard ? ' · agents see the leaderboard' : ''}`],
+    ] : [
+      ['Scarcity', esc(c.scarcity ?? '–')],
+      ['Payoff', esc(payoff) + (c.extra_penalty != null ? ` <span class="muted">· extra penalty ${c.extra_penalty}</span>` : '')],
+    ]),
     ['Agents', `<div class="chips">${R.built.agents.map(agentTag).join(' ')}</div>`],
     ['World', `${g.width}×${g.depth}×${g.height} · ${R.log.events.length} events · ${fmtT(R.tEnd)}${h.clock ? ` <span class="muted">(${esc(h.clock)} clock)</span>` : ''}`],
   ];
@@ -722,13 +803,14 @@ function renderInfo() {
   if (c.action_cooldown_s) lim.push(`cooldown ${c.action_cooldown_s} s`);
   if (c.walk_speed != null) lim.push(`walk ${c.walk_speed} blocks/s · reach ${c.reach} · view ${c.view_radius}`);
   if (lim.length) rows.push(['Limits', lim.join(' · ')]);
-  if (end) rows.push(['Ended', `${esc(end.reason)} at ${fmtT(end.t)} · team score ${fmt(end.team_score)}`]);
+  if (end && v4) { const fr = finalResults(R.log); rows.push(['Ended', `${esc(end.reason)} at ${fmtT(end.t)} · deployed: ${fr.deployed.length ? fr.deployed.map(agentTag).join(' ') : '<span class="muted">nobody</span>'}`]); }
+  else if (end) rows.push(['Ended', `${esc(end.reason)} at ${fmtT(end.t)} · team score ${fmt(end.team_score)}`]);
   else if (F.active) rows.push(['Ended', '<span style="color:var(--danger)">not yet — following live</span>']);
   else rows.push(['Ended', '<span class="warnbox">no episode_end record (incomplete log?)</span>']);
   const B = R.built, m = B.mismatches;
   let check;
-  if (m.length) check = `<span class="warnbox">${m.length} snapshot${m.length > 1 ? 's' : ''} disagree with the replayed events (engine bug?). First at t = ${fmtT(m[0].t)}: ${esc(m[0].problems.slice(0, 3).join('; '))}</span>`;
-  else if (B.snapshotCount) check = `<span class="okbox">replay matches all ${B.verified} snapshot${B.verified === 1 ? '' : 's'}</span>`;
+  if (m.length) check = `<span class="warnbox">${m.length} snapshot${m.length > 1 ? 's' : ''} disagree with the replayed events (engine bug?). First at t = ${fmtT(m[0].t)}${m[0].seq === 'end' ? ' (episode_end)' : ''}: ${esc(m[0].problems.slice(0, 3).join('; '))}</span>`;
+  else if (B.snapshotCount) check = `<span class="okbox">replay matches all ${B.verified} snapshot${B.verified === 1 ? '' : 's'}${B.endChecked ? ' and episode_end' : ''}</span>`;
   else check = '<span class="muted">no snapshots in log</span>';
   rows.push(['Replay check', check]);
   if (R.log.warnings.length) rows.push(['Warnings', `<span class="warnbox">${esc(R.log.warnings.slice(0, 3).join(' '))}</span>`]);
@@ -751,7 +833,43 @@ function fmtDetail(v) {
   return esc(typeof v === 'number' ? fmt(v) : String(v));
 }
 
+/** [v4] leaderboard (blocks placed still standing) + deployed badges at the end + house analysis. */
+function renderLeaderboard() {
+  const st = R.built.states[R.pos], s = st.stats, N = R.log.events.length;
+  const lb = leaderboard(st, R.built.agents);
+  const maxA = Math.max(1, ...lb.map(r => r.score));
+  const atEnd = R.pos === N && !!R.log.episodeEnd;
+  const fr = atEnd ? finalResults(R.log) : null;
+  const dep = fr ? new Set(fr.deployed) : null;
+  const k = deployTopK(R.log.header);
+  let html = `<div class="muted" style="font-size:11px;margin-bottom:4px">Blocks each agent placed that are still in the world${k ? ` · top ${k} get deployed` : ''}</div>`;
+  for (const r of lb) {
+    const badge = dep ? (dep.has(r.agent) ? '<span class="deployed">deployed</span>' : '<span class="notdeployed">not deployed</span>') : '';
+    html += `<div class="lbrow"><span class="rk">#${r.rank}</span><span>${agentTag(r.agent)}</span><div class="bar"><i style="width:${r.score / maxA * 100}%;background:${agentColor(r.agent)}"></i></div><span class="n">${r.score}</span></div>${badge ? `<div style="margin:-2px 0 3px 28px">${badge}</div>` : ''}`;
+  }
+  if (fr && fr.source === 'episode_end') html += `<div class="muted" style="font-size:11px;margin-top:3px">Final ranking from episode_end (${esc(R.log.episodeEnd.reason)}).</div>`;
+  if (s.kind === 'open') {
+    const tick = (ok, label) => `<span class="chip" style="${ok ? 'outline:1.5px solid var(--ok)' : 'opacity:.6'}">${ok ? '✓' : '✗'} ${label}</span>`;
+    html += `<div class="analysis"><div class="t">House analysis · not shown to agents</div>
+      <div class="chips" style="margin-bottom:4px">${tick(s.enclosed, 'enclosed')} ${tick(s.doors >= 1, `door${s.doors === 1 ? '' : 's'} ${s.doors}`)} ${tick(s.windows >= 1, `window${s.windows === 1 ? '' : 's'} ${s.windows}`)}</div>
+      <div class="muted">interior air <b>${s.interiorCells}</b> cells · shell blocks <b>${s.shellCells}</b> · leftovers <b style="color:${s.leftovers ? FLAG_EXTRA : 'inherit'}">${s.leftovers}</b></div></div>`;
+  }
+  const last = lastSnapshotUpTo(R.pos);
+  if (last) {
+    const sn = last.snap, det = sn.analysis || {};
+    const rows = [['wallet', sn.wallet], ...Object.keys(sn.individual_scores || {}).map(a => [a, sn.individual_scores[a]]), ...Object.keys(det).map(k2 => [k2, det[k2]])]
+      .map(([k2, v]) => `<div class="k">${esc(k2)}</div><div>${fmtDetail(v)}</div>`).join('');
+    html += `<details style="margin-top:6px"><summary class="muted" style="cursor:pointer;font-size:12px">Engine snapshot at t = ${fmtT(sn.t)}${last.pos === R.pos ? ' (this event)' : ''}</summary>
+      <div class="kv" style="font-size:12px;margin-top:4px">${rows}</div></details>`;
+  }
+  const open = $('scores').querySelector('details')?.open;
+  $('scores').innerHTML = html;
+  if (open && $('scores').querySelector('details')) $('scores').querySelector('details').open = true;
+  $('scoreNote').innerHTML = '';
+}
+
 function renderScores() {
+  if (R.built.v4) return renderLeaderboard();
   const s = R.built.states[R.pos].stats;
   const maxA = Math.max(1, ...Object.values(s.perAgent));
   let html;
@@ -794,7 +912,24 @@ function renderScores() {
   $('scoreNote').innerHTML = snap && typeof snap.team_score === 'number' ? `<span class="muted">engine logged ${fmt(snap.team_score)} here</span>` : '';
 }
 
+/** [v4] shared wallet: balance vs starting money + the latest purchases up to here. */
+function renderWallet() {
+  const st = R.built.states[R.pos], start = R.built.shop.startingMoney ?? R.built.states[0].wallet ?? 0;
+  const bal = st.wallet ?? 0, pct = start ? Math.max(0, Math.min(1, bal / start)) : 0;
+  const buys = [];
+  let spent = 0, nBuys = 0;
+  for (let i = 0; i < R.pos; i++) { const b = purchaseOf(R.log.events[i]); if (b && b.ok) { spent += b.cost; nBuys++; } }
+  for (let i = R.pos - 1; i >= 0 && buys.length < 5; i--) { const b = purchaseOf(R.log.events[i]); if (b) buys.push({ ...b, i, t: R.log.events[i].t }); }
+  $('chest').innerHTML = `<div class="wallet"><div style="display:flex;align-items:baseline;gap:8px"><span class="big">${bal}</span><span class="muted">of ${start} coins left</span>
+      <span class="muted" style="margin-left:auto">spent ${spent} in ${nBuys} purchase${nBuys === 1 ? '' : 's'}</span></div>
+    <div class="bar" style="margin:4px 0 6px"><i style="width:${pct * 100}%;background:${pct > 0.25 ? '#e0a800' : 'var(--danger)'}"></i></div>
+    ${buys.length ? buys.map(b => `<div class="buyrow" style="${b.ok ? '' : 'opacity:.55'}"><span class="muted" style="min-width:44px">${b.t.toFixed(1)} s</span>${agentTag(b.agent)}
+      <span><span class="sw" style="background:${typeColor(b.item)}"></span>${b.n} × ${esc(b.item)}</span><span class="c">${b.ok ? '−' + b.cost : 'failed'}</span></div>`).join('')
+      : '<div class="muted" style="font-size:12px">no purchases yet</div>'}</div>`;
+}
+
 function renderChest() {
+  if (R.built.v4) return renderWallet();
   const st = R.built.states[R.pos], init = R.log.header.chest || {};
   const types = [...new Set([...(R.log.header.block_types || []), ...Object.keys(init), ...Object.keys(st.chest)])]
     .filter(t => (init[t] || 0) > 0 || (st.chest[t] || 0) !== 0);
@@ -830,7 +965,7 @@ function renderInvs() {
 
 function buildFeedFilter() {
   const sel = $('feedFilter');
-  sel.innerHTML = `<option value="all">all events</option><option value="chat">chat only</option><option value="fail">failed only</option><option value="grid">block changes</option>` +
+  sel.innerHTML = `<option value="all">all events</option><option value="chat">chat only</option><option value="fail">failed only</option><option value="grid">block changes</option>${R.built.v4 ? '<option value="buy">purchases</option>' : ''}` +
     R.built.agents.map(a => `<option value="agent:${esc(a)}">only ${esc(a)}</option>`).join('');
   sel.value = 'all'; R.filter = 'all';
 }
@@ -857,6 +992,7 @@ function appendFeed(from) {
     } else if (e.tool === 'note' && e.args.text != null) {
       body += `<div class="note">“${esc(e.args.text)}”</div>`;
     }
+    if (e.tool === 'buy' && e.ok) { const b = purchaseOf(e); el.classList.add('buy'); body = `<span class="who">${esc(e.agent)}</span> buys <span class="sw" style="background:${typeColor(b.item)}"></span><b>${b.n} × ${esc(b.item)}</b> <span style="color:var(--warn)">(−${b.cost})</span>`; }
     if (!e.ok) body += `<span class="badge bad">failed</span><div class="err">${esc(e.message)}</div>`;
     if (e.ok && e.tool === 'remove') { const b = e.diff.grid[0] && e.diff.grid[0].before; if (b && b.placed_by && b.placed_by !== e.agent) body += `<span class="badge bad">other's block</span>`; }
     el.innerHTML = `<div class="meta">t = ${e.t.toFixed(2)} s · #${e.event_id ?? i}${e.cost ? ' · ' + esc(e.cost) : ''}</div>${body}`;
@@ -872,6 +1008,7 @@ function passesFilter(e) {
   if (f === 'chat') return !!e.chat;
   if (f === 'fail') return !e.ok;
   if (f === 'grid') return e.diff.grid.length > 0;
+  if (f === 'buy') return e.tool === 'buy';
   if (f.startsWith('agent:')) return e.agent === f.slice(6);
   return true;
 }
@@ -911,11 +1048,19 @@ function renderCaption() {
 function renderLegend() {
   let items;
   if (R.colorMode === 'agent') items = R.built.agents.map(a => `<span><span class="sw" style="background:${agentColor(a)}"></span>${esc(a)}</span>`);
-  else {
+  else if (R.built.v4) {
+    // only the items currently in the world, most used first
+    const cnt = new Map();
+    for (const b of R.built.states[R.pos < 0 ? 0 : R.pos].grid.values()) cnt.set(b.type, (cnt.get(b.type) || 0) + 1);
+    const types = [...cnt.entries()].sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(b[0]));
+    items = types.map(([t, n]) => { const it = itemInfo(t); return `<span title="${esc(it.name)}${it.price != null ? ` · ${it.price} coins` : ''}"><span class="sw" style="background:${typeColor(t)};${it.transparent ? 'opacity:.5' : ''}${it.door ? ';border:2px solid #2a1a0c' : ''}"></span>${esc(t)} <span class="muted">${n}</span></span>`; });
+    if (!items.length) items = ['<span class="muted">no blocks placed yet</span>'];
+  } else {
     const types = [...new Set([...(R.log.header.block_types || []), ...(R.built.task.blueprint ? R.built.task.blueprint.cells.map(c => c[3]) : [])])];
     items = types.map(t => `<span><span class="sw" style="background:${typeColor(t)};${t === 'glass' ? 'opacity:.6' : ''}"></span>${esc(t)}</span>`);
   }
-  $('legendItems').innerHTML = items.join('');
+  const html = items.join('');
+  if (html !== R.legendItemsHtml) { $('legendItems').innerHTML = html; R.legendItemsHtml = html; }
   const flags = [];
   const isOpen = R.built.task.kind === 'open';
   if (R.showGhost) flags.push(isOpen ? `<span><span class="sw" style="background:#ffc83d66"></span>interior air</span>`
@@ -923,8 +1068,10 @@ function renderLegend() {
   if (R.showFlags) flags.push(...(isOpen ? [`<span><span class="sw outline" style="border-color:${FLAG_EXTRA}"></span>leftover (not in shell)</span>`]
     : [`<span><span class="sw outline" style="border-color:${FLAG_WRONG}"></span>wrong type</span>`, `<span><span class="sw outline" style="border-color:${FLAG_EXTRA}"></span>extra (outside blueprint)</span>`]));
   if (R.showHL) flags.push(`<span><span class="sw outline" style="border-color:${HL_PLACE}"></span>placed now</span>`, `<span><span class="sw outline" style="border-color:${HL_REMOVE}"></span>removed now</span>`, `<span><span class="sw outline" style="border-color:${HL_FAIL}"></span>failed target</span>`);
-  if (R.log.header.chest_pos || (R.log.header.config || {}).chest_pos) flags.push(`<span><span class="sw" style="background:#8a5a2b;border-color:#d4a63a"></span>chest</span>`);
-  $('legendFlags').innerHTML = flags.join('');
+  if (R.built.v4 && R.built.shop.pos) flags.push(`<span><span class="sw" style="background:repeating-linear-gradient(90deg,#d1495b 0 3px,#f4f1ea 3px 6px)"></span>shop</span>`);
+  else if (R.log.header.chest_pos || (R.log.header.config || {}).chest_pos) flags.push(`<span><span class="sw" style="background:#8a5a2b;border-color:#d4a63a"></span>chest</span>`);
+  const fh = flags.join('');
+  if (fh !== R.legendFlagsHtml) { $('legendFlags').innerHTML = fh; R.legendFlagsHtml = fh; }
 }
 
 // ---------- activity strip (one lane per agent, ticks at event times; doubles as the scrubber) ----------
@@ -982,6 +1129,7 @@ function drawStrip() {
       g.beginPath(); g.moveTo(x, cy - r); g.lineTo(x + r, cy); g.lineTo(x, cy + r); g.lineTo(x - r, cy); g.closePath();
       if (e.chat.channel === 'private') { g.strokeStyle = agentColor(e.agent); g.lineWidth = 1.2; g.stroke(); } else g.fill();
     } else {
+      if (e.tool === 'buy' && e.ok) { g.fillStyle = '#e0a800'; g.fillRect(x - 2, y + lane / 2 - 2, 4, 4); return; }
       const full = e.diff.grid.length > 0 || !e.ok && e.tool === 'place';
       const hh = full ? lane - 2 : Math.max(2, (lane - 2) / 2);
       g.fillRect(x - 0.75, y + 1 + (lane - 2 - hh) / 2, 1.5, hh);
@@ -1229,10 +1377,12 @@ renderer.domElement.addEventListener('pointermove', ev => {
   if (!b) { tip.style.display = 'none'; return; }
   const S = R.built.states[R.pos].stats;
   const status = S.kind === 'open'
-    ? (!S.enclosed ? '<span class="muted">nothing enclosed yet</span>' : S.leftoverSet.has(k) ? `<span style="color:${FLAG_EXTRA}">leftover — not part of the shell</span>` : '<span style="color:var(--ok)">part of the shell</span>')
+    ? (!S.enclosed ? `<span class="muted">nothing enclosed yet${S.v4 ? ' (analysis)' : ''}</span>` : S.leftoverSet.has(k) ? `<span style="color:${FLAG_EXTRA}">leftover — not part of the shell</span>` : '<span style="color:var(--ok)">part of the shell</span>')
     : want === undefined ? `<span style="color:${FLAG_EXTRA}">extra — not in blueprint</span>`
     : want === b.type ? '<span style="color:var(--ok)">correct</span>' : `<span style="color:${FLAG_WRONG}">wrong type — blueprint wants ${esc(want)}</span>`;
-  tip.innerHTML = `<b>${esc(b.type)}</b> at (${k.replace(/,/g, ', ')})<br>placed by ${agentTag(b.placed_by)} at t = ${typeof b.placed_at === 'number' ? b.placed_at.toFixed(1) + ' s' : '?'}<br>${status}<br><span class="muted">double-click: jump to its placement</span>`;
+  const it = itemInfo(b.type);
+  const props = R.built.v4 ? ` <span class="muted">${esc(it.name)}${it.price != null ? ` · ${it.price} coins` : ''}${it.transparent ? ' · transparent' : ''}${it.door ? ' · door' : ''}</span>` : '';
+  tip.innerHTML = `<b>${esc(b.type)}</b>${props} at (${k.replace(/,/g, ', ')})<br>placed by ${agentTag(b.placed_by)} at t = ${typeof b.placed_at === 'number' ? b.placed_at.toFixed(1) + ' s' : '?'}<br>${status}<br><span class="muted">double-click: jump to its placement</span>`;
   const sr = stage.getBoundingClientRect();
   tip.style.display = 'block';
   tip.style.left = Math.min(ev.clientX - sr.left + 14, sr.width - 290) + 'px';

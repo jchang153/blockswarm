@@ -1,0 +1,42 @@
+{
+  "comment": "Pilot batch 2 (v4: shop, shared wallet, competitive incentive): copy of pilot1-haiku55.json with the v4 world keys (scarcity/payoff/chest_pos dropped, shop_pos [12,4,0]). Prices from openrouter.ai/api/v1/models on 2026-10-27.",
+  "episode_id": "pilot2-haiku55",
+  "n_agents": 5,
+  "model": "anthropic/claude-haiku-5.5",
+  "budget_usd": 20.0,
+  "task": "open",
+  "max_seconds": 1800,
+  "max_actions_per_agent": 1000,
+  "width": 24,
+  "depth": 24,
+  "height": 10,
+  "shop_pos": [
+    12,
+    4,
+    0
+  ],
+  "seed": 0,
+  "llm": {
+    "max_tokens": 2048,
+    "temperature": null,
+    "reasoning": null,
+    "provider": {
+      "require_parameters": true,
+      "data_collection": "deny"
+    },
+    "history_steps": 6,
+    "history_chunk": 1,
+    "max_model_calls_per_agent": 1000,
+    "max_consecutive_errors": 3,
+    "prices": {
+      "anthropic/claude-haiku-5.5": {
+        "input_per_m": 0.1,
+        "output_per_m": 0.5
+      }
+    }
+  },
+  "client": {
+    "timeout_s": 120,
+    "max_retries": 4
+  }
+}
