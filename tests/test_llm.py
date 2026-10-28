@@ -175,6 +175,10 @@ class TestBudget(unittest.TestCase):
         r = b.reserve(0.01)
         b.commit(r, 0.02)
         self.assertEqual(b.overruns, 1)
+        self.assertFalse(b.exhausted)  # an overrun is logged but doesn't stop the run
+        self.assertAlmostEqual(b.spent, 0.02)
+        r = b.reserve(0.5)
+        b.commit(r, 0.99)               # overrun that reaches the limit does stop it
         self.assertTrue(b.exhausted)
         b2 = Budget(1.0)
         r = b2.reserve(0.3)

@@ -9,8 +9,9 @@ with prices in USD per 1M tokens from the run config. After the attempt the rese
 settled with the provider-reported cost (`usage.cost`) when there is one; otherwise with a
 token-based cost if tokens are known, otherwise the full reservation is kept (outcome
 "maybe_billed": timeouts, 5xx), or released (outcome "not_billed": 4xx/429, refused
-connection). An actual cost above its reservation is recorded as an overrun and exhausts
-the budget for further calls.
+connection). An actual cost above its reservation is recorded as an overrun; it doesn't stop
+the run by itself, so total spend can exceed the limit by at most the overruns of calls that
+were already in flight when the limit was reached.
 
 The ledger (one JSON object per line) has a row for every reserve / refuse / commit. It
 contains no request content and no secrets.
@@ -156,12 +157,11 @@ class Budget:
             if uncertain:
                 self.uncertain_usd += charged
             self._spent += charged
+            # A call can cost more than its estimate (e.g. routed to a pricier provider). That is
+            # logged but doesn't stop the run; the hard cap below and in reserve() still applies.
             overrun = charged > r["amount"] + 1e-9
             if overrun:
                 self.overruns += 1
-                self._exhausted = True
-                self._exhausted_reason = self._exhausted_reason or (
-                    f"actual cost ${charged:.6f} exceeded its reservation ${r['amount']:.6f}")
             if self._spent >= self.limit_usd and not self._exhausted:
                 self._exhausted = True
                 self._exhausted_reason = f"spent ${self._spent:.6f} of ${self.limit_usd:.2f}"
