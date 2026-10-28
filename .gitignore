@@ -8,3 +8,4 @@ runs/
 site/
 site_data/
 dist/
+*.local.md
