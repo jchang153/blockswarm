@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from blockswarm.catalog import catalog_json
 
-PROMPT_VERSION = "v4"
+PROMPT_VERSION = "v4.1"
 
 
 def _cfg(header: dict) -> dict:
@@ -231,13 +231,19 @@ def system_prompt(world_header: dict, agent_id: str) -> str:
         + (". For give, the target is the other agent's body (either of its two cells)." if n > 1 else "."))
 
     P.append("\n## Shop, wallet and inventory")
-    wallet = ("The team has one shared wallet: a single balance used by every agent's purchases. "
-              if n > 1 else "You have a wallet. ")
+    wallet = ("Shared budget: the team has one wallet, and it is the only money there is. No agent has "
+              "money of its own; every agent's purchases are paid from this same balance, so coins one "
+              "agent spends are no longer available to any other agent. "
+              if n > 1 else "You have a wallet; it is the only money there is. ")
     P.append(
-        f"{wallet}It starts with {money} coins; the current balance is in every observation. "
+        f"{wallet}It starts with {money} coins and is never topped up; the current balance is in every "
+        "observation. "
         "buy(item, n) buys n blocks of one item: the shop must be within reach, you must not be walking, "
         "the wallet must hold price x n, and your inventory must have room. The coins leave the wallet "
-        "and the blocks go to your inventory. Stock is unlimited. Nothing can be sold back. "
+        "and the blocks go to your inventory. Stock is unlimited. "
+        "No refunds: blocks cannot be sold or returned to the shop, and coins once spent never come back, "
+        "even if the blocks are later removed, given away or never placed. A removed block goes into the "
+        "inventory of whoever removed it, not back to the shop. "
         f"Your inventory holds at most {cap} blocks in total."
         + (" Other agents cannot see your inventory, and you cannot see theirs. Nobody is shown who "
            "bought what. give moves blocks from your inventory to a teammate's within reach, if they "
@@ -357,7 +363,7 @@ def tool_schemas(world_header: dict, agent_id: str | None = None) -> list[dict]:
         _fn("buy", f"Buy n blocks of one item from the shop into your inventory, paid from the "
             f"{'shared ' if not solo else ''}wallet (price x n coins). The shop must be within reach "
             f"({reach} from your eyes{los}); the wallet must hold enough and your inventory must have "
-            f"room (at most {cap} blocks). Action. {walking}",
+            f"room (at most {cap} blocks). No refunds: spent coins never come back. Action. {walking}",
             {"item": item, "n": count}, ["item", "n"]),
         _fn("give", f"Move n blocks of an item from your inventory to another agent's inventory. The agent "
             f"must be within reach ({reach} from your eyes{los}) and have room. Action. {walking}",

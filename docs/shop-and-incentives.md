@@ -23,7 +23,9 @@ Decided 2026-10-27 by the researcher. Replaces the chest, the house grader and t
 - **Shared wallet:** one collective balance for the whole team, `starting_money` (default 100 × N
   coins). Every agent always sees the current balance and the full price list. Who bought what is not
   shown to agents (it's logged).
-- No selling, no take/deposit. `give` stays. `remove` still puts the block in the remover's inventory.
+- **Shared budget, no refunds (stated explicitly to agents):** the wallet is the only money; no agent
+  has money of its own, and it is never topped up. Nothing can be sold or returned; spent coins never
+  come back, even if the blocks are removed, given away or never placed. No take/deposit. `give` stays. `remove` still puts the block in the remover's inventory.
 - Inventory cap stays a config setting (default 12 blocks).
 
 ## 3. Block properties (from the catalog)

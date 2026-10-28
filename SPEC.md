@@ -61,7 +61,12 @@ Research questions (v1):
 - **Shared wallet:** one balance for the whole team, `starting_money` (default `100 × N`
   coins). Every agent always sees the current balance and the full price list. Who bought
   what is not shown to agents (it is logged).
-- No selling and no returning blocks. `give` moves blocks between agents.
+- **No refunds.** Blocks can't be sold or returned to the shop, and spent coins never come back,
+  even if the blocks are later removed, given away or never placed (a removed block goes to the
+  remover's inventory). The wallet is never topped up. `give` moves blocks between agents.
+- Both rules are stated explicitly in the system prompt ("Shared budget: ... No agent has money of
+  its own ..." and "No refunds: ...") and repeated in the `buy` tool description and on the wallet
+  line of every observation.
 
 ## 4. Agents (embodied)
 

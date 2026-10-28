@@ -109,7 +109,7 @@ class ObservationTests(unittest.TestCase):
         self.assertIn("placed by agent_2 since then", changes)
         self.assertIn("agent_2 (to all): hello team", second)
         self.assertIn("Inventory (1/12): oak_planks 1", second)
-        self.assertIn("Wallet (shared by the team): 290 coins", second)
+        self.assertIn("Wallet (shared by the whole team; no refunds): 290 coins", second)
         seen = second.split("BLOCKS YOU CAN SEE NOW")[1].split("CHANGES IN VIEW")[0]
         self.assertIn("[agent_2] (13, 3, 0) glass", seen)
         self.assertIn("[you] (11, 3..4, 0) oak_planks x2", seen)
@@ -173,7 +173,7 @@ class ObservationTests(unittest.TestCase):
 
     def test_wallet_and_shop(self):
         near = render_observation(make_view(wallet=287), ObservationMemory("agent_1"))
-        self.assertIn("Wallet (shared by the team): 287 coins", near)
+        self.assertIn("Wallet (shared by the whole team; no refunds): 287 coins", near)
         self.assertIn("Shop at (12, 4, 0), offset (+0, +2, +0)", near)
         self.assertIn("; within reach", near)
         self.assertNotIn("chest", near.lower())
@@ -186,7 +186,7 @@ class ObservationTests(unittest.TestCase):
         v = make_view(n=1, wallet=55)
         v["shop"] = {"pos": v.pop("shop_pos")}
         solo = render_observation(v, ObservationMemory("agent_1"))
-        self.assertIn("Wallet (yours): 55 coins", solo)
+        self.assertIn("Wallet (yours; no refunds): 55 coins", solo)
         self.assertIn("Shop at (12, 4, 0)", solo)
 
     def test_map_legend_many_items(self):
@@ -359,6 +359,21 @@ class PromptTests(unittest.TestCase):
         self.assertIn("doors: oak_door, spruce_door, iron_door", sp)
         self.assertIn("walk through and stand in a door cell", sp)
 
+    def test_shared_budget_and_no_refunds_are_explicit(self):
+        sp = system_prompt(make_header(5), "agent_1")
+        self.assertIn("Shared budget: the team has one wallet, and it is the only money there is.", sp)
+        self.assertIn("No agent has money of its own", sp)
+        self.assertIn("never topped up", sp)
+        self.assertIn("No refunds: blocks cannot be sold or returned to the shop, and coins once spent "
+                      "never come back", sp)
+        buy = next(t for t in tool_schemas(make_header(5), agent_id="agent_1")
+                   if t["function"]["name"] == "buy")
+        self.assertIn("shared wallet", buy["function"]["description"])
+        self.assertIn("No refunds", buy["function"]["description"])
+        solo = system_prompt(make_header(1), "agent_1")
+        self.assertIn("No refunds", solo)
+        self.assertNotIn("Shared budget", solo)
+
     def test_competitive_text(self):
         h = make_header(5)
         sp = self.check_prompt(h, "agent_1")
@@ -408,7 +423,7 @@ class PromptTests(unittest.TestCase):
         sp = self.check_prompt(h, "agent_2")
         self.assertIn("one of 2 agents", sp)
         self.assertIn("Your teammates are: agent_1.", sp)
-        self.assertIn("one shared wallet", sp)
+        self.assertIn("Shared budget: the team has one wallet", sp)
         text = render_observation(make_view("agent_2", n=2), ObservationMemory("agent_2"))
         self.assertIn("TEAMMATES (1)", text)
 

@@ -233,7 +233,8 @@ def render_observation(view: dict, memory: ObservationMemory) -> str:
 
     # ---- wallet and shop
     if view.get("wallet") is not None:
-        out.append(f"Wallet ({'shared by the team' if len(agents) > 1 else 'yours'}): {view['wallet']} coins")
+        out.append(f"Wallet ({'shared by the whole team' if len(agents) > 1 else 'yours'}; no refunds): "
+                   f"{view['wallet']} coins")
     spos = shop_pos(view)
     sdist = math.dist(eye, (spos[0] + 0.5, spos[1] + 0.5, spos[2] + 0.5))
     reach_txt = {True: "within reach", False: "not within reach"}.get(view.get("shop_in_reach"), "")
