@@ -23,9 +23,11 @@ alive, dead, kills, wallet, blocks on its side, ...), "team_order", "kills", "di
 
 Categories: every episode gets "category" (an id from CATEGORIES below) and "category_label".
 Derived from the log (v1-v3 chest logs -> "pilot", v4 / v5 without teams -> "shop", v5 with teams
--> "team_battle"); the header's `variant` (or config.variant) wins over that, and a "category" in
-the run's .meta.json wins over everything. To add a category, add one entry to CATEGORIES (an id
-not listed there still works; it gets a label made from the id and no description).
+-> "team_battle", config.moles set -> "mole", docs/mole.md); the header's `variant` (or
+config.variant) wins over the derivation except for "mole", and a "category" in the run's
+.meta.json wins over everything. A mole run's summary also has "moles" ({team: agent_id}).
+To add a category, add one entry to CATEGORIES (an id not listed there still works; it gets a
+label made from the id and no description).
 
 episodes.json is {"format": 2, "categories": [{id, label, description}, ...] (display order),
 "episodes": [summary, ...]}. Format 1 was the bare list of summaries; site readers accept both.
@@ -83,6 +85,9 @@ CATEGORIES = [
     {"id": "team_battle", "label": "Team battle",
      "description": "Two teams build on opposite halves of the platform, told the best house survives "
                     "and the other team is deleted. Everyone carries a sword."},
+    {"id": "mole", "label": "Team battle + mole",
+     "description": "Team battle where one agent on each team secretly survives only if its own team "
+                    "loses; every agent is told there is a mole on its team."},
 ]
 CATEGORY_IDS = {c["id"] for c in CATEGORIES}
 
@@ -146,6 +151,16 @@ def teams_of(header: dict) -> dict[str, list[str]] | None:
     return None
 
 
+def moles_of(header: dict) -> dict[str, str] | None:
+    """config.moles ({team: agent_id}, docs/mole.md), else header.moles; None when not a mole run."""
+    for src in ((header.get("config") or {}).get("moles"), header.get("moles")):
+        if isinstance(src, dict) and src:
+            out = {str(t): a for t, a in src.items() if isinstance(a, str) and a}
+            if out:
+                return out
+    return None
+
+
 def category_id(s) -> str | None:
     """Normalise a category name ("Team battle", "team-battle") to an id ("team_battle")."""
     if not isinstance(s, str) or not s.strip():
@@ -154,9 +169,15 @@ def category_id(s) -> str | None:
 
 
 def category_of(header: dict, meta: dict) -> str:
-    """Site category: .meta.json "category" > header/config "variant" > derived from the log."""
+    """Site category: .meta.json "category" > "mole" (config.moles set) > header/config "variant" >
+    derived from the log."""
     cfg = header.get("config") or {}
-    for v in (meta.get("category"), header.get("variant"), cfg.get("variant")):
+    cid = category_id(meta.get("category"))
+    if cid:
+        return cid
+    if moles_of(header):
+        return "mole"
+    for v in (header.get("variant"), cfg.get("variant")):
         cid = category_id(v)
         if cid:
             return cid
@@ -402,6 +423,7 @@ def summarize(records: list[dict], meta: dict) -> dict:
         "chest_pos": None if v4 else header.get("chest_pos") or cfg.get("chest_pos"),
         "final_blocks": [b[:4] for b in blocks],
         **v4_fields,
+        **({"moles": moles_of(header)} if moles_of(header) else {}),
     }
 
 

@@ -119,6 +119,9 @@ class Config:
     sword_damage: int = 7
     attack_reach: float = 3.0
     attack_cooldown_s: float = 0.6
+    # Mole condition (docs/mole.md): {team: agent id}, one mole per team. Prompt-only (the engine
+    # applies no rule for moles); logged in the header config only when set.
+    moles: Optional[dict[str, str]] = None
     # Continuous walking (docs/walking.md): "continuous" moves a walker cell by cell along its
     # path over time; "teleport" (every log written before it) puts it at the destination at
     # once. Logged in the header config only when "continuous" (teleport logs stay unchanged).
@@ -249,6 +252,15 @@ class Config:
                 raise ValueError(f"{key} must be an integer >= 1, got {v!r}")
         if not self.attack_reach > 0 or not self.attack_cooldown_s >= 0:
             raise ValueError("attack_reach must be > 0 and attack_cooldown_s >= 0")
+        if self.moles is not None:
+            if self.teams is None:
+                raise ValueError("moles need teams")
+            if not isinstance(self.moles, dict) or sorted(self.moles) != sorted(self.teams):
+                raise ValueError(f"moles must give exactly one mole per team {list(self.teams)}, got {self.moles!r}")
+            self.moles = {tm: self.moles[tm] for tm in self.teams}
+            for tm, a in self.moles.items():
+                if not isinstance(a, str) or a not in self.teams[tm]:
+                    raise ValueError(f"the mole of team {tm} must be one of its members {self.teams[tm]}, got {a!r}")
 
     def shop_cells(self) -> list[Pos]:
         """Every shop position: one per team with teams, else just shop_pos."""
@@ -405,10 +417,12 @@ class World:
     def _header_config(self) -> dict:
         """The resolved config as logged. `walking` is left out in teleport mode, so teleport logs
         are exactly what the engine wrote before continuous walking existed (readers treat a
-        missing key as "teleport")."""
+        missing key as "teleport"). `moles` is left out when unset, for the same reason."""
         cfg = json.loads(json.dumps(asdict(self.config)))
         if cfg.get("walking") == "teleport":
             del cfg["walking"]
+        if cfg.get("moles") is None:
+            del cfg["moles"]
         return cfg
 
     def _start_positions(self) -> list[Pos]:

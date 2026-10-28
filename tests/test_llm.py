@@ -498,6 +498,34 @@ class TestTeamConfig(unittest.TestCase):
                         self.assertEqual(rc["world_kwargs"]["walking"], "continuous")
 
 
+    def test_shipped_mole_configs(self):
+        """configs/mole-vsN-*.json = configs/vsN-*.json plus `moles` (docs/mole.md section 4)."""
+        root = Path(__file__).resolve().parents[1] / "configs"
+        files = sorted(root.glob("mole-vs*.json"))
+        self.assertEqual(len(files), 6)
+
+        def boom(*a, **k):
+            raise AssertionError("network used in dry run")
+
+        for f in files:
+            with self.subTest(name=f.stem):
+                raw = json.loads(f.read_text())
+                vs = json.loads((root / f"{f.stem[5:]}.json").read_text())
+                self.assertEqual(raw["episode_id"], f.stem)
+                strip = lambda c: {k: v for k, v in c.items() if k not in ("comment", "episode_id", "moles")}  # noqa: E731
+                self.assertEqual(strip(raw), strip(vs))
+                self.assertEqual(sorted(raw["moles"]), sorted(raw["teams"]))
+                for team, mole in raw["moles"].items():
+                    self.assertIn(mole, raw["teams"][team])
+                rc = resolve_config(raw)
+                self.assertEqual(rc["world_cfg"].moles, raw["moles"])
+                with mock.patch.object(urllib.request, "urlopen", boom), \
+                        mock.patch.object(socket, "create_connection", boom), \
+                        mock.patch.object(socket.socket, "connect", boom):
+                    res = run_episode(f, dry_run=True, quiet=True, env={"OPENROUTER_API_KEY": FAKE_KEY})
+                self.assertTrue(res["ok"])
+
+
 class TestRunner(unittest.TestCase):
     def check_episode(self, run_dir: Path, n: int) -> list[dict]:
         recs = read_log(run_dir)

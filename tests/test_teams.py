@@ -90,6 +90,28 @@ class TestTeamConfig(unittest.TestCase):
         # standing on either shop is fine for start positions
         Config(**base, start_positions=[[3, 4, 1], [2, 5, 0], [12, 4, 1], [13, 5, 0]])
 
+    def test_moles(self):
+        """Mole condition (docs/mole.md section 1): one mole per team, a member of it; logged as-is."""
+        base = dict(agents=["r1", "r2", "b1", "b2"], teams=TEAMS, shops=SHOPS, width=16, depth=8, height=6)
+        c = Config(**base, moles={"blue": "b2", "red": "r1"})
+        self.assertEqual(c.moles, {"red": "r1", "blue": "b2"})
+        for bad in ({"red": "b1", "blue": "b2"},                 # mole not on its team
+                    {"red": "r1", "blue": "r2"},                 # two moles on the red team
+                    {"red": ["r1", "r2"], "blue": "b1"},         # two moles on a team (list)
+                    {"red": "r1"},                               # a team without a mole
+                    {"red": "r1", "blue": "b1", "green": "r2"},  # unknown team
+                    {"red": "r1", "green": "b1"},                # unknown team
+                    {"red": "zz", "blue": "b1"}, {}, ["r1", "b1"], "r1"):
+            with self.assertRaises((ValueError, TypeError), msg=str(bad)):
+                Config(**{**base, "moles": bad})
+        with self.assertRaises(ValueError):
+            Config(moles={"red": "agent_1"})  # moles without teams
+        h = World(Config(**base, moles={"red": "r2", "blue": "b1"}), clock=SimClock()).recorder.records[0]
+        self.assertEqual(h["config"]["moles"], {"red": "r2", "blue": "b1"})
+        # without moles the header config has no `moles` key (logs stay as before)
+        self.assertNotIn("moles", team_world().recorder.records[0]["config"])
+        self.assertNotIn("moles", World(Config(), clock=SimClock()).recorder.records[0]["config"])
+
     def test_header(self):
         w = team_world()
         h = w.recorder.records[0]

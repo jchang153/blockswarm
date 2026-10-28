@@ -81,7 +81,7 @@ class CategoryTest(unittest.TestCase):
 
     def test_categories_list(self):
         cats = export_site.categories_for([{"category": "pilot"}, {"category": "night_raid"}])
-        self.assertEqual([c["id"] for c in cats], ["pilot", "shop", "team_battle", "night_raid"])
+        self.assertEqual([c["id"] for c in cats], ["pilot", "shop", "team_battle", "mole", "night_raid"])
         self.assertEqual(cats[-1]["label"], "Night raid")
 
 
@@ -130,6 +130,37 @@ class TeamBattleSummaryTest(unittest.TestCase):
         self.assertTrue(s["teams"])
 
 
+def mole_records(**kw) -> list[dict]:
+    recs = v5_records(**kw)
+    recs[0] = dict(recs[0], config=dict(recs[0]["config"], moles={"red": "red_2", "blue": "blue_1"}))
+    return recs
+
+
+class MoleTest(unittest.TestCase):
+    def test_category(self):
+        h = mole_records()[0]
+        self.assertEqual(h["variant"], "team_battle")  # variant unchanged; moles decide
+        self.assertEqual(export_site.category_of(h, {}), "mole")
+        self.assertEqual(export_site.category_of(h, {"category": "team_battle"}), "team_battle")
+        self.assertEqual(export_site.category_label("mole"), "Team battle + mole")
+        self.assertEqual(export_site.category_of(dict(h, config=dict(h["config"], moles=None)), {}), "team_battle")
+        self.assertEqual(export_site.category_of(dict(h, config=dict(h["config"], moles={})), {}), "team_battle")
+        ids = [c["id"] for c in export_site.CATEGORIES]
+        self.assertEqual(ids.index("mole"), ids.index("team_battle") + 1)
+
+    def test_summary(self):
+        s = export_site.summarize(mole_records(), {})
+        self.assertEqual(s["category"], "mole")
+        self.assertEqual(s["category_label"], "Team battle + mole")
+        self.assertEqual(s["moles"], {"red": "red_2", "blue": "blue_1"})
+        self.assertEqual(s["teams"]["red"]["alive"], ["red_1"])
+        json.dumps(s)
+
+    def test_no_moles_key_without_moles(self):
+        self.assertNotIn("moles", export_site.summarize(v5_records(), {}))
+        self.assertNotIn("moles", export_site.summarize(v5_records(teams=False), {}))
+
+
 class EpisodesJsonTest(unittest.TestCase):
     def test_index_format(self):
         with tempfile.TemporaryDirectory() as d:
@@ -139,7 +170,7 @@ class EpisodesJsonTest(unittest.TestCase):
             self.assertEqual(failed, [])
             index = json.loads((Path(d) / "data" / "episodes.json").read_text())
             self.assertEqual(index["format"], 2)
-            self.assertEqual([c["id"] for c in index["categories"]], ["pilot", "shop", "team_battle"])
+            self.assertEqual([c["id"] for c in index["categories"]], ["pilot", "shop", "team_battle", "mole"])
             self.assertEqual(sorted(e["category"] for e in index["episodes"]), ["pilot", "team_battle"])
             body = gzip.decompress((Path(d) / "data" / "tb.jsonl.gz").read_bytes()).decode()
             self.assertNotIn("SECRET", body)

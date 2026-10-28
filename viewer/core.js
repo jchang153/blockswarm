@@ -76,6 +76,11 @@
  *     blocksOnSide, ownOnSide, othersOnSide, byTeamOnOtherSide, placedStanding, placedTotal, removedByOther}}
  * sideAnalysis(built, p, team) -> openStats() of the blocks on that team's side (both shops solid), cached
  * combatOf(event) -> diff.combat of a successful attack | null
+ * molesOf(header) -> {team: agent} from config.moles (docs/mole.md: a prompt-only condition, no engine rule) | null;
+ *     teamsOf(...).moles is the same ({} without moles) and teamsOf(...).isMole(agent) -> bool
+ * moleStats(log) -> {agent: {team, placedOwnSide, removedOwnSide, removedTeamBlocks, hitsOnTeam, hitsOnOther, messages}} | null
+ *     per mole over the whole log: blocks it placed / removed on its own team's half, how many of the removed
+ *     ones were placed by its own team, sword hits on teammates / the other team, messages sent. No judging.
  * finalTeamResults(log) -> {teams:{team:{alive, dead, analysis, blocks_on_side, blocks_placed_by_team,
  *     blocks_by_team_on_other_side, team_blocks_removed_by_other_team, wallet, startWallet}}, kills, reason, t, source}
  *     (the engine's episode_end values when present, else recomputed). No winner is ever computed.
@@ -208,7 +213,16 @@ function shopOf(header) {
 }
 /** [v5] team battle: header.teams is set (two teams of agents). */
 function isTeamBattle(header) { return !!(header && header.teams && typeof header.teams === 'object' && !Array.isArray(header.teams) && Object.keys(header.teams).length); }
-/** [v5] {names, members, teamOf, shops, dividerX, startWallets, combat, variant} from the header, or null without teams. */
+/** [mole] {team: agent} from header.config.moles (or header.moles), only agents that exist in that team; null without moles. */
+function molesOf(header) {
+  if (!header) return null;
+  const src = [header.config && header.config.moles, header.moles].find(m => m && typeof m === 'object' && !Array.isArray(m) && Object.keys(m).length);
+  if (!src) return null;
+  const out = {};
+  for (const [t, a] of Object.entries(src)) if (typeof a === 'string' && a) out[t] = a;
+  return Object.keys(out).length ? out : null;
+}
+/** [v5] {names, members, teamOf, shops, dividerX, startWallets, combat, variant, moles, isMole} from the header, or null without teams. */
 function teamsOf(header) {
   if (!isTeamBattle(header)) return null;
   const c = header.config || {};
@@ -223,8 +237,10 @@ function teamsOf(header) {
   for (const t of names) startWallets[t] = header.wallets && typeof header.wallets[t] === 'number' ? header.wallets[t] : money ?? 100 * members[t].length;
   let combat = header.combat && typeof header.combat === 'object' ? header.combat : null;
   if (!combat && c.combat) combat = { max_health: c.max_health ?? 20, sword_damage: c.sword_damage ?? 7, attack_reach: c.attack_reach ?? 3, attack_cooldown_s: c.attack_cooldown_s ?? 0.6 };
+  const moles = molesOf(header) || {};
+  const moleSet = new Set(Object.values(moles));
   return { names, members, teamOf, shops, dividerX, startWallets, combat, variant: header.variant || c.variant || 'team_battle',
-    equipment: header.equipment || null };
+    equipment: header.equipment || null, moles, isMole: a => moleSet.has(a) };
 }
 /** [v5] Team whose half the column x is on (first team: x < dividerX, second: x >= dividerX). */
 function sideOf(teams, x) { return teams ? (x < teams.dividerX ? teams.names[0] : teams.names[1]) : null; }
@@ -273,6 +289,29 @@ function sideAnalysis(built, p, team) {
 const analysisOf = S => ({ enclosed: S.enclosed, interior_cells: S.interiorCells, shell_cells: S.shellCells, doors: S.doors, windows: S.windows, leftovers: S.leftovers });
 /** [v5] diff.combat of a successful attack event, else null. */
 function combatOf(e) { const c = e && e.ok && e.diff && e.diff.combat; return c && c.target ? c : null; }
+/** [mole] Per-mole counts over the whole log (see the header comment). Null without moles. */
+function moleStats(log) {
+  const T = log && log.built && log.built.teams;
+  if (!T || !Object.keys(T.moles).length) return null;
+  const out = {};
+  for (const [team, a] of Object.entries(T.moles)) out[a] = { team, placedOwnSide: 0, removedOwnSide: 0, removedTeamBlocks: 0, hitsOnTeam: 0, hitsOnOther: 0, messages: 0 };
+  for (const e of log.events) {
+    const m = out[e.agent];
+    if (!m || !e.ok) continue;
+    if (e.chat) m.messages++;
+    const c = combatOf(e);
+    if (c) { if (T.teamOf[c.target] === m.team) m.hitsOnTeam++; else m.hitsOnOther++; }
+    for (const g of (e.diff && e.diff.grid) || []) {
+      if (!Array.isArray(g.pos) || sideOf(T, g.pos[0]) !== m.team) continue;
+      if (g.after && !g.before) m.placedOwnSide++;
+      else if (!g.after && g.before) {
+        m.removedOwnSide++;
+        if (T.teamOf[g.before.placed_by] === m.team) m.removedTeamBlocks++;
+      }
+    }
+  }
+  return out;
+}
 /** [v5] Team-battle summary: the engine's episode_end numbers when present, else recomputed. No winner. */
 function finalTeamResults(log) {
   const built = log.built, T = built && built.teams;
@@ -1125,4 +1164,5 @@ export {
   walkingMode, walkStepTimes, walkCellAt,
   describeEvent, typeColor, agentColors, TYPE_COLORS, AGENT_COLORS, key,
   isTeamBattle, teamsOf, sideOf, teamColor, teamStatsAt, sideAnalysis, combatOf, finalTeamResults, TEAM_COLORS, TEAM_PALETTES,
+  molesOf, moleStats,
 };

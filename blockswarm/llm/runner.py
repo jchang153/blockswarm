@@ -506,6 +506,8 @@ def run_episode(config_path: str | Path, *, run_dir: str | Path | None = None, d
             say(f"  teams: " + "; ".join(f"{t}: {', '.join(m)}" for t, m in c.teams.items())
                 + f"  shops={getattr(c, 'shops', None)} divider_x={getattr(c, 'divider_x', None)} "
                 f"variant={getattr(c, 'variant', None)}")
+        if getattr(c, "moles", None):
+            say("  moles (docs/mole.md): " + ", ".join(f"{t}: {a}" for t, a in c.moles.items()))
         say(f"  llm: max_tokens={llm.max_tokens} temperature={llm.temperature} reasoning={llm.reasoning} "
             f"history_steps={llm.history_steps} max_calls/agent={llm.max_model_calls_per_agent}")
         say(f"  max spend without budget: ~${plan['max_spend_if_uncapped_usd~']:.2f} = {plan['formula']}")

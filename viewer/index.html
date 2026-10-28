@@ -20,6 +20,8 @@
   --ok: #12805c;
   --scene-bg: #eef1f5;
   --chip: #eef0f3;
+  --mole: #5b3a22;
+  --mole-text: #fff7ee;
   --shadow: 0 1px 3px rgba(16,24,40,.08), 0 1px 2px rgba(16,24,40,.04);
   color-scheme: light;
 }
@@ -38,6 +40,8 @@
     --ok: #4cc38a;
     --scene-bg: #161a1f;
     --chip: #252b32;
+    --mole: #e2bd94;
+    --mole-text: #22160b;
     --shadow: 0 1px 3px rgba(0,0,0,.4);
     color-scheme: dark;
   }
@@ -149,6 +153,7 @@ select { background: var(--panel); border: 1px solid var(--border); border-radiu
 .badge.pub { background: #2f6fdf22; color: var(--accent); }
 .badge.bad { background: #d92d2022; color: var(--danger); }
 .badge.team { background: color-mix(in srgb, var(--tc) 18%, transparent); color: var(--tc); }
+.badge.mole { background: var(--mole); color: var(--mole-text); font-weight: 700; letter-spacing: .04em; text-transform: uppercase; border-radius: 4px; }
 .ev.hit { background: #d92d2014; }
 .ev.kill { background: #d92d2030; font-weight: 600; }
 .ev.move { padding-top: 1px; padding-bottom: 1px; }
@@ -306,7 +311,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   createLogBuilder, parseLog, buildStates, posAtTime, walkPosition, agentCellAt, describeEvent,
   typeColor, agentColors, key, itemInfo, purchaseOf, leaderboard, finalResults, deployTopK,
-  teamStatsAt, sideAnalysis, combatOf, teamColor, finalTeamResults,
+  teamStatsAt, sideAnalysis, combatOf, teamColor, finalTeamResults, moleStats,
 } from './core.js';
 
 
@@ -801,6 +806,15 @@ function agentTag(a) { return `<span style="white-space:nowrap"><span class="age
 const fmt = v => (typeof v === 'number' ? (Math.round(v * 1000) / 1000).toString() : '–');
 const fmtT = t => (typeof t === 'number' ? t.toFixed(1) + ' s' : '–');
 
+/** [mole] docs/mole.md: who the moles are (config.moles) and what each did over the whole log. Counts only, no judging. */
+function moleInfo() {
+  const T = R.built.teams, ms = moleStats(R.log) || {};
+  return Object.entries(T.moles).map(([t, a]) => {
+    const m = ms[a], other = T.names.find(x => x !== t);
+    return `<div><b style="color:${teamColor(T, t)}">${esc(t)}</b>: ${agentTag(a)}<span class="badge mole">mole</span>${m ? ` <span class="muted">· placed ${m.placedOwnSide} / removed ${m.removedOwnSide} on own side (${m.removedTeamBlocks} of them ${esc(t)}'s) · hits: ${m.hitsOnTeam} on teammates, ${m.hitsOnOther} on ${esc(other)} · ${m.messages} messages</span>` : ''}</div>`;
+  }).join('') + '<div class="muted">prompt-only condition: each mole survives only if its own team does not; the others know there is a mole on their team, not who</div>';
+}
+
 function renderInfo() {
   const h = R.log.header, c = h.config || {}, end = R.log.episodeEnd;
   const g = gridDims();
@@ -814,6 +828,7 @@ function renderInfo() {
     ...(R.built.teams ? [
       ['Teams', R.built.teams.names.map(t => `<div><b style="color:${teamColor(R.built.teams, t)}">${esc(t)}</b>: ${R.built.teams.members[t].map(agentTag).join(' ')} · shop at (${(R.built.teams.shops[t] || []).join(', ')}) · ${R.built.teams.startWallets[t]} coins</div>`).join('')
         + `<div class="muted">divider between x = ${R.built.teams.dividerX - 1} and x = ${R.built.teams.dividerX}${R.built.teams.combat ? ` · swords: ${R.built.teams.combat.sword_damage} damage, ${R.built.teams.combat.max_health} health, reach ${R.built.teams.combat.attack_reach}, cooldown ${R.built.teams.combat.attack_cooldown_s} s` : ''}</div>`],
+      ...(Object.keys(R.built.teams.moles).length ? [['Moles', moleInfo()]] : []),
     ] : v4 ? [
       ['Shop', `${R.built.shop.pos ? `at (${R.built.shop.pos.join(', ')}) · ` : ''}${R.built.shop.catalog.length} items · starting money <b>${fmt(R.built.shop.startingMoney)}</b> coins (shared wallet)`],
       ['Incentive', c.incentive === 'none' ? 'none' : `competitive: the top ${deployTopK(h)} by blocks still standing are deployed (ties at the boundary too)${c.show_leaderboard ? ' · agents see the leaderboard' : ''}`],
@@ -1012,6 +1027,7 @@ function renderInvs() {
     const actBar = maxAct ? `<div class="bar" style="height:4px;margin:2px 0 3px"><i style="width:${Math.min(1, used / maxAct) * 100}%;background:${agentColor(a)}"></i></div>` : '';
     return `<div class="inv"><div style="display:flex;align-items:center;gap:6px"><span class="who">${agentTag(a)}</span>
       ${team ? `<span class="badge team" style="--tc:${teamColor(R.built.teams, team)}">${esc(team)}</span>` : ''}
+      ${R.built.teams && R.built.teams.isMole(a) ? '<span class="badge mole" title="this agent is its team\'s mole (config.moles)">mole</span>' : ''}
       ${dead ? `<span class="badge bad">dead (killed by ${esc(dead.by)} at ${dead.t.toFixed(1)} s)</span>` : hp !== null ? `<span class="badge" style="${hp < 20 ? 'color:var(--danger)' : ''}">health ${hp}</span>` : ''}
       ${done ? '<span class="badge" style="background:#12805c22;color:var(--ok)">voted done</span>' : ''}
       <span class="cnt" style="margin-left:auto">actions ${used}${maxAct ? ' / ' + maxAct : ''}</span></div>${actBar}${posLine}

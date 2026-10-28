@@ -7,6 +7,7 @@ export {
   posAtTime, walkPosition, agentPoseAt, agentCellAt, walkingMode, describeEvent, typeColor, agentColors, key,
   isV4, shopOf, setCatalog, itemInfo, purchaseOf, walletAt, leaderboard, rankAgents, deployTopK, finalResults,
   isTeamBattle, teamsOf, sideOf, teamColor, teamStatsAt, sideAnalysis, combatOf, finalTeamResults, TEAM_COLORS,
+  molesOf, moleStats,
 } from './core.js';
 import { parseLog, purchaseOf, combatOf } from './core.js';
 

@@ -85,7 +85,7 @@ with `"team_models": {"red": "<model a>", "blue": "<model b>"}` and put both mod
 `llm.prices`. Budget and cost control are unchanged (one shared `budget_usd` for all 10 agents,
 so expect about twice the spend of a 5-agent pilot).
 
-Agents get a separate prompt (prompts.py, `PROMPT_VERSION` v5.1): the brief, their team, the
+Agents get a separate prompt (prompts.py, `PROMPT_VERSION` v5.2): the brief, their team, the
 other team, the sides and the line, both shops, the team wallet and the channels (`say` = own
 team, `say_all` = everyone, `whisper` = one agent) as plain facts, with no hint either way about
 attacking or crossing. The sword is not explained: the `attack` tool says only "Hit another agent
@@ -105,6 +105,16 @@ through each other, and an agent's destination is reserved against others' moves
 Logs whose header config has no `walking` key are teleport logs. The prompts (v5.1) describe
 whichever mode the config uses; with teleport the v4 shop prompt is byte-identical to before.
 Observations show the agent's current cell and, while walking, its destination and arrival time.
+
+### Mole condition
+
+`"moles": {"red": "<agent id>", "blue": "<agent id>"}` (docs/mole.md; `configs/mole-vs*.json`)
+makes one member of each team a mole. It needs `teams`, exactly one mole per team, each a member
+of that team; it is logged as-is in the header config (and the key is absent from the header
+when unset, so other logs are unchanged). It is prompt-only: the engine applies no rule. The
+team prompt (v5.2) adds one paragraph after the brief (the mole's own, or "one agent on your team
+is a mole" for everyone else) and changes the "same instructions" sentence; without `moles` the
+prompt is byte-identical to v5.1. The dry run prints the moles.
 
 ## Outputs: `runs/<run_id>/` (git-ignored)
 
