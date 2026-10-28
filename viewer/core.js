@@ -89,6 +89,20 @@
  *     parabola (landing on a block placed underneath mid-hop), falls drop along their path.
  * agentPoseAt(state, agent, t) -> {pos:[x,y,z], cell:[x,y,z], moving, kind:'walk'|'jump'|'fall'|null,
  *     until: arrive_t|null, facing:[dx,dy]|null} — feet position (cell coords; feet at z), for drawing.
+ *     cell = the agent's logical cell at t (continuous walking: the current cell along the path).
+ * agentCellAt(state, agent, t) -> [x,y,z] | null: the agent's logical cell at time t.
+ *
+ * ── Continuous walking (docs/walking.md) ────────────────────────────────────────────────────
+ * walkingMode(header) -> 'continuous' | 'teleport' (config.walking; logs without it are 'teleport').
+ * built.walking = that mode. Teleport: a walker's position is its destination from departure on.
+ * Continuous: a move_to entry in state.moves gets {continuous: true, speed, times} where times[i] =
+ *     round(depart_t + C_i / speed, 3) is when path[i] is reached (C: straight step 1, diagonal √2,
+ *     vertical free); the current cell at t is path[i] for the largest i with times[i] <= t, and
+ *     state.positions holds the current cells at the time of the state's last event. A truncation
+ *     entry ("stopped": true, "path_offset") keeps the original walk's timing and cuts it at the new end
+ *     (state.moves[a].stopped = true). Snapshots are checked against the current cells at their t and,
+ *     when present, against their `walks` (walks in progress).
+ * walkStepTimes(path, depart_t, speed) -> [t_i]; walkCellAt(move, t) -> current cell of a continuous walk.
  *
  * ── Presentation helpers (no DOM) ─────────────────────────────────────────────────────────────
  * describeEvent(event) -> short text for feeds ("place stone at (4, 5, 0)", "walks to (…) (1.9 s)",
@@ -116,6 +130,37 @@ const FALLBACK_TEAM_KEYS = ['red', 'blue'];
 const EXTRA_TYPE_COLORS = ['#c2185b', '#7cb342', '#5e35b1', '#00897b', '#f4511e', '#6d4c41'];
 
 const key = (x, y, z) => x + ',' + y + ',' + z;
+
+// ---------- continuous walking (docs/walking.md) ----------
+/** 'continuous' | 'teleport' for a log header (no config.walking key: 'teleport'). */
+function walkingMode(header) {
+  const w = header && header.config && header.config.walking;
+  return w === 'continuous' ? 'continuous' : 'teleport';
+}
+/** Python's round(x, 3): the float's exact decimal value, ties to even (toFixed breaks exact ties upwards). */
+function round3(x) {
+  const k = x * 2000;
+  if (Number.isInteger(k) && k % 2 !== 0) { const lo = Math.floor(x * 1000); return (lo % 2 === 0 ? lo : lo + 1) / 1000; }
+  return Number(x.toFixed(3));
+}
+/** Walk length of one step (pathing.path_length): diagonal √2, else 1 (going up or down adds nothing). */
+const stepLen = (a, b) => (a[0] !== b[0] && a[1] !== b[1] ? Math.SQRT2 : 1.0);
+/** Time each path cell is reached: round(depart_t + C_i / speed, 3), C summed in path order like the engine. */
+function walkStepTimes(path, depart, speed) {
+  const out = [depart];
+  let c = 0;
+  for (let i = 1; i < path.length; i++) { c += stepLen(path[i - 1], path[i]); out.push(round3(depart + c / speed)); }
+  return out;
+}
+/** Current cell of a continuous walk at time t: path[i] for the largest i with times[i] <= t. */
+function walkCellAt(m, t) {
+  const P = m.path, T = m.times;
+  if (!P || !T || !P.length) return m.to;
+  let i = 0;
+  while (i + 1 < P.length && T[i + 1] <= t + 1e-9) i++;
+  return P[i];
+}
+const sameCell = (a, b) => !!a && !!b && a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
 
 // ---------- v4 shop catalog ----------
 /** Legacy (log v1–v3) block types as catalog-like items, so callers can treat both alike. */
@@ -418,6 +463,29 @@ function openStats(grid, dims, solidKeys, agents, targetInterior, classify = leg
 }
 
 /**
+ * [continuous] Apply a truncation entry {from, to, path: [current … new end], depart_t, arrive_t, stopped, path_offset}
+ * to the walk in progress `prev`: same path and timing, cut at the new end. Without a matching walk (e.g. a reader
+ * that started mid-walk) the entry's own path is timed so that its last cell is reached at its arrive_t.
+ */
+function truncateWalk(prev, m, speed, t) {
+  const off = typeof m.path_offset === 'number' ? m.path_offset : null;
+  const P = Array.isArray(m.path) && m.path.length ? m.path : [m.from || m.to, m.to];
+  if (prev && prev.continuous && off !== null && off >= 0 && off + P.length <= prev.path.length
+      && P.every((c, k) => sameCell(c, prev.path[off + k]))) {
+    const n = off + P.length;
+    return { ...prev, to: m.to, path: prev.path.slice(0, n), times: prev.times.slice(0, n), arrive_t: m.arrive_t,
+      stopped: true, stoppedAt: t };
+  }
+  let len = 0;
+  for (let i = 1; i < P.length; i++) len += stepLen(P[i - 1], P[i]);
+  const dep = typeof m.arrive_t === 'number' ? m.arrive_t - len / speed : t;
+  const times = walkStepTimes(P, dep, speed);
+  times[0] = Math.min(times[0], t); // the first listed cell is the current one
+  return { ...m, path: P, depart_t: typeof m.depart_t === 'number' ? m.depart_t : dep, continuous: true, speed, times,
+    walkStart: dep, stopped: true, stoppedAt: t };
+}
+
+/**
  * Incremental log reader + replay. Feed it records (or lines) in file order; it keeps
  *   log   = {header, task, events, snapshots, episodeEnd, warnings}
  *   built = {states, bp, task, agents, mismatches, verified, snapshotCount, snapsAtPos}
@@ -427,7 +495,7 @@ function openStats(grid, dims, solidKeys, agents, targetInterior, classify = leg
 function createLogBuilder() {
   const log = { header: null, task: null, events: [], snapshots: [], episodeEnd: null, warnings: [] };
   const built = { states: [], bp: new Map(), task: null, agents: [], mismatches: [], verified: 0, snapshotCount: 0, snapsAtPos: new Map(),
-    v4: false, shop: null, endChecked: false, teams: null, sideCache: new Map() };
+    v4: false, shop: null, endChecked: false, teams: null, sideCache: new Map(), walking: 'teleport', walkSpeed: 4.317 };
   let lastId = -Infinity, lastT = -Infinity;
   const idToPos = new Map();
   let cur = null, computeStats = null;
@@ -445,6 +513,9 @@ function createLogBuilder() {
     const v4 = isV4(header);
     const shop = v4 ? shopOf(header) : null;
     built.v4 = v4; built.shop = shop;
+    built.walking = walkingMode(header);
+    const ws = header.config && typeof header.config.walk_speed === 'number' && header.config.walk_speed > 0 ? header.config.walk_speed : 4.317;
+    built.walkSpeed = ws;
     setCatalog(shop ? shop.catalog : null);
     const teams = teamsOf(header);
     built.teams = teams;
@@ -486,7 +557,7 @@ function createLogBuilder() {
   }
 
   function checkAt(p, s) {
-    const problems = checkSnapshot(s, built.states[p]);
+    const problems = checkSnapshot(s, built.states[p], built);
     if (problems.length) built.mismatches.push({ pos: p, t: s.t, seq: s.seq, problems });
     else built.verified++;
   }
@@ -524,21 +595,44 @@ function createLogBuilder() {
         for (const t in d.inventory[a]) addDelta(inv[a], t, d.inventory[a][t]);
       }
     }
+    const cont = built.walking === 'continuous';
+    if (cont) {
+      // [continuous] walkers move on along their paths: current cells at this event's time
+      let copied = false;
+      for (const a in moves) {
+        const m = moves[a];
+        if (!m || !m.continuous) continue;
+        const c = walkCellAt(m, e.t);
+        if (!sameCell(c, positions[a])) { if (!copied) { positions = { ...positions }; copied = true; } positions[a] = c; }
+      }
+    }
     if (Object.keys(d.agents).length) {
       positions = { ...positions }; moves = { ...moves };
       for (const a in d.agents) {
         const m = d.agents[a];
         if (m && m.dead) {
           // [v5] killed: the body is removed (no position, nobody stands on it)
-          const at = Array.isArray(m.at) ? m.at : positions[a] || null;
+          const at = Array.isArray(m.at) ? m.at : (cont && moves[a] && moves[a].continuous ? walkCellAt(moves[a], e.t) : positions[a]) || null;
           delete positions[a]; delete moves[a];
           if (!dead.includes(a)) dead = [...dead, a];
           deadAt = { ...deadAt, [a]: { t: e.t, at, by: e.agent, eventIdx: idx } };
           continue;
         }
         if (!m || !m.to) continue;
-        positions[a] = m.to;
         const prev = moves[a];
+        if (cont && m.stopped) {
+          // [continuous] a walk cut short by a grid change: keep the original timing, cut at the new end
+          moves[a] = truncateWalk(prev, m, built.walkSpeed, e.t);
+          positions[a] = walkCellAt(moves[a], e.t);
+          continue;
+        }
+        if (cont && !m.jump && !m.fall && e.tool === 'move_to' && e.agent === a && Array.isArray(m.path) && m.path.length && typeof m.depart_t === 'number') {
+          // [continuous] a new walk: the agent is at path[0] until the first step is done
+          moves[a] = { ...m, continuous: true, speed: built.walkSpeed, times: walkStepTimes(m.path, m.depart_t, built.walkSpeed) };
+          positions[a] = walkCellAt(moves[a], e.t);
+          continue;
+        }
+        positions[a] = m.to;
         if (!m.jump && !m.fall && prev && prev.jump && typeof prev.arrive_t === 'number' && e.t <= prev.arrive_t + 1e-9) {
           // a block placed into the jumper's feet cell mid-hop: keep the hop, land on top of the new block
           moves[a] = { ...prev, to: m.to, landZ: m.to[2], raiseAt: e.t, arrive_t: m.arrive_t ?? prev.arrive_t };
@@ -574,7 +668,8 @@ function createLogBuilder() {
         kills = [...kills, { t: e.t, attacker: hit.attacker, target: hit.target, eventIdx: idx }];
         if (!dead.includes(c.target)) {
           dead = [...dead, c.target];
-          deadAt = { ...deadAt, [c.target]: { t: e.t, at: positions[c.target] || null, by: hit.attacker, eventIdx: idx } };
+          const tm = moves[c.target], at = cont && tm && tm.continuous ? walkCellAt(tm, e.t) : positions[c.target];
+          deadAt = { ...deadAt, [c.target]: { t: e.t, at: at || null, by: hit.attacker, eventIdx: idx } };
           positions = { ...positions }; delete positions[c.target];
           moves = { ...moves }; delete moves[c.target];
         }
@@ -756,7 +851,7 @@ function finalResults(log) {
   };
 }
 
-function checkSnapshot(snap, st) {
+function checkSnapshot(snap, st, built = null) {
   const out = [];
   if (Array.isArray(snap.blocks)) {
     const seen = new Set();
@@ -784,10 +879,31 @@ function checkSnapshot(snap, st) {
     const A = [...st.votes].sort().join(','), B = [...snap.done_votes].sort().join(',');
     if (A !== B) out.push(`done votes: replay [${A}], snapshot [${B}]`);
   }
+  const cont = built ? built.walking === 'continuous' : Object.values(st.moves || {}).some(m => m && m.continuous);
+  const snapT = typeof snap.t === 'number' ? snap.t : null;
   if (snap.positions) for (const a in snap.positions) {
     if (st.dead && st.dead.includes(a)) continue; // [v5] the engine may keep a dead agent's last cell; its body is gone
-    const A = (st.positions[a] || []).join(','), B = (snap.positions[a] || []).join(',');
+    // [continuous] the current cell at the snapshot's time
+    const mine = cont && snapT !== null ? agentCellAt(st, a, snapT) : st.positions[a];
+    const A = (mine || []).join(','), B = (snap.positions[a] || []).join(',');
     if (A !== B) out.push(`${a} position: replay (${A}), snapshot (${B})`);
+  }
+  if (cont && snapT !== null && snap.walks && typeof snap.walks === 'object') {
+    // [continuous] walks in progress at the snapshot's time
+    const mineW = {};
+    for (const a in st.moves) { const m = st.moves[a]; if (m && m.continuous && m.arrive_t > snapT + 1e-9 && !(st.dead || []).includes(a)) mineW[a] = m; }
+    for (const a of new Set([...Object.keys(mineW), ...Object.keys(snap.walks)])) {
+      const m = mineW[a], w = snap.walks[a];
+      if (!m) { out.push(`${a} walk: replay none, snapshot to (${(w.path || []).slice(-1)[0]}) until ${w.arrive_t}`); continue; }
+      if (!w) { out.push(`${a} walk: replay to (${m.to}) until ${m.arrive_t}, snapshot none`); continue; }
+      if (typeof w.arrive_t === 'number' && w.arrive_t !== m.arrive_t) out.push(`${a} walk arrive_t: replay ${m.arrive_t}, snapshot ${w.arrive_t}`);
+      if (typeof w.depart_t === 'number' && w.depart_t !== m.depart_t) out.push(`${a} walk depart_t: replay ${m.depart_t}, snapshot ${w.depart_t}`);
+      if (Array.isArray(w.path)) {
+        // the whole (cut) path, or the part from some cell on: it must end the same way
+        const P = m.path.map(c => c.join(',')).join(';'), Q = w.path.map(c => c.join(',')).join(';');
+        if (!(P === Q || (Q && P.endsWith(';' + Q)))) out.push(`${a} walk path: replay ${m.path.length} cells to (${m.to}), snapshot ${w.path.length} cells to (${(w.path.slice(-1)[0] || [])})`);
+      }
+    }
   }
   // scores: our own computation vs. what the engine logged
   const S = st.stats, det = snap.score_details || snap.analysis || {};
@@ -908,6 +1024,7 @@ function walkPosition(m, t) {
     if (typeof m.landZ === 'number' && t >= m.raiseAt) z = Math.max(z, m.landZ);
     return [base[0], base[1], z];
   }
+  if (m.continuous) return continuousWalkPosition(m, t);
   const path = m.path && m.path.length ? m.path : [m.from || m.to, m.to];
   if (!(typeof m.depart_t === 'number' && typeof m.arrive_t === 'number') || t >= m.arrive_t || path.length < 2) return m.to;
   if (t <= m.depart_t) return path[0];
@@ -928,10 +1045,36 @@ function walkPosition(m, t) {
   return m.to;
 }
 
+/**
+ * [continuous] Smooth position along a continuous walk: the engine's step lengths (straight 1, diagonal √2,
+ * vertical free) at the walk speed, so the body is at path[i] when the engine says so; a truncated walk
+ * stops at its (new) last cell.
+ */
+function continuousWalkPosition(m, t) {
+  const P = m.path;
+  if (!P || P.length < 2 || t >= m.arrive_t) return m.to;
+  const start = typeof m.walkStart === 'number' ? m.walkStart : m.depart_t;
+  if (t <= start) return P[0];
+  let dist = (t - start) * m.speed;
+  for (let i = 1; i < P.length; i++) {
+    const L = stepLen(P[i - 1], P[i]);
+    if (dist < L) { const f = dist / L, A = P[i - 1], B = P[i]; return [A[0] + (B[0] - A[0]) * f, A[1] + (B[1] - A[1]) * f, A[2] + (B[2] - A[2]) * f]; }
+    dist -= L;
+  }
+  return P[P.length - 1];
+}
+
+/** Logical cell of `agent` at time t (continuous walking: the current cell along the path; else state.positions). */
+function agentCellAt(state, agent, t) {
+  const m = state.moves && state.moves[agent];
+  if (m && m.continuous && state.positions[agent]) return walkCellAt(m, t);
+  return state.positions[agent] || null;
+}
+
 /** Pose of `agent` at time t in a reconstructed state (see header). */
 function agentPoseAt(state, agent, t) {
   const m = state.moves[agent];
-  const cell = state.positions[agent] || null;
+  const cell = agentCellAt(state, agent, t);
   if (!m) return { pos: cell, cell, moving: false, kind: null, until: null, facing: null };
   const pos = walkPosition(m, t);
   const moving = typeof m.arrive_t === 'number' && t < m.arrive_t;
@@ -978,7 +1121,8 @@ export {
   createLogBuilder, parseLog, buildStates, checkSnapshot, taskOf,
   blueprintStats, openStats,
   isV4, shopOf, setCatalog, itemInfo, classifyItem, purchaseOf, walletAt, leaderboard, rankAgents, deployTopK, finalResults,
-  posAtTime, walkPosition, agentPoseAt, HOP_HEIGHT,
+  posAtTime, walkPosition, agentPoseAt, agentCellAt, HOP_HEIGHT,
+  walkingMode, walkStepTimes, walkCellAt,
   describeEvent, typeColor, agentColors, TYPE_COLORS, AGENT_COLORS, key,
   isTeamBattle, teamsOf, sideOf, teamColor, teamStatsAt, sideAnalysis, combatOf, finalTeamResults, TEAM_COLORS, TEAM_PALETTES,
 };

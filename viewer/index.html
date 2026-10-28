@@ -304,7 +304,7 @@ body.dragging #drop { display: flex; }
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
-  createLogBuilder, parseLog, buildStates, posAtTime, walkPosition, describeEvent,
+  createLogBuilder, parseLog, buildStates, posAtTime, walkPosition, agentCellAt, describeEvent,
   typeColor, agentColors, key, itemInfo, purchaseOf, leaderboard, finalResults, deployTopK,
   teamStatsAt, sideAnalysis, combatOf, teamColor, finalTeamResults,
 } from './core.js';
@@ -557,7 +557,9 @@ function updateBodies() {
 function walkingSig() {
   if (!R.log) return '';
   const st = R.built.states[R.pos];
-  return R.built.agents.map(a => { const m = st.moves[a]; return m && R.time < m.arrive_t ? 1 : 0; }).join('');
+  // [continuous walking] the current cell changes along the way, so it is part of the signature too
+  const cont = R.built.walking === 'continuous';
+  return R.built.agents.map(a => { const m = st.moves[a]; return (m && R.time < m.arrive_t ? 1 : 0) + (cont ? ':' + (agentCellAt(st, a, R.time) || '') : ''); }).join('|');
 }
 
 function frameCamera() {
@@ -1002,9 +1004,11 @@ function renderInvs() {
     const hp = st.health && typeof st.health[a] === 'number' ? st.health[a] : null;
     const team = R.built.teams ? R.built.teams.teamOf[a] : null;
     const items = Object.entries(inv).filter(([, v]) => v).map(([t, v]) => `<span class="chip"><span class="sw" style="background:${typeColor(t)}"></span>${esc(t)} ${v}</span>`).join('');
-    const pos = st.positions[a], mv = st.moves[a];
+    const pos = agentCellAt(st, a, R.time), mv = st.moves[a];
     const walking = mv && typeof mv.arrive_t === 'number' && R.time < mv.arrive_t;
-    const posLine = pos ? `<div class="cnt" style="margin:1px 0 2px">at (${pos.join(', ')})${walking ? ` · <b style="color:${agentColor(a)}">${mv.jump ? 'airborne' : mv.fall ? 'falling' : 'walking'} until t = ${mv.arrive_t.toFixed(1)} s</b>` : ''}</div>` : '';
+    // [continuous walking] the current cell, plus where the walk ends (and whether it was cut short)
+    const dest = walking && mv.continuous ? ` to (${mv.to.join(', ')})${mv.stopped ? ' (cut short)' : ''}` : '';
+    const posLine = pos ? `<div class="cnt" style="margin:1px 0 2px">at (${pos.join(', ')})${walking ? ` · <b style="color:${agentColor(a)}">${mv.jump ? 'airborne' : mv.fall ? 'falling' : 'walking' + dest} until t = ${mv.arrive_t.toFixed(1)} s</b>` : ''}</div>` : '';
     const actBar = maxAct ? `<div class="bar" style="height:4px;margin:2px 0 3px"><i style="width:${Math.min(1, used / maxAct) * 100}%;background:${agentColor(a)}"></i></div>` : '';
     return `<div class="inv"><div style="display:flex;align-items:center;gap:6px"><span class="who">${agentTag(a)}</span>
       ${team ? `<span class="badge team" style="--tc:${teamColor(R.built.teams, team)}">${esc(team)}</span>` : ''}
@@ -1161,11 +1165,18 @@ function drawStrip() {
   });
   const laneOf = new Map(agents.map((a, i) => [a, i]));
   // [v3] walking spans: thin bar from depart_t to arrive_t
+  // [continuous walking] a walk cut short by a grid change ("stopped": true) ends at its new arrival time
+  const walkEnd = new Map(), lastWalk = {};
+  for (const e of R.log.events) for (const [a, m] of Object.entries(e.diff.agents || {})) {
+    if (!m) continue;
+    if (e.tool === 'move_to' && a === e.agent && e.ok) lastWalk[a] = e;
+    else if (m.stopped && lastWalk[a] && typeof m.arrive_t === 'number') walkEnd.set(lastWalk[a], m.arrive_t);
+  }
   for (const e of R.log.events) {
     const li = laneOf.get(e.agent);
     const m = e.diff.agents && e.diff.agents[e.agent];
     if (li === undefined || !m || typeof m.arrive_t !== 'number') continue;
-    const x0 = stripX(m.depart_t ?? e.t, w), x1 = stripX(m.arrive_t, w), y = top + li * lane;
+    const x0 = stripX(m.depart_t ?? e.t, w), x1 = stripX(walkEnd.get(e) ?? m.arrive_t, w), y = top + li * lane;
     g.globalAlpha = 0.35; g.fillStyle = agentColor(e.agent);
     g.fillRect(x0, y + lane / 2 - 1.5, Math.max(1, x1 - x0), 3);
   }

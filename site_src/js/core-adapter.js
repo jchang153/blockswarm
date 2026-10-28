@@ -4,7 +4,7 @@
 // Everything site-specific (where data lives, gzip, per-agent totals) stays in this file.
 export {
   createLogBuilder, parseLog, taskOf, openStats, blueprintStats,
-  posAtTime, walkPosition, agentPoseAt, describeEvent, typeColor, agentColors, key,
+  posAtTime, walkPosition, agentPoseAt, agentCellAt, walkingMode, describeEvent, typeColor, agentColors, key,
   isV4, shopOf, setCatalog, itemInfo, purchaseOf, walletAt, leaderboard, rankAgents, deployTopK, finalResults,
   isTeamBattle, teamsOf, sideOf, teamColor, teamStatsAt, sideAnalysis, combatOf, finalTeamResults, TEAM_COLORS,
 } from './core.js';

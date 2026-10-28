@@ -359,7 +359,8 @@ const lerpAngle = (a, b, f) => { let d = ((b - a + Math.PI) % (2 * Math.PI) + 2 
 function updateAvatars(dt) {
   const st = R.built.states[R.pos];
   const maxHp = (R.teams && R.teams.combat && R.teams.combat.max_health) || 20;
-  const cellOf = a => st.positions[a] || (st.deadAt && st.deadAt[a] && st.deadAt[a].at) || null;
+  // where an agent is drawn now (a walker mid-path: its place along the path), else where it died
+  const placeOf = a => (st.positions[a] && agentPoseAt(st, a, R.time).pos) || (st.deadAt && st.deadAt[a] && st.deadAt[a].at) || null;
   for (const [a, av] of world.avatars) {
     // [v5] death: topple over, fade out, leave a marker
     const died = st.deadAt && st.deadAt[a];
@@ -388,8 +389,8 @@ function updateAvatars(dt) {
     // [v5] swinging the sword: face the target
     const hit = recent(R.hitsBy.get(a), SWING);
     if (hit) {
-      const me = st.positions[a], tc = cellOf(hit.target);
-      if (me && tc && (tc[0] !== me[0] || tc[1] !== me[1])) av.target = Math.atan2(tc[0] - me[0], -(tc[1] - me[1]));
+      const me = p.pos, tc = placeOf(hit.target);
+      if (me && tc && Math.hypot(tc[0] - me[0], tc[1] - me[1]) > 1e-3) av.target = Math.atan2(tc[0] - me[0], -(tc[1] - me[1]));
     }
     if (av.target !== undefined) av.rot = lerpAngle(av.rot, av.target, Math.min(1, dt * (hit ? 20 : 12)));
     av.g.rotation.y = av.rot;
@@ -407,7 +408,7 @@ function updateAvatars(dt) {
     // [v5] being hit: red flash and a short knockback away from the attacker
     const took = recent(R.hitsOn.get(a), KNOCK);
     if (took) {
-      const f = (R.time - took.t) / KNOCK, ac = cellOf(took.attacker), me = st.positions[a];
+      const f = (R.time - took.t) / KNOCK, ac = placeOf(took.attacker), me = p.pos;
       if (ac && me) {
         let dx = me[0] - ac[0], dy = me[1] - ac[1]; const n = Math.hypot(dx, dy) || 1; dx /= n; dy /= n;
         const k = 0.38 * Math.sin(Math.PI * Math.min(1, f * 1.4));
@@ -434,7 +435,7 @@ function updateAvatars(dt) {
       if (e.ok && e.tool === 'buy') { want = 1 - (R.time - e.t) / 0.9; buyer = e.agent; break; }
     }
     let near = world.shops[0];
-    const bp = buyer && st.positions[buyer];
+    const bp = buyer && placeOf(buyer);
     if (bp && world.shops.length > 1) near = world.shops.reduce((b, s) => (Math.hypot(s.pos[0] - bp[0], s.pos[1] - bp[1]) < Math.hypot(b.pos[0] - bp[0], b.pos[1] - bp[1]) ? s : b));
     for (const s of world.shops) { s.goods.position.y = s === near ? 0.12 * Math.sin(Math.PI * want) : 0; s.label.visible = R.showNames; }
   }
@@ -684,6 +685,13 @@ function drawStrip() {
     const d = deadAt[a];
     if (d) { const x0 = sx(d.t, w); g.fillStyle = muted + '40'; g.fillRect(x0, y + 1, w - ST.padR - x0, lane - 1); }
   });
+  // [continuous walking] a walk cut short by a grid change ("stopped": true) ends at its new arrival time
+  const walkEnd = new Map(), lastWalk = {};
+  for (const e of R.log.events) for (const [a, m] of Object.entries(e.diff.agents || {})) {
+    if (!m) continue;
+    if (e.tool === 'move_to' && a === e.agent && e.ok) lastWalk[a] = e;
+    else if (m.stopped && lastWalk[a] && typeof m.arrive_t === 'number') walkEnd.set(lastWalk[a], m.arrive_t);
+  }
   for (const e of R.log.events) {
     const li = idx.get(e.agent); if (li === undefined) continue;
     g.globalAlpha = isOn(e.agent) ? 1 : 0.18;
@@ -691,7 +699,8 @@ function drawStrip() {
     const m = e.diff.agents && e.diff.agents[e.agent];
     if (e.ok && m && typeof m.arrive_t === 'number' && e.tool === 'move_to') {
       g.fillStyle = R.colors[e.agent] + '55';
-      g.fillRect(sx(m.depart_t ?? e.t, w), y + lane / 2 - 2, Math.max(1, sx(m.arrive_t, w) - sx(m.depart_t ?? e.t, w)), 4);
+      const end = walkEnd.get(e) ?? m.arrive_t;
+      g.fillRect(sx(m.depart_t ?? e.t, w), y + lane / 2 - 2, Math.max(1, sx(end, w) - sx(m.depart_t ?? e.t, w)), 4);
       continue;
     }
     if (!e.ok) { g.fillStyle = muted + '88'; g.fillRect(x - 0.5, y + lane - 4, 1, 3); continue; }
