@@ -1,0 +1,31 @@
+{
+  "comment": "First paid pilot. Fill in 'model' (one OpenRouter model id for all agents) and its prices in llm.prices (USD per 1M tokens, from the model's OpenRouter page), then dry-run first: python3 scripts/run_episode.py configs/pilot.json --dry-run",
+  "model_candidates": [
+    "google/gemini-2.5-flash  (unverified id/price - check openrouter.ai/models)",
+    "openai/gpt-5-mini  (unverified id/price)",
+    "qwen/qwen3-235b-a22b-2507  (unverified id/price; pick a provider that supports tools)"
+  ],
+  "episode_id": "pilot",
+  "n_agents": 3,
+  "model": "CHOOSE_MODEL",
+  "budget_usd": 2.00,
+  "task": "open",
+  "scarcity": "exact",
+  "payoff": "team",
+  "max_seconds": 600,
+  "seed": 0,
+  "llm": {
+    "max_tokens": 2048,
+    "temperature": 1.0,
+    "reasoning": null,
+    "provider": {"require_parameters": true},
+    "history_steps": 6,
+    "history_chunk": 1,
+    "max_model_calls_per_agent": 150,
+    "max_consecutive_errors": 3,
+    "prices": {
+      "CHOOSE_MODEL": {"input_per_m": null, "output_per_m": null}
+    }
+  },
+  "client": {"timeout_s": 120, "max_retries": 4}
+}

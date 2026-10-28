@@ -179,3 +179,9 @@ viewers should show its keys generically).
   position not in the blueprint (wrong-type blocks on blueprint positions are neither).
 - `team_score = correct / blueprint_cells − extra_penalty · extra / blueprint_cells`, floored at 0.
 - `individual_scores[a]` = correct cells with `placed_by == a`.
+
+## Orchestrator records (LLM runs)
+LLM runs add `agent_prompt` (each agent's system prompt, logged once and referenced by sha256
+from `model_call`), `model_call`, `tool_results`, `implicit_wait`, `agent_stop` and
+`orchestrator_error` records. They are described in [running.md](running.md). Replay and the
+viewers ignore them; the public site export drops them by default.
