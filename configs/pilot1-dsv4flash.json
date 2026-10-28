@@ -1,0 +1,46 @@
+{
+  "comment": "Pilot batch 1 (2026-10-27): 5 agents, 30 min, open house task, $20 cap. Prices from openrouter.ai/api/v1/models on 2026-10-27.",
+  "episode_id": "pilot1-dsv4flash",
+  "n_agents": 5,
+  "model": "deepseek/deepseek-v4-flash",
+  "budget_usd": 20.0,
+  "task": "open",
+  "scarcity": "exact",
+  "payoff": "team",
+  "max_seconds": 1800,
+  "max_actions_per_agent": 1000,
+  "width": 24,
+  "depth": 24,
+  "height": 10,
+  "chest_pos": [
+    12,
+    4,
+    0
+  ],
+  "seed": 0,
+  "llm": {
+    "max_tokens": 2048,
+    "temperature": null,
+    "reasoning": {
+      "enabled": false
+    },
+    "provider": {
+      "require_parameters": true,
+      "data_collection": "deny"
+    },
+    "history_steps": 6,
+    "history_chunk": 1,
+    "max_model_calls_per_agent": 1000,
+    "max_consecutive_errors": 3,
+    "prices": {
+      "deepseek/deepseek-v4-flash": {
+        "input_per_m": 0.14,
+        "output_per_m": 0.28
+      }
+    }
+  },
+  "client": {
+    "timeout_s": 120,
+    "max_retries": 4
+  }
+}

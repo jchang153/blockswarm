@@ -174,7 +174,10 @@ class OpenRouterClient:
             body["temperature"] = temperature
         if tools:
             body["tools"] = tools
-            body["parallel_tool_calls"] = bool(parallel_tool_calls)
+            # Multiple tool calls per response are the default; only send the flag to turn them off,
+            # since with require_parameters most providers would be excluded by it.
+            if not parallel_tool_calls:
+                body["parallel_tool_calls"] = False
         if reasoning is not None:
             body["reasoning"] = reasoning
         if provider is not None:
