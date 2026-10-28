@@ -571,10 +571,6 @@ class TeamBattlePromptTests(unittest.TestCase):
                   "The blue team's side is x >= 20", "the red team's shop at (6, 10, 0)",
                   "the blue team's shop at (33, 10, 0)", "Your team's wallet starts with 500 coins",
                   "The other team has its own wallet", "No refunds",
-                  # sword and health, as plain facts
-                  "for 7 damage", "starts with 20 health", "health never regenerates", "3 hits kill",
-                  "can no longer act for the rest of the run", "the blocks it placed stay in the world",
-                  "Hits on teammates do the same damage", "within 3 of your eyes",
                   # channels and per-team votes
                   "say sends a message that only your own team (red) sees",
                   "say_all sends a message that every agent on both teams sees",
@@ -584,6 +580,9 @@ class TeamBattlePromptTests(unittest.TestCase):
             self.assertIn(s, sp)
         self.assertLess(tokens(sp), 3200, tokens(sp))
         self.assertNotIn("chest", sp.lower())
+        # the sword is deliberately not explained in the rules (researcher's choice, 2026-10-28)
+        for s_ in ("sword", "7 damage", "health", "hits kill", "killed", "attack"):
+            self.assertNotIn(s_, sp.split("## Observations")[0].lower())
 
     def test_no_strategy_or_judging_words(self):
         h = team_header()
@@ -624,11 +623,9 @@ class TeamBattlePromptTests(unittest.TestCase):
         self.assertEqual(by["give"]["parameters"]["properties"]["to"]["enum"], others)
         self.assertIn("only your own team", by["say"]["description"])
         self.assertIn("every agent on both teams", by["say_all"]["description"])
-        atk = by["attack"]["description"]
-        for s in ("7 damage", "20 health", "never regenerates", "3 hits kill",
-                  "can no longer act for the rest of the run", "blocks it placed stay in the world",
-                  "Hits on teammates do the same damage"):
-            self.assertIn(s, atk)
+        # bare description only: no damage, health or death mechanics
+        self.assertEqual(by["attack"]["description"],
+                         "Hit another agent with your sword. Action. Refused while you are walking (not counted).")
         self.assertIn("your team's wallet", by["buy"]["description"])
         self.assertIn("your team's house is finished", by["declare_done"]["description"])
         self.assertEqual(by["move_to"]["parameters"]["properties"]["x"]["maximum"], 39)

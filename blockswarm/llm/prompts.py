@@ -13,8 +13,10 @@ omitted from the schemas (there is nobody to target), and the prompt says the ag
 
 Team battle (header `teams` set; docs/team-battle.md section 5): a separate prompt and tool
 list (`team_system_prompt`, `team_tool_schemas`). Same neutrality rule, stricter: it states the
-brief, the two teams, the sides and the line, both shops, the team wallets, the channels and the
-sword/health mechanics as plain facts, and never suggests or discourages attacking, crossing the
+brief, the two teams, the sides and the line, both shops, the team wallets and the channels as
+plain facts. The sword is deliberately not explained: the rules never mention it, the `attack`
+tool says only "Hit another agent with your sword", and agents learn the rest (damage, health,
+death) from what happens. It never suggests or discourages attacking, crossing the
 line, removing the other team's blocks or working with the other team. Without `teams` the v4
 prompt and tools are produced byte for byte as before (tests pin their hashes).
 """
@@ -499,11 +501,6 @@ def team_system_prompt(world_header: dict, agent_id: str) -> str:
     shops = team_shops(h)
     sides = _sides(h)
     dx = divider_x(h)
-    combat = combat_rules(h)
-    hp, dmg = int(combat["max_health"]), int(combat["sword_damage"])
-    k = hits_to_kill(h)
-    areach = _num(float(combat["attack_reach"]))
-    acool = float(combat["attack_cooldown_s"] or 0)
     catalog = _catalog(h)
     doors = [it["id"] for it in catalog if it.get("door")]
     money = _team_money(h, mine)
@@ -581,8 +578,7 @@ def team_system_prompt(world_header: dict, agent_id: str) -> str:
         f"Reach: buy, place, remove and give work only on targets whose centre is within {reach} of "
         "your eyes" + (" and with a clear straight line from your eyes to the target's centre that "
                        "passes through no other non-transparent block or shop" if los else "")
-        + ". For give, the target is the other agent's body (either of its two cells). attack has its "
-        "own reach (see Swords and health).")
+        + ". For give, the target is the other agent's body (either of its two cells).")
 
     P.append("\n## Shops, wallets and inventory")
     P.append(
@@ -604,24 +600,6 @@ def team_system_prompt(world_header: dict, agent_id: str) -> str:
     P.append("Items (id and price in coins; * = transparent; doors: " + ", ".join(doors) + "):")
     P.extend(catalog_lines(catalog))
 
-    P.append("\n## Swords and health")
-    P.append(
-        "Every agent carries an iron sword. It is not a block: it takes no inventory space and cannot be "
-        f"placed, given, bought or dropped. attack(target) hits another living agent with it for {dmg} "
-        f"damage. Every agent starts with {hp} health, which is also the maximum, and health never "
-        f"regenerates. An agent whose health reaches 0 is killed, so {k} hits kill an agent at full "
-        "health. A killed agent can no longer act for the rest of the run: its body disappears, the "
-        "blocks in its inventory are lost, its finished vote is withdrawn, and the blocks it placed stay "
-        "in the world. Hits on teammates do the same damage as any other hit.\n"
-        f"An attack needs the target within {areach} of your eyes (measured to the centre of the nearer "
-        "of its two body cells)" + (" with a clear line of sight" if los else "")
-        + ", and you must not be walking."
-        + (f" After an attack (hit or not) your next attack is allowed only {_num(acool)} s later."
-           if acool > 0 else "")
-        + " Your own health is in every observation. A hit agent is told who hit it and its new "
-        "health; when an agent is killed, every agent is told who killed whom. Nobody is shown other "
-        "agents' health.")
-
     P.append("\n## What you see")
     P.append(
         f"You see blocks and agents within {view} of your eyes"
@@ -636,7 +614,7 @@ def team_system_prompt(world_header: dict, agent_id: str) -> str:
         "If you make several tool calls in one response, they are executed back to back in that order "
         "without delay.\n"
         "Each tool has a cost category:\n"
-        "- action (move_to, jump, buy, give, place, remove, attack, declare_done, cancel_done): each call "
+        "- action (move_to, jump, buy, give, place, remove, declare_done, cancel_done): each call "
         f"counts toward your limit of {max_a} actions, including calls that fail. Exception: calls "
         "refused because you are still walking, airborne, in cooldown or out of actions do not count.\n"
         "- While walking, every action call is refused; while airborne, move_to and jump are refused."
@@ -658,9 +636,8 @@ def team_system_prompt(world_header: dict, agent_id: str) -> str:
         "Votes are per team. Placing or removing a block (by anyone) on your team's side clears all of "
         "your team's votes; a block placed or removed on the other team's side clears only the other "
         "team's votes. Your team's votes and vote changes are announced to your team as SYSTEM messages. "
-        "The episode ends when every living agent on both teams has its vote in at the same time, when "
-        f"time runs out, when every agent has used all {max_a} actions, or when every agent has been "
-        "killed.")
+        "The episode ends when every agent on both teams that can still act has its vote in at the "
+        f"same time, when time runs out, or when every agent has used all {max_a} actions.")
 
     ex = mates[0] if mates else (teams.get(other) or ["you"])[0]
     P.append("\n## Observations")
@@ -696,11 +673,6 @@ def team_tool_schemas(world_header: dict, agent_id: str | None = None) -> list[d
     reach = _num(cfg.get("reach", 4.5))
     max_chars = int(cfg.get("max_message_chars", 1000))
     los = ", line of sight" if cfg.get("reach_line_of_sight", True) else ""
-    combat = combat_rules(h)
-    hp, dmg = int(combat["max_health"]), int(combat["sword_damage"])
-    k = hits_to_kill(h)
-    areach = _num(float(combat["attack_reach"]))
-    acool = float(combat["attack_cooldown_s"] or 0)
 
     def coord(axis: str, hi: int, what: str) -> dict:
         return {"type": "integer", "minimum": 0, "maximum": hi - 1, "description": f"{axis} ({what})"}
@@ -738,13 +710,7 @@ def team_tool_schemas(world_header: dict, agent_id: str | None = None) -> list[d
         _fn("remove", f"Remove the block at (x, y, z) (anyone's) into your inventory; needs room. Within "
             f"reach ({reach} from your eyes to the cell centre{los}). Agents standing on it "
             f"fall. Action. {walking}", xyz, ["x", "y", "z"]),
-        _fn("attack", f"Hit another living agent (either team) with your sword for {dmg} damage. Every "
-            f"agent starts with {hp} health (the maximum) and health never regenerates; {k} hits kill an "
-            "agent at full health. A killed agent can no longer act for the rest of the run; the blocks "
-            "it placed stay in the world. Hits on teammates do the same damage. The target must be within "
-            f"{areach} of your eyes (to the centre of the nearer of its two body cells{los})."
-            + (f" Your next attack is allowed {_num(acool)} s after this one (refused before that, not "
-               "counted)." if acool > 0 else "") + f" Action. {walking}",
+        _fn("attack", f"Hit another agent with your sword. Action. {walking}",
             {"target": {"type": "string", "enum": targets, "description": "another agent's id (either team)"}},
             ["target"]),
         _fn("say", "Send a message that only your own team sees, at any distance. Message (not an action).",
