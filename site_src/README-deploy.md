@@ -58,3 +58,16 @@ Notes:
 - Per-run titles/models/notes: put `<log>.meta.json` next to a log, e.g.
   `{"title": "Three agents, scarce blocks", "model": "provider/model-name", "notes": "..."}`;
   `{"hidden": true}` leaves a run out.
+
+## Categories (variants)
+
+Every run gets a `category` that the gallery's filter chips use (`?cat=<id>` in the URL):
+`pilot` (v1-v3 chest logs), `shop` (v4, and v5 without `teams`), `team_battle` (v5 with
+`header.teams`). The header's `variant` overrides the derived one, and `"category": "<id>"` in a
+run's `.meta.json` overrides both. Labels, descriptions and display order live in `CATEGORIES` in
+`scripts/export_site.py`; adding a variant is one entry there (plus, optionally, a colour token
+`--cat-<id>` in `site_src/css/gallery.css` and a paragraph on `about.html`). A chip with no runs is
+hidden.
+
+`episodes.json` is `{"format": 2, "categories": [{id, label, description}, ...], "episodes": [...]}`.
+The site still reads the older bare-list format, deriving categories in the browser.

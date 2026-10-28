@@ -6,8 +6,9 @@ export {
   createLogBuilder, parseLog, taskOf, openStats, blueprintStats,
   posAtTime, walkPosition, agentPoseAt, describeEvent, typeColor, agentColors, key,
   isV4, shopOf, setCatalog, itemInfo, purchaseOf, walletAt, leaderboard, rankAgents, deployTopK, finalResults,
+  isTeamBattle, teamsOf, sideOf, teamColor, teamStatsAt, sideAnalysis, combatOf, finalTeamResults, TEAM_COLORS,
 } from './core.js';
-import { parseLog, purchaseOf } from './core.js';
+import { parseLog, purchaseOf, combatOf } from './core.js';
 
 let configPromise = null;
 /** site-config.json → {title, subtitle, data_base_url}; data_base_url defaults to ./data/. */
@@ -59,10 +60,12 @@ export async function loadEpisodeLog(file) {
   return parseLog(await fetchLogText(await dataUrl(file)));
 }
 
-/** Per-agent totals over the first `upTo` events: placed, removed, taken from chest (v3), bought / coins spent (v4), messages, notes. */
+/** Per-agent totals over the first `upTo` events: placed, removed, taken from chest (v3), bought / coins spent (v4), messages, notes,
+ *  [v5] sword hits dealt / taken, damage dealt / taken, kills. */
 export function agentTotals(log, agents, upTo = log.events.length) {
   const out = {};
-  for (const a of agents) out[a] = { placed: 0, removed: 0, taken: 0, deposited: 0, bought: 0, spent: 0, messages: 0, notes: 0, failed: 0 };
+  for (const a of agents) out[a] = { placed: 0, removed: 0, taken: 0, deposited: 0, bought: 0, spent: 0, messages: 0, notes: 0, failed: 0,
+    hits: 0, hitsTaken: 0, dealt: 0, received: 0, kills: 0 };
   for (let i = 0; i < upTo; i++) {
     const e = log.events[i], s = out[e.agent];
     if (!s) continue;
@@ -73,6 +76,11 @@ export function agentTotals(log, agents, upTo = log.events.length) {
     else if (e.tool === 'deposit') for (const v of Object.values(e.diff.chest)) { if (v > 0) s.deposited += v; }
     else if (e.tool === 'buy') { const b = purchaseOf(e); s.bought += b.n; s.spent += b.cost; }
     else if (e.tool === 'note') s.notes++;
+    const c = combatOf(e);
+    if (c) {
+      s.hits++; s.dealt += c.damage || 0; if (c.killed) s.kills++;
+      const v = out[c.target]; if (v) { v.hitsTaken++; v.received += c.damage || 0; }
+    }
     if (e.chat) s.messages++;
   }
   return out;

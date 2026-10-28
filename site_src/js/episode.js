@@ -4,12 +4,21 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   loadEpisodeIndex, loadEpisodeLog, posAtTime, agentPoseAt, describeEvent, agentColors, agentTotals, finalScore, key,
   finalResults, purchaseOf, leaderboard, deployTopK, itemInfo,
+  teamStatsAt, sideAnalysis, combatOf, finalTeamResults, teamColor,
 } from './core-adapter.js';
-import { blockFaces, doorKey, isTransparent, isDoor, headFaces, clothTexture, swatchUrl } from './textures.js';
+import { blockFaces, doorKey, isTransparent, isDoor, headFaces, clothTexture, swatchUrl, shopFaces } from './textures.js';
 import {
-  $, esc, fmtClock, fmtDuration, fmtScore, scoreBand, SCORE_COLORS, agentLabel, shortModel, reasonLabel,
+  $, esc, fmtClock, fmtDuration, fmtScore, scoreBand, SCORE_COLORS, agentLabel as baseLabel, shortModel, reasonLabel as baseReason,
   prefersReducedMotion, initTheme, onThemeChange, isDark, toast,
 } from './ui.js';
+
+/** "red_3" → "Red 3" (team battle ids); everything else as before ("agent_1" → "Agent 1"). */
+const agentLabel = a => { const m = /^([a-z]+)_(\d+)$/i.exec(String(a)); return m && m[1] !== 'agent' ? `${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}` : baseLabel(a); };
+const reasonLabel = r => (r === 'all_dead' ? 'every agent died' : baseReason(r));
+/** [v5] team helpers (R.teams is null outside team battles). */
+const TC = t => teamColor(R.teams, t);
+const teamName = t => String(t).charAt(0).toUpperCase() + String(t).slice(1);
+const teamOf = a => (R.teams ? R.teams.teamOf[a] : null);
 
 initTheme();
 
@@ -20,6 +29,7 @@ const R = {
   showInterior: false, showNames: true, orbit: false, showNotes: false,
   chatItems: [], chatShown: -1, resultsShownAuto: false,
   sel: null, fadeOthers: true, // sel: Set of agents to show, or null for everyone
+  teams: null, hitsBy: new Map(), hitsOn: new Map(), // [v5] team battle
 };
 /** Whether an agent passes the agent filter (blocks with no placer always do). */
 const isOn = a => !R.sel || a == null || R.sel.has(a);
@@ -117,10 +127,32 @@ function buildStatic() {
   const r = Math.max(W, D) * 0.9;
   Object.assign(sun.shadow.camera, { left: -r, right: r, top: r, bottom: -r, near: 1, far: 90 });
   sun.shadow.camera.updateProjectionMatrix();
+  buildDivider();
   buildChest();
   buildShop();
   buildAvatars();
   applyTheme();
+}
+
+// ---------------------------------------------------------------- [v5] the line between the two halves
+function buildDivider() {
+  const T = R.teams;
+  if (!T) return;
+  const { D } = dims(), x = T.dividerX;
+  const strip = (w, color, opacity, cx) => {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, D), new THREE.MeshBasicMaterial({ color, transparent: opacity < 1, opacity, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
+    m.rotation.x = -Math.PI / 2; m.position.set(cx, 0.015, -D / 2); m.renderOrder = 1;
+    world.root.add(m); return m;
+  };
+  strip(0.55, TC(T.names[0]), 0.3, x - 0.3);
+  strip(0.55, TC(T.names[1]), 0.3, x + 0.3);
+  strip(0.14, 0xfff8d6, 1, x);
+  // the line continues down the front and back faces of the island
+  for (const z of [0.002, -D - 0.002]) {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(0.14, 1), new THREE.MeshBasicMaterial({ color: 0xfff8d6 }));
+    m.position.set(x, -0.5, z); if (z < 0) m.rotation.y = Math.PI;
+    world.root.add(m);
+  }
 }
 
 // ---------------------------------------------------------------- sky + theme
@@ -173,10 +205,15 @@ function buildChest() {
 
 // ---------------------------------------------------------------- [v4] shop: a market stall
 function buildShop() {
-  world.shop = null;
-  const shop = R.built.v4 ? R.built.shop : null;
-  if (!shop || !Array.isArray(shop.pos)) return;
-  const p = shop.pos;
+  world.shop = null; world.shops = [];
+  if (!R.built.v4) return;
+  if (R.teams) {
+    for (const t of R.teams.names) { const p = R.teams.shops[t]; if (Array.isArray(p)) world.shops.push(makeStall(p, TC(t), `${teamName(t)} shop`)); }
+  } else if (R.built.shop && Array.isArray(R.built.shop.pos)) world.shops.push(makeStall(R.built.shop.pos, null, 'Shop'));
+  world.shop = world.shops[0] || null;
+}
+/** One market stall; `color` tints the awning (team shops), null = the v4 red/white stall. */
+function makeStall(p, color, text) {
   const g = new THREE.Group();
   g.position.copy(feetToThree(p[0], p[1], p[2]));
   const add = (geo, mat, x, y, z) => { const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); m.castShadow = m.receiveShadow = true; g.add(m); return m; };
@@ -185,7 +222,7 @@ function buildShop() {
   const dark = new THREE.MeshLambertMaterial({ color: 0x6e4520 });
   add(new THREE.BoxGeometry(1.0, 0.06, 1.0), dark, 0, 0.59, 0);
   for (const [x, z] of [[-0.45, -0.45], [0.45, -0.45], [-0.45, 0.45], [0.45, 0.45]]) add(new THREE.BoxGeometry(0.08, 1.5, 0.08), dark, x, 0.75, z);
-  const sm = blockFaces('shop');
+  const sm = color ? { top: shopFaces(color).awning } : blockFaces('shop');
   const awTop = new THREE.MeshLambertMaterial({ map: cachedTex(sm.top) }), awSide = new THREE.MeshLambertMaterial({ map: cachedTex(sm.top) });
   const awning = add(new THREE.BoxGeometry(1.18, 0.06, 1.18), [awSide, awSide, awTop, awTop, awSide, awSide], 0, 1.52, 0.05);
   awning.rotation.x = 0.17;
@@ -195,19 +232,20 @@ function buildShop() {
     if (itemInfo(t).legacy) return;
     const m = new THREE.Mesh(new THREE.BoxGeometry(sz, sz, sz), blockMaterials(t)); m.position.set(x, 0.62 + sz / 2, z); m.castShadow = true; goods.add(m);
   });
-  const label = labelSprite('Shop', '#d1495b'); label.position.y = 1.95; g.add(label);
+  const label = labelSprite(text, color || '#d1495b'); label.position.y = 1.95; g.add(label);
   world.root.add(g);
-  world.shop = { g, goods, label, bounce: 0 };
+  return { g, goods, label, pos: p };
 }
 
 // ---------------------------------------------------------------- agents
-function labelSprite(text, color) {
+function labelSprite(text, color, ring = null) {
   const c = document.createElement('canvas'); const g = c.getContext('2d');
   const font = '600 34px -apple-system, "Segoe UI", Roboto, sans-serif';
   g.font = font;
   const w = Math.ceil(g.measureText(text).width) + 30; c.width = w; c.height = 50;
   g.font = font;
   g.fillStyle = 'rgba(20,22,26,0.62)'; g.beginPath(); g.roundRect(0, 0, w, 50, 10); g.fill();
+  if (ring) { g.strokeStyle = ring; g.lineWidth = 5; g.beginPath(); g.roundRect(2.5, 2.5, w - 5, 45, 9); g.stroke(); }
   g.fillStyle = color; g.fillRect(10, 17, 8, 16);
   g.fillStyle = '#fff'; g.textBaseline = 'middle'; g.fillText(text, 24, 27);
   const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
@@ -215,12 +253,53 @@ function labelSprite(text, color) {
   const h = 0.34; sp.scale.set(h * w / 50, h, 1); sp.renderOrder = 30;
   return sp;
 }
+/** [v5] An iron sword (grip at the origin, blade along +z). */
+function makeSword() {
+  const s = new THREE.Group();
+  const add = (w, h, d, color, z, emissive = 0) => { const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshLambertMaterial({ color, emissive })); m.position.z = z; m.castShadow = true; s.add(m); return m; };
+  add(0.06, 0.06, 0.2, 0x6b4423, 0.0);
+  add(0.3, 0.07, 0.07, 0x3a3f47, 0.12);
+  add(0.075, 0.03, 0.66, 0xe3e8ee, 0.48, 0x30343a);
+  add(0.04, 0.035, 0.1, 0xe3e8ee, 0.84, 0x30343a);
+  return s;
+}
+const hpTexCache = new Map();
+/** [v5] Small health bar texture (cached per value). */
+function hpTexture(h, max) {
+  const k = h + '/' + max;
+  if (hpTexCache.has(k)) return hpTexCache.get(k);
+  const c = document.createElement('canvas'); c.width = 64; c.height = 12;
+  const g = c.getContext('2d');
+  g.fillStyle = 'rgba(15,15,18,0.8)'; g.fillRect(0, 0, 64, 12);
+  const f = Math.max(0, Math.min(1, h / max));
+  g.fillStyle = f > 0.5 ? '#46c45a' : f > 0.25 ? '#f0b429' : '#e5483b';
+  g.fillRect(2, 2, Math.round(60 * f), 8);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.magFilter = THREE.NearestFilter;
+  hpTexCache.set(k, t);
+  return t;
+}
+/** [v5] Where an agent died: a red cross on the ground and its sword stuck in it. */
+function makeGrave(color) {
+  const g = new THREE.Group();
+  const red = new THREE.MeshBasicMaterial({ color: 0xd62828 });
+  for (const r of [Math.PI / 4, -Math.PI / 4]) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(0.72, 0.03, 0.12), red);
+    m.rotation.y = r; m.position.y = 0.02; g.add(m);
+  }
+  const sw = makeSword(); sw.rotation.x = Math.PI / 2; sw.position.y = 0.95; sw.rotation.z = 0.12; g.add(sw);
+  const band = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.1, 0.1), new THREE.MeshLambertMaterial({ color })); band.position.y = 0.95; g.add(band);
+  g.visible = false;
+  return g;
+}
 function buildAvatars() {
   const cloth = tex(clothTexture());
+  const combat = !!(R.teams && R.teams.combat) || !!R.log.header.equipment;
   R.agents.forEach((a, i) => {
     const col = new THREE.Color(R.colors[a]);
+    const team = teamOf(a);
     const shirt = new THREE.MeshLambertMaterial({ color: col, map: cloth });
-    const pants = new THREE.MeshLambertMaterial({ color: new THREE.Color(0x2f3b6b).lerp(col, 0.15), map: cloth });
+    const pantsCol = team ? new THREE.Color(TC(team)).multiplyScalar(0.42) : new THREE.Color(0x2f3b6b).lerp(col, 0.15);
+    const pants = new THREE.MeshLambertMaterial({ color: pantsCol, map: cloth });
     const skin = new THREE.MeshLambertMaterial({ color: 0xe2b68c });
     const hf = headFaces(i);
     const headMats = [hf.side, hf.side, hf.top, hf.bottom, hf.front, hf.back].map(c => new THREE.MeshLambertMaterial({ map: cachedTex(c) }));
@@ -238,22 +317,81 @@ function buildAvatars() {
     const head = part(0.5, 0.5, 0.5, headMats, 1.5, 0, false);
     fig.scale.setScalar(0.9);
     const g = new THREE.Group(); g.add(fig);
-    const label = labelSprite(agentLabel(a), R.colors[a]); label.position.y = 2.15; g.add(label);
+    const label = labelSprite(agentLabel(a), R.colors[a], team ? TC(team) : null); label.position.y = 2.15; g.add(label);
+    const mats = [shirt, pants, skin, ...headMats];
+    let hp = null, grave = null;
+    if (combat) {
+      const sword = makeSword(); sword.position.set(0, -0.66, 0.02); sword.rotation.x = -0.45; armR.add(sword);
+      hp = new THREE.Sprite(new THREE.SpriteMaterial({ map: hpTexture(20, 20), depthTest: false, transparent: true }));
+      hp.scale.set(0.72, 0.135, 1); hp.position.y = 2.46; hp.renderOrder = 31; hp.visible = false; g.add(hp);
+      grave = makeGrave(R.colors[a]); world.root.add(grave);
+      for (const o of [sword]) o.traverse(m => { if (m.material) mats.push(m.material); });
+    }
     g.visible = false;
     world.root.add(g);
-    world.avatars.set(a, { g, fig, legL, legR, armL, armR, head, torso, label, rot: 0, phase: 0 });
+    world.avatars.set(a, { g, fig, legL, legR, armL, armR, head, torso, label, rot: 0, phase: 0, mats, hp, hpVal: null, grave, fade: 1, flash: 0 });
   });
 }
+/** [v5] Fade an avatar's body (death) — materials are per avatar. */
+function setFade(av, op) {
+  if (Math.abs(av.fade - op) < 1e-3) return;
+  const was = av.fade < 1, now = op < 1;
+  for (const m of av.mats) { m.opacity = op; m.transparent = now; if (was !== now) m.needsUpdate = true; }
+  av.fade = op;
+}
+function setFlash(av, f) {
+  if (Math.abs(av.flash - f) < 1e-3) return;
+  for (const m of av.mats) if (m.emissive) m.emissive.setRGB(0.85 * f, 0.05 * f, 0.05 * f);
+  av.flash = f;
+}
+/** The latest entry of a time-sorted list with t <= now and now - t < win, else null. */
+function recent(list, win) {
+  if (!list) return null;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const h = list[i];
+    if (h.t > R.time + 1e-9) continue;
+    return R.time - h.t < win ? h : null;
+  }
+  return null;
+}
+const SWING = 0.45, KNOCK = 0.4, TOPPLE = 0.55, GONE = 1.7;
 const lerpAngle = (a, b, f) => { let d = ((b - a + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI; return a + d * f; };
 function updateAvatars(dt) {
   const st = R.built.states[R.pos];
+  const maxHp = (R.teams && R.teams.combat && R.teams.combat.max_health) || 20;
+  const cellOf = a => st.positions[a] || (st.deadAt && st.deadAt[a] && st.deadAt[a].at) || null;
   for (const [a, av] of world.avatars) {
+    // [v5] death: topple over, fade out, leave a marker
+    const died = st.deadAt && st.deadAt[a];
+    if (av.grave) av.grave.visible = !!(died && died.at && isOn(a));
+    if (died) {
+      const since = R.time - died.t;
+      if (av.grave && died.at) av.grave.position.copy(feetToThree(died.at[0], died.at[1], died.at[2]));
+      if (since > GONE || !died.at || !isOn(a)) { av.g.visible = false; continue; }
+      av.g.visible = true;
+      av.g.position.copy(feetToThree(died.at[0], died.at[1], died.at[2]));
+      const f = Math.min(1, since / TOPPLE);
+      av.fig.rotation.x = -(Math.PI / 2) * f * f;
+      av.fig.position.y = 0.12 * Math.sin(Math.PI * f) ;
+      setFade(av, since < 0.75 ? 1 : Math.max(0, 1 - (since - 0.75) / (GONE - 0.75)));
+      setFlash(av, Math.max(0, 1 - since / 0.6));
+      av.label.visible = false; if (av.hp) av.hp.visible = false;
+      continue;
+    }
+    if (av.fade !== 1) setFade(av, 1);
+    av.fig.rotation.x = 0; av.fig.position.y = 0;
     const p = agentPoseAt(st, a, R.time);
     if (!p.pos || !isOn(a)) { av.g.visible = false; continue; }
     av.g.visible = true;
     av.g.position.copy(feetToThree(p.pos[0], p.pos[1], p.pos[2]));
     if (p.facing) av.target = Math.atan2(p.facing[0], -p.facing[1]);
-    if (av.target !== undefined) av.rot = lerpAngle(av.rot, av.target, Math.min(1, dt * 12));
+    // [v5] swinging the sword: face the target
+    const hit = recent(R.hitsBy.get(a), SWING);
+    if (hit) {
+      const me = st.positions[a], tc = cellOf(hit.target);
+      if (me && tc && (tc[0] !== me[0] || tc[1] !== me[1])) av.target = Math.atan2(tc[0] - me[0], -(tc[1] - me[1]));
+    }
+    if (av.target !== undefined) av.rot = lerpAngle(av.rot, av.target, Math.min(1, dt * (hit ? 20 : 12)));
     av.g.rotation.y = av.rot;
     let swing = 0, arms = 0;
     if (p.kind === 'walk') { av.phase += dt * 10; swing = Math.sin(av.phase) * 0.75; }
@@ -261,19 +399,44 @@ function updateAvatars(dt) {
     else av.phase = 0;
     av.legL.rotation.x = swing; av.legR.rotation.x = -swing;
     av.armL.rotation.x = -swing + arms; av.armR.rotation.x = swing + arms;
+    if (hit) {
+      const f = (R.time - hit.t) / SWING;
+      av.armR.rotation.x = f < 0.3 ? -0.4 - 2.4 * (f / 0.3) : -2.8 + 2.5 * ((f - 0.3) / 0.7);
+    }
     av.armL.rotation.z = -0.05; av.armR.rotation.z = 0.05;
+    // [v5] being hit: red flash and a short knockback away from the attacker
+    const took = recent(R.hitsOn.get(a), KNOCK);
+    if (took) {
+      const f = (R.time - took.t) / KNOCK, ac = cellOf(took.attacker), me = st.positions[a];
+      if (ac && me) {
+        let dx = me[0] - ac[0], dy = me[1] - ac[1]; const n = Math.hypot(dx, dy) || 1; dx /= n; dy /= n;
+        const k = 0.38 * Math.sin(Math.PI * Math.min(1, f * 1.4));
+        av.g.position.x += dx * k; av.g.position.z -= dy * k; av.g.position.y += 0.12 * Math.sin(Math.PI * Math.min(1, f * 1.4));
+      }
+      setFlash(av, 1 - f);
+    } else setFlash(av, 0);
     av.label.visible = R.showNames;
+    // [v5] health bar when damaged
+    if (av.hp) {
+      const h = st.health ? st.health[a] : null;
+      const show = typeof h === 'number' && h < maxHp;
+      av.hp.visible = show;
+      if (show && av.hpVal !== h) { av.hp.material.map = hpTexture(h, maxHp); av.hp.material.needsUpdate = true; av.hpVal = h; }
+      av.hp.position.y = R.showNames ? 2.46 : 2.12;
+    }
   }
-  // shop: goods hop briefly around purchases
-  if (world.shop) {
-    let want = 0;
+  // shop: goods hop briefly around purchases (the stall nearest to the buyer)
+  if (world.shops && world.shops.length) {
+    let want = 0, buyer = null;
     for (let i = R.pos - 1; i >= 0; i--) {
       const e = R.log.events[i];
       if (R.time - e.t > 0.9) break;
-      if (e.ok && e.tool === 'buy') { want = 1 - (R.time - e.t) / 0.9; break; }
+      if (e.ok && e.tool === 'buy') { want = 1 - (R.time - e.t) / 0.9; buyer = e.agent; break; }
     }
-    world.shop.goods.position.y = 0.12 * Math.sin(Math.PI * want);
-    world.shop.label.visible = R.showNames;
+    let near = world.shops[0];
+    const bp = buyer && st.positions[buyer];
+    if (bp && world.shops.length > 1) near = world.shops.reduce((b, s) => (Math.hypot(s.pos[0] - bp[0], s.pos[1] - bp[1]) < Math.hypot(b.pos[0] - bp[0], b.pos[1] - bp[1]) ? s : b));
+    for (const s of world.shops) { s.goods.position.y = s === near ? 0.12 * Math.sin(Math.PI * want) : 0; s.label.visible = R.showNames; }
   }
   // chest lid: open briefly around take / deposit events
   if (world.chest) {
@@ -332,7 +495,8 @@ function refreshGhosts() {
   const want = new Set();
   const open = R.built.task.kind === 'open';
   if (R.showInterior) {
-    if (open) for (const k of st.stats.interior) want.add(k);
+    if (open && R.teams) { for (const t of R.teams.names) for (const k of sideAnalysis(R.built, R.pos, t).interior) want.add(k); }
+    else if (open) for (const k of st.stats.interior) want.add(k);
     else for (const k of R.built.bp.keys()) if (!st.grid.has(k)) want.add(k);
   }
   for (const [k, m] of world.ghosts) if (!want.has(k)) { world.root.remove(m); world.ghosts.delete(k); }
@@ -366,6 +530,7 @@ function frameCamera() {
   const cp = h.chest_pos || (h.config || {}).chest_pos;
   if (Array.isArray(cp)) pts.push(cp);
   if (R.built.shop && Array.isArray(R.built.shop.pos)) pts.push(R.built.shop.pos);
+  if (R.teams) { for (const p of Object.values(R.teams.shops)) if (Array.isArray(p)) pts.push(p); pts.push([0, 0, 0], [W - 1, D - 1, 0]); }
   for (const p of Object.values(h.positions || {})) if (Array.isArray(p)) pts.push(p);
   if (pts.length < 2) pts.push([0, 0, 0], [W - 1, D - 1, Math.min(H - 1, 3)]);
   const min = new THREE.Vector3(Infinity, Infinity, Infinity), max = min.clone().negate();
@@ -375,7 +540,7 @@ function frameCamera() {
   center.y = Math.max(1, center.y * 0.8);
   const r = Math.max(max.clone().sub(min).length(), 8);
   const aspect = camera.aspect || 1.5;
-  const k = aspect < 1 ? 1.25 / aspect : 1;
+  const k = (aspect < 1 ? 1.25 / aspect : 1) * (R.teams ? 0.72 : 1); // team battles: the whole (wide) platform, framed tighter
   home = { target: center, pos: new THREE.Vector3(center.x + r * 0.62 * k, center.y + r * 0.72 * k, center.z + r * 1.12 * k) };
   resetCamera();
   controls.minDistance = 3; controls.maxDistance = r * 4;
@@ -404,18 +569,21 @@ function updateBubbles() {
   for (const [a, el] of bubbleEls) if (!current.has(a)) { el.remove(); bubbleEls.delete(a); }
   for (const [a, e] of current) {
     const av = world.avatars.get(a);
-    if (!av || !av.g.visible) continue;
     let el = bubbleEls.get(a);
+    if (!av || !av.g.visible) { if (el) el.style.display = 'none'; continue; }
     if (!el || el._ev !== e) {
       el?.remove();
       el = document.createElement('div');
-      el.className = 'say' + (e.chat.channel === 'private' ? ' priv' : '');
+      el.className = 'say' + (e.chat.channel === 'private' ? ' priv' : '') + (e.chat.channel === 'team' ? ' team' : '');
       el.style.setProperty('--c', R.colors[a]);
+      if (R.teams) el.style.setProperty('--tc', TC(e.chat.team || teamOf(a)));
       const txt = e.chat.text.length > 110 ? e.chat.text.slice(0, 107) + '…' : e.chat.text;
-      el.innerHTML = (e.chat.channel === 'private' ? `<span class="to">whisper → ${esc(agentLabel(e.chat.to))}</span>` : '') + esc(txt);
+      const to = e.chat.channel === 'private' ? `whisper → ${esc(agentLabel(e.chat.to))}`
+        : !R.teams ? '' : e.chat.channel === 'team' ? `to team ${esc(e.chat.team || teamOf(a))}` : 'to everyone';
+      el.innerHTML = (to ? `<span class="to">${to}</span>` : '') + esc(txt);
       el._ev = e; layer.appendChild(el); bubbleEls.set(a, el);
     }
-    v3.copy(av.g.position); v3.y += 2.45; v3.project(camera);
+    v3.copy(av.g.position); v3.y += av.hp && av.hp.visible ? 2.62 : 2.45; v3.project(camera);
     const vis = v3.z < 1 && Math.abs(v3.x) < 1.2 && Math.abs(v3.y) < 1.2;
     el.style.display = vis ? '' : 'none';
     el.style.left = `${(v3.x * 0.5 + 0.5) * w}px`; el.style.top = `${(-v3.y * 0.5 + 0.5) * h}px`;
@@ -431,7 +599,7 @@ function setTime(t, fromPlay = false) {
     const forward = p > R.pos && p - R.pos < 40;
     R.pos = p;
     refreshBlocks(fromPlay && forward && !prefersReducedMotion());
-    renderTicker(); renderLiveScore(); renderV4();
+    renderTicker(); renderLiveScore(); renderV4(); renderV5();
   }
   renderChat(); renderAgents(); renderTime(); drawStrip();
 }
@@ -502,10 +670,19 @@ function drawStrip() {
   // played region
   g.fillStyle = accent + '22'; g.fillRect(ST.gutter, top, sx(R.time, w) - ST.gutter, lane * R.agents.length);
   g.font = '11px -apple-system, "Segoe UI", sans-serif'; g.textBaseline = 'middle';
+  const deadAt = R.teams ? R.built.states[R.built.states.length - 1].deadAt : {};
   R.agents.forEach((a, i) => {
-    g.fillStyle = R.colors[a]; g.fillRect(4, top + i * lane + 3, 7, lane - 6);
-    g.fillStyle = muted; g.fillText(agentLabel(a), 15, top + i * lane + lane / 2 + 0.5);
-    if (i) { g.fillStyle = border; g.fillRect(ST.gutter, top + i * lane, w - ST.gutter - ST.padR, 1); }
+    const y = top + i * lane;
+    if (R.teams) { g.fillStyle = TC(teamOf(a)); g.fillRect(0, y + 1, 2, lane - 2); }
+    g.fillStyle = R.colors[a]; g.fillRect(4, y + 3, 7, lane - 6);
+    g.fillStyle = muted; g.fillText(agentLabel(a), 15, y + lane / 2 + 0.5);
+    if (i) {
+      const between = R.teams && teamOf(a) !== teamOf(R.agents[i - 1]);
+      g.fillStyle = between ? muted : border; g.fillRect(ST.gutter, y - (between ? 0.5 : 0), w - ST.gutter - ST.padR, between ? 2 : 1);
+    }
+    // [v5] a dead agent's lane is greyed out after its death
+    const d = deadAt[a];
+    if (d) { const x0 = sx(d.t, w); g.fillStyle = muted + '40'; g.fillRect(x0, y + 1, w - ST.padR - x0, lane - 1); }
   });
   for (const e of R.log.events) {
     const li = idx.get(e.agent); if (li === undefined) continue;
@@ -524,8 +701,24 @@ function drawStrip() {
     else if (e.tool === 'buy') { g.fillStyle = '#d9a514'; g.fillRect(x - 1.5, y + lane - 7, 3, 5); }
     else if (['take', 'deposit', 'give'].includes(e.tool)) { g.fillStyle = '#a8742c'; g.fillRect(x - 1, y + lane - 6, 2, 4); }
     else if (e.tool === 'declare_done') { g.fillStyle = accent; g.fillRect(x - 2, y + 1, 4, lane - 2); }
+    // [v5] sword hits: a red wedge on the attacker's lane, a red tick on the target's lane
+    const c = combatOf(e);
+    if (c) {
+      g.fillStyle = danger; g.beginPath(); g.moveTo(x - 3.5, y + 2); g.lineTo(x + 3.5, y + 2); g.lineTo(x, y + lane - 2); g.fill();
+      const ti = idx.get(c.target);
+      if (ti !== undefined) { g.globalAlpha = isOn(c.target) || isOn(e.agent) ? 1 : 0.18; g.fillRect(x - 1, top + ti * lane + 2, 2, lane - 4); }
+    }
   }
   g.globalAlpha = 1;
+  // [v5] deaths: a red ✕ on the dead agent's lane
+  for (const a in deadAt) {
+    const li = idx.get(a); if (li === undefined) continue;
+    const x = sx(deadAt[a].t, w), y = top + li * lane + lane / 2;
+    g.globalAlpha = isOn(a) ? 1 : 0.3;
+    g.strokeStyle = danger; g.lineWidth = 2.2; g.beginPath();
+    g.moveTo(x - 4, y - 4); g.lineTo(x + 4, y + 4); g.moveTo(x + 4, y - 4); g.lineTo(x - 4, y + 4); g.stroke();
+  }
+  g.globalAlpha = 1; g.lineWidth = 1;
   // axis
   const span = R.tEnd, steps = [5, 10, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600];
   const stepT = steps.find(s => (w - ST.gutter) / (span / s) > 60) || 3600;
@@ -573,6 +766,13 @@ strip.addEventListener('pointerup', () => { dragging = false; });
 function renderLiveScore() {
   const s = R.built.states[R.pos].stats, el = $('liveScore');
   el.hidden = false;
+  if (R.teams) {
+    const ts = teamStatsAt(R.built, R.pos);
+    el.textContent = R.teams.names.map(t => `${teamName(t)} ${ts[t].alive.length}/${ts[t].members.length}`).join(' · ') + ' alive';
+    el.title = 'Living agents per team at the playhead';
+    el.style.background = `linear-gradient(90deg, ${TC(R.teams.names[0])}, ${TC(R.teams.names[1])})`;
+    return;
+  }
   if (R.built.v4) {
     const w = R.built.states[R.pos].wallet;
     el.textContent = `${w} coins`;
@@ -587,7 +787,7 @@ function renderLiveScore() {
 /** [v4] shared wallet bar + latest purchase + leaderboard (blocks placed still standing; deployed badges at the end). */
 let v4Sig = '';
 function renderV4() {
-  if (!R.built.v4) return;
+  if (!R.built.v4 || R.teams) return;
   const st = R.built.states[R.pos];
   const start = R.startMoney || 0, bal = st.wallet ?? 0;
   const lb = leaderboard(st, R.agents);
@@ -607,6 +807,36 @@ function renderV4() {
     <span class="who"><i></i>${esc(agentLabel(r.agent))}${dep ? (dep.has(r.agent) ? ' <span class="dep">deployed</span>' : ' <span class="dep no">not deployed</span>') : ''}</span>
     <span class="bar"><i style="width:${r.score / max * 100}%"></i></span><span class="n">${r.score}</span></li>`).join('');
 }
+/** [v5] per-team status: wallet bar, alive count, blocks on each side, health of each agent. */
+let v5Sig = '';
+function renderV5() {
+  if (!R.teams) return;
+  const ts = teamStatsAt(R.built, R.pos), st = R.built.states[R.pos];
+  const maxHp = (R.teams.combat && R.teams.combat.max_health) || 20;
+  const sig = JSON.stringify([ts, R.sel && [...R.sel]]);
+  if (sig === v5Sig) return;
+  v5Sig = sig;
+  const other = t => R.teams.names.find(x => x !== t);
+  $('teamStatus').innerHTML = R.teams.names.map(t => {
+    const s = ts[t], start = s.startWallet || 0, bal = s.wallet ?? 0, pct = start ? Math.max(0, Math.min(1, bal / start)) : 0;
+    const rows = s.members.map(a => {
+      const d = st.deadAt[a], h = s.health[a];
+      const hp = d ? `<span class="deadinfo"><span class="dead-tag">✕ dead</span> <span class="muted">killed by ${esc(agentLabel(d.by))} at ${fmtClock(d.t)}</span></span>`
+        : typeof h === 'number' ? `<span class="hpbar${h <= maxHp * 0.25 ? ' low' : h <= maxHp * 0.5 ? ' mid' : ''}" role="img" aria-label="health ${h} of ${maxHp}"><i style="width:${Math.max(0, h / maxHp) * 100}%"></i></span><span class="n">${h}</span>` : '';
+      return `<div class="hp-row${d ? ' dead' : ''}${isOn(a) ? '' : ' off'}" style="--c:${R.colors[a]}"><i class="sw"></i><span class="who">${esc(agentLabel(a))}</span>${hp}${s.votes.includes(a) ? '<span class="vote" title="voted that the house is finished">done ✓</span>' : ''}</div>`;
+    }).join('');
+    return `<div class="team-card" style="--tc:${TC(t)}">
+      <div class="tc-head"><b>${esc(teamName(t))}</b><span class="alive">${s.alive.length}/${s.members.length} alive</span>${s.votes.length ? `<span class="muted">${s.votes.length} finished vote${s.votes.length === 1 ? '' : 's'}</span>` : ''}</div>
+      <div class="wallet-row"><span class="v">${bal}</span><span class="muted">of ${start} coins left</span></div>
+      <div class="wallet-bar team${pct < 0.2 ? ' low' : ''}" role="img" aria-label="${bal} of ${start} coins left"><i style="width:${pct * 100}%"></i></div>
+      <div class="tc-stats">
+        <span title="Blocks standing on ${esc(t)}'s half (placed by anyone)">on its side <b>${s.blocksOnSide}</b>${s.othersOnSide ? ` <span class="muted">(${s.othersOnSide} by ${esc(other(t))})</span>` : ''}</span>
+        <span title="Blocks ${esc(t)} placed on the other half, still standing">on the other side <b>${s.byTeamOnOtherSide}</b></span>
+        <span title="Blocks placed by ${esc(t)} that the other team removed">removed by ${esc(other(t))} <b>${s.removedByOther}</b></span>
+      </div>
+      <div class="hp-list">${rows}</div></div>`;
+  }).join('');
+}
 function blk(type) { return `<span class="blk" style="background-image:url(${swatchUrl(type)})"></span>`; }
 let agentsSig = '';
 function renderAgents() {
@@ -619,13 +849,26 @@ function renderAgents() {
     const types = Object.entries(inv).filter(([, v]) => v > 0).sort((x, y) => y[1] - x[1]).slice(0, 3);
     return { a, n, state, types };
   });
-  const sig = JSON.stringify([rows, R.sel && [...R.sel]]);
+  const sig = JSON.stringify([rows, R.sel && [...R.sel], st.dead]);
   if (sig === agentsSig) return;
   agentsSig = sig;
   $('agents').classList.toggle('filtering', !!R.sel);
-  $('agents').innerHTML = rows.map(({ a, n, state, types }) => `<button type="button" class="agent-pill${isOn(a) ? '' : ' off'}" data-agent="${esc(a)}" aria-pressed="${!!R.sel && isOn(a)}" style="--c:${R.colors[a]}" title="${esc(a)}${R.models[a] ? ' · ' + esc(R.models[a]) : ''} · click to filter, double-click to show only this agent">
+  const pill = ({ a, n, state, types }) => {
+    const dead = st.dead && st.dead.includes(a);
+    return `<button type="button" class="agent-pill${isOn(a) ? '' : ' off'}${dead ? ' dead' : ''}" data-agent="${esc(a)}" aria-pressed="${!!R.sel && isOn(a)}" style="--c:${R.colors[a]}" title="${esc(a)}${R.models[a] ? ' · ' + esc(R.models[a]) : ''}${dead ? ' · dead' : ''} · click to filter, double-click to show only this agent">
     <span class="sw"></span>${esc(agentLabel(a))}${R.models[a] ? ` <span class="muted mono" style="font-size:11px">${esc(shortModel(R.models[a]))}</span>` : ''}
-    <span class="hold" title="blocks held">${types.map(([t]) => blk(t)).join('')} ${n}</span>${state ? `<span class="state">${state}</span>` : ''}</button>`).join('');
+    ${dead ? '<span class="state dead">✕ dead</span>' : `<span class="hold" title="blocks held">${types.map(([t]) => blk(t)).join('')} ${n}</span>${state ? `<span class="state">${state}</span>` : ''}`}</button>`;
+  };
+  $('agents').classList.toggle('grouped', !!R.teams);
+  if (!R.teams) { $('agents').innerHTML = rows.map(pill).join(''); return; }
+  // [v5] grouped by team, with a quick-select button per team
+  $('agents').innerHTML = R.teams.names.map(t => {
+    const mem = R.teams.members[t], on = !!R.sel && R.sel.size === mem.length && mem.every(a => R.sel.has(a));
+    const alive = mem.filter(a => !st.dead.includes(a)).length;
+    return `<div class="team-group" style="--tc:${TC(t)}"><div class="team-head"><button type="button" class="team-btn" data-team="${esc(t)}" aria-pressed="${on}" title="${on ? 'Show everyone' : `Show only team ${esc(t)}`}"><i></i>${esc(teamName(t))}</button>
+      <span class="muted">${alive}/${mem.length} alive</span></div>
+      <div class="agents-row">${rows.filter(r => teamOf(r.a) === t).map(pill).join('')}</div></div>`;
+  }).join('');
 }
 
 // ---------------------------------------------------------------- agent filter
@@ -636,7 +879,7 @@ function setSel(sel) {
   $('selHint').textContent = R.sel ? `Showing ${R.sel.size} of ${R.agents.length} agents` : 'Click agents to show only them · double-click to show just one';
   if (!R.log) return;
   refreshBlocks(false); renderAgents(); renderChat(true); renderTicker(); drawStrip();
-  v4Sig = ''; renderV4();
+  v4Sig = ''; renderV4(); v5Sig = ''; renderV5();
 }
 function toggleAgent(a) {
   if (!R.sel) return setSel(new Set([a])); // from everyone, the first click starts a selection
@@ -644,7 +887,15 @@ function toggleAgent(a) {
   s.has(a) ? s.delete(a) : s.add(a);
   setSel(s);
 }
-$('agents').addEventListener('click', ev => { const b = ev.target.closest('[data-agent]'); if (b) toggleAgent(b.dataset.agent); });
+$('agents').addEventListener('click', ev => {
+  const tb = ev.target.closest('[data-team]');
+  if (tb && R.teams) {
+    const mem = R.teams.members[tb.dataset.team] || [];
+    const on = !!R.sel && R.sel.size === mem.length && mem.every(a => R.sel.has(a));
+    return setSel(on ? null : new Set(mem));
+  }
+  const b = ev.target.closest('[data-agent]'); if (b) toggleAgent(b.dataset.agent);
+});
 $('agents').addEventListener('dblclick', ev => { const b = ev.target.closest('[data-agent]'); if (b) setSel(new Set([b.dataset.agent])); });
 $('selAll').addEventListener('click', () => setSel(null));
 $('optFade').addEventListener('change', ev => { R.fadeOthers = ev.target.checked; if (R.log) refreshBlocks(false); });
@@ -723,14 +974,29 @@ function buildChat() {
   R.chatItems = [];
   R.log.events.forEach((e, i) => {
     const isNote = e.ok && e.tool === 'note';
+    // [v5] kills: the system notice everyone got ("<target> was killed by <attacker>")
+    const c = R.teams ? combatOf(e) : null;
+    if (c && c.killed) {
+      const el = document.createElement('div');
+      el.className = 'msg sys';
+      el.innerHTML = `<div class="hd"><span class="tag sys">system</span><span style="margin-left:auto" class="mono">${fmtClock(e.t)}</span></div><div class="body">✕ ${esc(agentLabel(c.target))} was killed by ${esc(agentLabel(c.attacker || e.agent))}</div>`;
+      el.addEventListener('click', () => { pause(); setPos(i + 1); });
+      el.hidden = true; box.appendChild(el);
+      R.chatItems.push({ el, t: e.t, note: false, sys: true, agent: c.target, agents: [c.target, c.attacker || e.agent] });
+    }
     if (!e.chat && !isNote) return;
     const el = document.createElement('div');
     const priv = e.chat && e.chat.channel === 'private';
-    el.className = 'msg' + (priv ? ' priv' : '') + (isNote ? ' note' : '');
+    const teamCh = e.chat && e.chat.channel === 'team';
+    el.className = 'msg' + (priv ? ' priv' : '') + (isNote ? ' note' : '') + (teamCh ? ' team' : '');
     el.style.setProperty('--c', R.colors[e.agent] || '#888');
     const who = e.chat ? e.chat.from || e.agent : e.agent;
+    const tm = teamCh ? e.chat.team || teamOf(who) : null;
+    if (R.teams) el.style.setProperty('--tc', TC(tm || teamOf(who)));
     const tag = priv ? `<span class="tag" title="Private message: only ${esc(agentLabel(e.chat.to))} saw this">private → ${esc(agentLabel(e.chat.to))}</span>`
-      : isNote ? '<span class="tag" title="Private note to self">note</span>' : '';
+      : isNote ? '<span class="tag" title="Private note to self">note</span>'
+      : teamCh ? `<span class="tag team" title="Team channel: only team ${esc(tm)} saw this">team ${esc(tm)}</span>`
+      : R.teams && e.chat ? '<span class="tag all" title="Public channel: both teams saw this">all</span>' : '';
     const text = e.chat ? e.chat.text : (e.args.redacted ? '(note text removed from the public log)' : e.args.text ?? '');
     el.innerHTML = `<div class="hd"><span class="who">${esc(agentLabel(who))}</span>${tag}<span style="margin-left:auto" class="mono">${fmtClock(e.t)}</span></div><div class="body">${esc(text)}</div>`;
     el.addEventListener('click', () => { pause(); setPos(i + 1); });
@@ -741,8 +1007,9 @@ function buildChat() {
   const empty = document.createElement('div'); empty.className = 'chat-empty'; empty.id = 'chatEmpty'; box.appendChild(empty);
   R.chatShown = -1;
 }
+const chatOn = c => (c.agents || [c.agent]).some(isOn);
 function renderChatCount() {
-  const all = R.chatItems.filter(c => !c.note), mine = all.filter(c => isOn(c.agent)).length;
+  const all = R.chatItems.filter(c => !c.note && !c.sys), mine = all.filter(chatOn).length;
   $('chatCount').textContent = !all.length ? '' : R.sel ? `${mine} of ${all.length} messages` : `${all.length} message${all.length === 1 ? '' : 's'}`;
 }
 function renderChat(force) {
@@ -754,7 +1021,7 @@ function renderChat(force) {
   const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60 || R.chatShown < 0 || n < R.chatShown || force;
   let lastVisible = null;
   R.chatItems.forEach((c, i) => {
-    const show = i < n && (!c.note || R.showNotes) && isOn(c.agent);
+    const show = i < n && (!c.note || R.showNotes) && chatOn(c);
     c.el.hidden = !show;
     c.el.classList.remove('latest');
     if (show) lastVisible = c.el;
@@ -770,14 +1037,23 @@ function renderTicker() {
   const out = [];
   for (let i = R.pos - 1; i >= 0 && out.length < 60; i--) {
     const e = R.log.events[i];
-    if (e.tool === 'observe' || e.tool === 'note' || e.chat || !isOn(e.agent)) continue;
+    if (e.tool === 'observe' || e.tool === 'note' || e.chat) continue;
+    if (!isOn(e.agent) && !(combatOf(e) && isOn(combatOf(e).target))) continue; // hits show for the attacker or the target
     if (!e.ok && /^(walking|airborne):/.test(e.message || '')) continue;
     let type = null;
     if (e.tool === 'place' || e.tool === 'take' || e.tool === 'deposit' || e.tool === 'give') type = e.args.type ?? e.args.item;
     if (e.tool === 'buy') type = purchaseOf(e).item;
     if (e.tool === 'remove' && e.diff.grid[0] && e.diff.grid[0].before) type = e.diff.grid[0].before.type;
-    out.push(`<li class="${e.ok ? '' : 'fail'}" data-i="${i}" style="--c:${R.colors[e.agent] || '#888'}"><span class="t">${fmtClock(e.t)}</span><span class="dot"></span>
-      <span class="tx"><b>${esc(agentLabel(e.agent))}</b> ${type ? blk(type) + ' ' : ''}${esc(describeEvent(e))}</span></li>`);
+    const c = combatOf(e);
+    if (c) {
+      // [v5] hits and kills stand out
+      out.push(`<li class="${c.killed ? 'kill' : 'hit'}" data-i="${i}" style="--c:${R.colors[e.agent] || '#888'}"><span class="t">${fmtClock(e.t)}</span><span class="dot"></span>
+        <span class="tx">${c.killed ? '✕' : '⚔'} <b>${esc(agentLabel(e.agent))}</b> ${c.killed ? 'killed' : 'hit'} <b style="color:${R.colors[c.target] || 'inherit'}">${esc(agentLabel(c.target))}</b> <span class="muted">(${c.health_before} → ${c.health_after} health)</span></span></li>`);
+      continue;
+    }
+    const cross = R.teams && e.ok && e.tool === 'remove' && e.diff.grid[0] && e.diff.grid[0].before && teamOf(e.diff.grid[0].before.placed_by) && teamOf(e.diff.grid[0].before.placed_by) !== teamOf(e.agent);
+    out.push(`<li class="${e.ok ? '' : 'fail'}${cross ? ' cross' : ''}" data-i="${i}" style="--c:${R.colors[e.agent] || '#888'}"><span class="t">${fmtClock(e.t)}</span><span class="dot"></span>
+      <span class="tx"><b>${esc(agentLabel(e.agent))}</b> ${type ? blk(type) + ' ' : ''}${esc(describeEvent(e))}${cross ? ` <span class="xside">${esc(teamOf(e.diff.grid[0].before.placed_by))}'s block</span>` : ''}</span></li>`);
   }
   $('ticker').innerHTML = out.join('') || '<li class="muted">Nothing yet.</li>';
 }
@@ -823,7 +1099,58 @@ function showResultsV4() {
   $('resClose').onclick = hideResults;
   $('resReplay').onclick = () => { hideResults(); setTime(0); play(); };
 }
+/** [v5] team battle results: per team survivors, the house analysis of each half, cross-side removals, kills. No winner. */
+function showResultsTeams() {
+  const fr = finalTeamResults(R.log);
+  const totals = agentTotals(R.log, R.agents);
+  const yes = v => (v ? '✓ yes' : '✗ no');
+  const chip = (a, dead) => `<span class="pchip${dead ? ' dead' : ''}" style="--c:${R.colors[a]}"><i></i>${esc(agentLabel(a))}${dead ? ' ✕' : ''}</span>`;
+  const other = t => R.teams.names.find(x => x !== t);
+  const cols = R.teams.names.map(t => {
+    const r = fr.teams[t], a = r.analysis || {};
+    const rows = [
+      ['Enclosed interior', 'enclosed' in a ? yes(a.enclosed) : '–'],
+      ['Interior size', 'interior_cells' in a ? `${a.interior_cells} cells` : '–'],
+      ['Doors to the outside', a.doors ?? '–'],
+      ['Windows', a.windows ?? '–'],
+      ['Shell blocks', a.shell_cells ?? '–'],
+      ['Leftover blocks', a.leftovers ?? '–'],
+      ['Blocks on this half', r.blocks_on_side],
+      ['Blocks it placed (still standing)', `${r.blocks_placed_by_team} (${r.standing ?? '–'})`],
+      [`Placed on ${other(t)}'s half`, r.blocks_by_team_on_other_side],
+      [`Its blocks removed by ${other(t)}`, r.team_blocks_removed_by_other_team],
+      ['Coins spent', typeof r.wallet === 'number' ? `${r.startWallet - r.wallet} of ${r.startWallet}` : '–'],
+    ];
+    return `<div class="team-res" style="--tc:${TC(t)}"><h3>${esc(teamName(t))} team</h3>
+      <div class="alive-line"><b>${r.alive.length}/${r.alive.length + r.dead.length}</b> alive</div>
+      <div class="pchips">${r.alive.map(x => chip(x, false)).join('')}${r.dead.map(x => chip(x, true)).join('')}</div>
+      <table><tbody>${rows.map(([k, v]) => `<tr><td>${esc(k)}</td><td class="n">${esc(v)}</td></tr>`).join('')}</tbody></table></div>`;
+  }).join('');
+  const kills = fr.kills.length ? `<ul class="kills">${fr.kills.map(k => `<li><span class="mono muted">${fmtClock(k.t)}</span> ✕ <b style="color:${R.colors[k.attacker]}">${esc(agentLabel(k.attacker))}</b> killed <b style="color:${R.colors[k.target]}">${esc(agentLabel(k.target))}</b>${teamOf(k.attacker) === teamOf(k.target) ? ' <span class="dep no">own team</span>' : ''}</li>`).join('')}</ul>`
+    : '<p class="muted" style="margin:4px 0">Nobody was killed.</p>';
+  const st = R.built.states[R.built.states.length - 1];
+  const per = R.agents.map(a => {
+    const T = totals[a], d = st.deadAt[a], h = st.health ? st.health[a] : null;
+    return `<tr><td style="white-space:nowrap"><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${R.colors[a]};margin-right:6px"></span>${esc(agentLabel(a))}</td>
+      <td>${d ? '<span class="dead-tag">✕ dead</span>' : typeof h === 'number' ? `${h} hp` : 'alive'}</td>
+      <td class="n">${fr.individual[a] ?? 0}</td><td class="n">${T.placed}</td><td class="n">${T.removed}</td><td class="n">${T.hits}</td><td class="n">${T.kills}</td><td class="n">${T.messages}</td></tr>`;
+  }).join('');
+  $('resCard').classList.add('wide');
+  $('resCard').innerHTML = `
+    <h2 id="resTitle">Results</h2>
+    <div class="muted">${esc(reasonLabel(fr.reason))} after ${fmtDuration(R.tEnd)} · ${R.log.events.length} events</div>
+    <div class="team-res-grid">${cols}</div>
+    <h3>Kills</h3>${kills}
+    <h3>Per agent</h3>
+    <div style="overflow-x:auto"><table><thead><tr><th>Agent</th><th>Status</th><th class="n" title="Blocks this agent placed that are still in the world">Standing</th><th class="n">Placed</th><th class="n">Removed</th><th class="n" title="Successful sword hits">Hits</th><th class="n">Kills</th><th class="n">Messages</th></tr></thead><tbody>${per}</tbody></table></div>
+    <p class="nojudge muted">No judge: neither team was actually evaluated. The agents were told the best house survives, but nothing compared the houses; the analysis above is for research only and was never shown to them.</p>
+    <div class="actions"><a href="./"><button type="button">All builds</button></a><button type="button" id="resClose">Close</button><button type="button" class="primary" id="resReplay">Watch again</button></div>`;
+  $('results').classList.add('show');
+  $('resClose').onclick = hideResults;
+  $('resReplay').onclick = () => { hideResults(); setTime(0); play(); };
+}
 function showResults() {
+  if (R.teams) return showResultsTeams();
   if (R.built.v4) return showResultsV4();
   const fs = finalScore(R.log);
   const end = R.built.states[R.built.states.length - 1].stats;
@@ -959,8 +1286,19 @@ async function main() {
   catch (e) { console.error(e); return fail(`Could not load this replay: ${e.message}`); }
   R.log = log; R.built = log.built;
   R.agents = R.built.agents;
-  R.startMoney = R.built.v4 ? (R.built.shop.startingMoney ?? R.built.states[0].wallet) : null;
-  R.colors = agentColors(R.agents);
+  R.teams = R.built.teams || null;
+  R.startMoney = R.built.v4 && !R.teams ? (R.built.shop.startingMoney ?? R.built.states[0].wallet) : null;
+  R.colors = agentColors(R.agents, R.teams);
+  // [v5] sword hits per attacker / target, for the swing and knockback animations
+  R.hitsBy = new Map(); R.hitsOn = new Map();
+  log.events.forEach(e => {
+    const c = combatOf(e); if (!c) return;
+    const at = c.attacker || e.agent;
+    if (!R.hitsBy.has(at)) R.hitsBy.set(at, []);
+    R.hitsBy.get(at).push({ t: e.t, target: c.target });
+    if (!R.hitsOn.has(c.target)) R.hitsOn.set(c.target, []);
+    R.hitsOn.get(c.target).push({ t: e.t, attacker: at });
+  });
   for (const a of ep.agents || []) R.models[a.id] = a.model;
   const end = log.episodeEnd;
   R.tEnd = Math.max(0.001, end && typeof end.t === 'number' ? end.t : 0, log.events.length ? log.events[log.events.length - 1].t : 0);
@@ -970,22 +1308,29 @@ async function main() {
   // brief card
   const task = R.built.task, cfg = log.header.config || {};
   $('brief').hidden = false;
-  if (task.kind === 'open') { $('briefSum').textContent = 'The brief'; $('briefTxt').textContent = task.brief || '(no brief recorded)'; }
+  if (task.kind === 'open') { $('briefSum').textContent = R.teams ? 'The brief (team battle)' : 'The brief'; $('briefTxt').textContent = task.brief || '(no brief recorded)'; }
   else { $('briefSum').textContent = `Blueprint: ${task.blueprint.name || cfg.blueprint || '?'}`; $('briefTxt').textContent = `Copy a fixed design of ${task.blueprint.cells.length} blocks. Toggle “Target” to see missing cells.`; $('bInterior').textContent = 'Target'; $('bInterior').title = 'Show missing blueprint cells (I)'; }
-  const v4facts = R.built.v4 ? [`${R.startMoney} coins shared`, `${R.built.shop.catalog.length} items in the shop`,
+  const T = R.teams, cb = T && T.combat;
+  const sizes = T ? T.names.map(t => T.members[t].length) : [];
+  const v5facts = T ? [sizes.every(n => n === sizes[0]) ? `${T.names.length} teams × ${sizes[0]}` : sizes.join(' v '),
+    cb ? `sword: ${cb.sword_damage ?? 7} damage · ${cb.max_health ?? 20} health` : null, cb ? 'death is permanent' : null,
+    `${T.startWallets[T.names[0]]} coins per team`, `a shop per team`, 'no judge'] : [];
+  const v4facts = T ? v5facts : R.built.v4 ? [`${R.startMoney} coins shared`, `${R.built.shop.catalog.length} items in the shop`,
     cfg.incentive === 'none' ? 'no incentive' : `top ${deployTopK(log.header)} deployed`] : [];
-  const facts = [`${R.agents.length} agents`, ...v4facts, cfg.scarcity && `${cfg.scarcity} blocks`, cfg.payoff && `${cfg.payoff} payoff`, `${fmtDuration(R.tEnd)}`, reasonLabel(end && end.reason),
+  const facts = [T ? null : `${R.agents.length} agents`, ...v4facts, cfg.scarcity && `${cfg.scarcity} blocks`, cfg.payoff && `${cfg.payoff} payoff`, `${fmtDuration(R.tEnd)}`, reasonLabel(end && end.reason),
     ...[...new Set(Object.values(R.models).filter(Boolean))].map(shortModel)].filter(Boolean);
   $('facts').innerHTML = facts.map(f => `<span class="chip">${esc(f)}</span>`).join('');
   if (ep.notes) $('briefTxt').textContent += `\n\n${ep.notes}`;
   if (window.innerWidth > 900) $('brief').open = true;
 
-  $('v4sec').hidden = !R.built.v4;
+  $('v4sec').hidden = !R.built.v4 || !!R.teams;
+  $('v5sec').hidden = !R.teams;
   buildStatic();
   resize();
   frameCamera();
   sizeStrip();
   buildChat();
+  if (params.has('debug')) window.bsDebug = { R, camera, controls, setTime, THREE }; // inspection from the console only
   const want = (params.get('agents') || '').split(',').filter(a => R.agents.includes(a));
   setSel(want.length ? new Set(want) : null);
   renderChatCount();

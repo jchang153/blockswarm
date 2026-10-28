@@ -85,7 +85,9 @@ class TestConfigAndHeader(unittest.TestCase):
     def test_header(self):
         w = World(Config(), clock=SimClock())
         h = w.recorder.records[0]
-        self.assertEqual(h["log_version"], 4)
+        self.assertEqual(h["log_version"], 5)
+        self.assertEqual((h["variant"], h["teams"], h["shops"], h["wallets"], h["divider_x"], h["combat"],
+                          h["health"], h["equipment"]), ("shop", None, None, None, None, None, None, None))
         self.assertEqual(h["clock"], "simulated")
         self.assertEqual(h["task"], {"kind": "open", "brief": DEFAULT_BRIEF})
         for gone in ("chest", "chest_pos"):
@@ -485,7 +487,7 @@ class TestInventoryAndShop(unittest.TestCase):
         self.assertEqual(w.inventories["a"], {"oak_door": 2})
         ev = events(w)[-1]
         self.assertEqual(ev["diff"], {"grid": [], "wallet": -2 * price, "inventory": {"a": {"oak_door": 2}},
-                                      "agents": {}, "votes": {}})
+                                      "agents": {}, "votes": {}, "combat": {}})
         self.assertEqual(ev["cost"], "action")
         # money: the wallet is shared and can't go negative
         r = w.act("a", "buy", item="diamond_block", n=1)
@@ -713,7 +715,10 @@ class TestSnapshots(unittest.TestCase):
                 self.assertNotIn(gone, rec)
         end = records_of(w, "episode_end")[0]
         self.assertEqual(set(end), {"type", "t", "reason", "wallet", "individual_scores", "ranking", "deployed",
-                                    "analysis", "actions_used"})
+                                    "analysis", "actions_used", "wallets", "health", "dead", "kills", "teams"})
+        # v5 keys in a run without teams or combat
+        self.assertEqual((end["wallets"], end["health"], end["dead"], end["kills"], end["teams"]),
+                         (None, None, [], [], None))
         replay(w.recorder.records)
 
 
@@ -803,12 +808,12 @@ class TestEventShapes(unittest.TestCase):
         w.act("a", "place", x=0, y=0, z=5, type="stone")  # fails
         ev = events(w)
         for e in ev:
-            self.assertEqual(list(e["diff"]), ["grid", "wallet", "inventory", "agents", "votes"])
+            self.assertEqual(list(e["diff"]), ["grid", "wallet", "inventory", "agents", "votes", "combat"])
             for k in ("event_id", "t", "agent", "tool", "args", "cost", "ok", "message", "chat"):
                 self.assertIn(k, e)
         buy, place, give, remove, say, whisper, note, bad = ev
         self.assertEqual(buy["diff"], {"grid": [], "wallet": -2 * CATALOG["stone"].price,
-                                       "inventory": {"a": {"stone": 2}}, "votes": {}, "agents": {}})
+                                       "inventory": {"a": {"stone": 2}}, "votes": {}, "agents": {}, "combat": {}})
         self.assertEqual(place["diff"]["grid"], [{"pos": [11, 2, 0], "before": None,
                                                  "after": {"type": "stone", "placed_by": "a", "placed_at": 0.0}}])
         self.assertEqual(place["diff"]["wallet"], 0)
@@ -818,7 +823,8 @@ class TestEventShapes(unittest.TestCase):
         self.assertEqual(say["chat"], {"channel": "public", "from": "a", "to": None, "text": "hi all"})
         self.assertEqual(whisper["chat"], {"channel": "private", "from": "a", "to": "b", "text": "psst"})
         self.assertEqual((note["args"], note["cost"], note["chat"]), ({"text": "remember"}, "free", None))
-        self.assertEqual(bad["diff"], {"grid": [], "wallet": 0, "inventory": {}, "agents": {}, "votes": {}})
+        self.assertEqual(bad["diff"], {"grid": [], "wallet": 0, "inventory": {}, "agents": {}, "votes": {},
+                                       "combat": {}})
         snap = w.snapshot()
         self.assertEqual(snap["wallet"], 1000 - 2 * CATALOG["stone"].price)
         self.assertNotIn("chest", snap)

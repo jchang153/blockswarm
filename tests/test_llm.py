@@ -347,6 +347,135 @@ class TestAgent(unittest.TestCase):
         self.assertTrue(any(r["type"] == "implicit_wait" for r in w.recorder.records))
 
 
+RED = [f"red_{i}" for i in range(1, 6)]
+BLUE = [f"blue_{i}" for i in range(1, 6)]
+TEAM_KEYS = {"variant": "team_battle", "teams": {"red": RED, "blue": BLUE},
+             "shops": {"red": [6, 10, 0], "blue": [33, 10, 0]}, "divider_x": 20, "width": 40, "depth": 20,
+             "height": 10}
+
+
+def world_has_teams() -> bool:
+    return "teams" in getattr(Config, "__dataclass_fields__", {})
+
+
+class TestDeadAgent(unittest.TestCase):
+    """A killed agent's loop stops (World.is_alive false), before a call or mid-response."""
+
+    def test_loop_stops_when_killed(self):
+        w = make_world(2)
+        alive = {"agent_1": True, "agent_2": True}
+        w.is_alive = lambda a: alive[a]  # stands in for the engine's team-battle death
+
+        def script(state, messages):
+            if state["call_index"] == 0:  # first call: the agent is killed during it
+                alive[state["agent"]] = False
+            return mock_result(tool_call("note", text="a"), tool_call("note", text="b"))
+
+        client = MockClient(script)
+        ag = make_agent(w, "agent_1", client, max_model_calls_per_agent=5)
+        th = threading.Thread(target=ag.run, daemon=True)
+        th.start()
+        th.join(10)
+        self.assertFalse(th.is_alive())
+        self.assertEqual(ag.stop_reason, "dead")
+        self.assertEqual(len(client.calls), 1)
+        self.assertFalse([r for r in w.recorder.records if r["type"] == "event"])  # no tool ran
+        res = [r for r in w.recorder.records if r["type"] == "tool_results"][0]["results"]
+        self.assertTrue(all(not r["ok"] and "killed" in r["content"] for r in res))
+        stop = [r for r in w.recorder.records if r["type"] == "agent_stop"]
+        self.assertEqual([r["reason"] for r in stop], ["dead"])
+        # an agent that is already dead makes no model call at all
+        client2 = MockClient(script)
+        ag2 = make_agent(w, "agent_1", client2)
+        self.assertEqual(ag2.run(), "dead")
+        self.assertEqual(client2.calls, [])
+        self.assertFalse(w.done)  # other agents go on
+
+    @unittest.skipUnless(world_has_teams(), "world.py has no team battle yet")
+    def test_killed_in_real_world(self):
+        from blockswarm.clock import SimClock
+        cfg = Config(agents=RED + BLUE, start_positions=[[2 + 2 * i, 2, 0] for i in range(5)]
+                     + [[2 + 2 * i, 3, 0] for i in range(5)], attack_cooldown_s=0.0, **TEAM_KEYS)
+        w = World(cfg, Recorder(), clock=SimClock())
+        for _ in range(3):
+            self.assertTrue(w.act("blue_1", "attack", target="red_1").ok)
+        self.assertFalse(w.is_alive("red_1"))
+        client = MockClient([])
+        ag = LLMAgent(w, "red_1", client, MODEL, Budget(1.0),
+                      LLMConfig.from_dict({"max_tokens": 64, "prices": PRICES, "stagger_s": 0}))
+        self.assertEqual(ag.run(), "dead")
+        self.assertEqual(client.calls, [])
+
+
+@unittest.skipUnless(world_has_teams(), "world.py has no team battle yet")
+class TestTeamWait(unittest.TestCase):
+    def test_wait_wakes_on_own_team_message_and_hits(self):
+        cfg = Config(agents=RED + BLUE, start_positions=[[2 + 2 * i, 2, 0] for i in range(5)]
+                     + [[2 + 2 * i, 3, 0] for i in range(5)], **TEAM_KEYS)
+        w = World(cfg, Recorder(), clock=WallClock())
+        ag = make_agent(w, "red_1", MockClient([]))
+        start = w.last_event_id()
+        self.assertTrue(w.act("blue_1", "say", text="blue team only").ok)
+        self.assertIsNone(ag._noticeable(start, w.last_event_id()))
+        start = w.last_event_id()
+        self.assertTrue(w.act("red_2", "say", text="red team").ok)
+        self.assertEqual(ag._noticeable(start, w.last_event_id()), "red_2 sent a message")
+        start = w.last_event_id()
+        self.assertTrue(w.act("blue_1", "attack", target="red_1").ok)
+        self.assertEqual(ag._noticeable(start, w.last_event_id()), "you were hit by blue_1")
+
+
+class TestTeamConfig(unittest.TestCase):
+    @unittest.skipUnless(world_has_teams(), "world.py has no team battle yet")
+    def test_teams_define_agents_and_team_models(self):
+        raw = {"budget_usd": 1.0, "team_models": {"red": "m/a", "blue": "m/b"},
+               "llm": {"prices": {"m/a": {"input_per_m": 1, "output_per_m": 1},
+                                  "m/b": {"input_per_m": 1, "output_per_m": 1}}}, **TEAM_KEYS}
+        rc = resolve_config(raw)
+        self.assertEqual(rc["agents"], RED + BLUE)
+        self.assertEqual({rc["models"][a] for a in RED}, {"m/a"})
+        self.assertEqual({rc["models"][a] for a in BLUE}, {"m/b"})
+        self.assertEqual(rc["world_cfg"].teams, {"red": RED, "blue": BLUE})
+        self.assertTrue(rc["world_cfg"].brief.startswith("Your team and the other team are each building"))
+        for f in ("shops", "divider_x", "variant"):
+            self.assertIn(f, rc["world_kwargs"])
+        same = {k: v for k, v in raw.items() if k != "team_models"}
+        rc = resolve_config({**same, "model": MODEL, "llm": {"prices": PRICES}})
+        self.assertEqual(set(rc["models"].values()), {MODEL})
+
+    def test_team_config_refusals(self):
+        base = {"budget_usd": 1.0, "llm": {"prices": PRICES}, **TEAM_KEYS}
+        with self.assertRaises(ConfigError):
+            resolve_config({**base, "model": MODEL, "team_models": {"red": MODEL, "blue": MODEL}})
+        with self.assertRaises(ConfigError):
+            resolve_config({**base, "team_models": {"red": MODEL}})
+        with self.assertRaises(ConfigError):
+            resolve_config({**base, "model": MODEL}, n_agents=4)
+        with self.assertRaises(ConfigError):
+            resolve_config({**base, "model": MODEL, "agents": BLUE + RED})
+        with self.assertRaises(ConfigError):
+            resolve_config({"budget_usd": 1.0, "model": MODEL, "team_models": {"a": MODEL}})
+
+    def test_shipped_team_configs(self):
+        root = Path(__file__).resolve().parents[1] / "configs"
+        for name in ("teams-mock", "teams-dsv4flash", "teams-glm53flash", "teams-gpt6luna", "teams-haiku55"):
+            with self.subTest(name=name):
+                raw = json.loads((root / f"{name}.json").read_text())
+                self.assertEqual(raw["episode_id"], name)
+                self.assertEqual(raw["variant"], "team_battle")
+                self.assertEqual(raw["teams"], {"red": RED, "blue": BLUE})
+                self.assertEqual(raw["shops"], {"red": [6, 10, 0], "blue": [33, 10, 0]})
+                self.assertEqual((raw["width"], raw["depth"], raw["height"], raw["divider_x"]), (40, 20, 10, 20))
+                if name != "teams-mock":
+                    self.assertEqual((raw["max_seconds"], raw["budget_usd"]), (1800, 20.0))
+                    pilot = json.loads((root / f"pilot2-{name[6:]}.json").read_text())
+                    self.assertEqual(raw["llm"], pilot["llm"])
+                    self.assertEqual(raw["model"], pilot["model"])
+                if world_has_teams():
+                    rc = resolve_config(raw, mock=True)
+                    self.assertEqual(rc["agents"], RED + BLUE)
+
+
 class TestRunner(unittest.TestCase):
     def check_episode(self, run_dir: Path, n: int) -> list[dict]:
         recs = read_log(run_dir)
@@ -382,6 +511,24 @@ class TestRunner(unittest.TestCase):
                 self.assertTrue(any(r["type"] == "event" and r["ok"] for r in recs))
                 self.assertEqual(recs[0]["config"]["target_interior"], 4 * n)
                 self.assertEqual(recs[0]["config"]["models"], {f"agent_{i}": MODEL for i in range(1, n + 1)})
+
+    @unittest.skipUnless(world_has_teams(), "world.py has no team battle yet")
+    def test_mock_team_battle_episode(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = write_config(Path(d), n_agents=None, max_seconds=6.0, budget_usd=5.0, **TEAM_KEYS)
+            raw = json.loads(cfg.read_text())
+            del raw["n_agents"]
+            cfg.write_text(json.dumps(raw))
+            res = run_episode(cfg, run_dir=Path(d) / "run", mock=True, quiet=True)
+            recs = self.check_episode(Path(d) / "run", 10)
+            self.assertEqual(recs[0]["teams"], {"red": RED, "blue": BLUE})
+            prompts = [r for r in recs if r["type"] == "agent_prompt"]
+            self.assertEqual(len(prompts), 10)
+            self.assertTrue(all("Whichever team builds the best house" in r["system_prompt"] for r in prompts))
+            self.assertIn("Whichever team builds the best house", recs[0]["task"]["brief"])
+            self.assertTrue(all("attack" in [t["function"]["name"] for t in r["tools"]] for r in prompts))
+            self.assertTrue(any(r["type"] == "event" and r["tool"] == "buy" and r["ok"] for r in recs))
+            self.assertIn(res["end_reason"], ("time_limit", "all_done", "all_dead"))
 
     def test_budget_exhaustion_stops_all(self):
         with tempfile.TemporaryDirectory() as d:

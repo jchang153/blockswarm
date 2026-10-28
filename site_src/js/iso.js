@@ -1,11 +1,27 @@
 // Isometric 2D-canvas rendering of a build (gallery thumbnails). Cheap: no WebGL context per card.
 // Uses the same procedural textures as the 3D replay. View from the south-east, like the replay camera.
-import { blockFaces, doorKey, isTransparent, isDoor } from './textures.js';
+import { blockFaces, doorKey, isTransparent, isDoor, shopFaces } from './textures.js';
+import { teamColor } from './core-adapter.js';
+
+// [v5] grass top with the team-battle line painted along its east (edge 'e') or west (edge 'w') edge
+const lineCache = new Map();
+function grassLine(edge) {
+  if (lineCache.has(edge)) return lineCache.get(edge);
+  const base = blockFaces('grass');
+  const c = document.createElement('canvas'); c.width = c.height = 16;
+  const g = c.getContext('2d');
+  g.drawImage(base.top, 0, 0);
+  g.fillStyle = '#fff8d6'; g.fillRect(edge === 'e' ? 14 : 0, 0, 2, 16);
+  const f = { ...base, top: c };
+  lineCache.set(edge, f);
+  return f;
+}
 
 /**
  * Draw blocks on a canvas (sized to its CSS box × devicePixelRatio).
  * build = {final_blocks: [[x, y, z, type], ...], grid: {width, depth, height}, chest_pos: [x, y, z] | null,
- *          shop_pos: [x, y, z] | null (log v4)}. Item types resolve through the catalog registered in core
+ *          shop_pos: [x, y, z] | null (log v4), shops: {team: [x, y, z]} | null and divider_x (log v5 team battle;
+ *          team_order optional)}. Item types resolve through the catalog registered in core
  *          (the caller sets it per episode with setCatalog for v4 summaries).
  */
 export function drawIso(canvas, build, { pad = 0.08, island = 2 } = {}) {
@@ -21,8 +37,15 @@ export function drawIso(canvas, build, { pad = 0.08, island = 2 } = {}) {
   for (const [x, y, z, t] of build.final_blocks || []) cells.set(k(x, y, z), t);
   const cp = Array.isArray(build.chest_pos) ? build.chest_pos : null;
   if (cp) cells.set(k(cp[0], cp[1], cp[2]), '__chest');
-  const sp = Array.isArray(build.shop_pos) ? build.shop_pos : null;
-  if (sp) cells.set(k(sp[0], sp[1], sp[2]), '__shop');
+  const teamShops = build.shops && typeof build.shops === 'object' ? build.shops : null;
+  const teams = teamShops ? { names: Array.isArray(build.team_order) ? build.team_order : Object.keys(teamShops) } : null;
+  if (teamShops) {
+    for (const t in teamShops) { const p = teamShops[t]; if (Array.isArray(p)) cells.set(k(p[0], p[1], p[2]), '__shop:' + t); }
+  } else {
+    const sp = Array.isArray(build.shop_pos) ? build.shop_pos : null;
+    if (sp) cells.set(k(sp[0], sp[1], sp[2]), '__shop');
+  }
+  const div = teamShops && typeof build.divider_x === 'number' ? build.divider_x : null;
 
   // ground island: bounding box of the build (+ margin), clamped to the grid
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
@@ -33,7 +56,8 @@ export function drawIso(canvas, build, { pad = 0.08, island = 2 } = {}) {
   if (!isFinite(x0)) { x0 = 0; y0 = 0; x1 = grid.width - 1; y1 = grid.depth - 1; }
   x0 = Math.max(0, x0 - island); y0 = Math.max(0, y0 - island);
   x1 = Math.min(grid.width - 1, x1 + island); y1 = Math.min(grid.depth - 1, y1 + island);
-  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) cells.set(k(x, y, -1), 'grass');
+  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++)
+    cells.set(k(x, y, -1), div === null ? 'grass' : x === div - 1 ? 'grass:e' : x === div ? 'grass:w' : 'grass');
 
   // projection (unit a = 1): +x → right-down, +y → right-up, +z → up
   const EX = [1, 0.5], EY = [1, -0.5], EZ = [0, -1.18];
@@ -50,7 +74,7 @@ export function drawIso(canvas, build, { pad = 0.08, island = 2 } = {}) {
   const vec = v => [v[0] * s, v[1] * s];
   const ex = vec(EX), ey = vec(EY), ez = vec(EZ);
 
-  const special = t => t === '__chest' || t === '__shop' || t === 'grass';
+  const special = t => t === '__chest' || t.startsWith('__shop') || t.startsWith('grass');
   const opaqueAt = (x, y, z) => { const t = cells.get(k(x, y, z)); return t !== undefined && (special(t) || !isTransparent(t)); };
   const typeAt = (x, y, z) => cells.get(k(x, y, z));
   const face = (img, o, u, v, shade) => {
@@ -64,7 +88,8 @@ export function drawIso(canvas, build, { pad = 0.08, island = 2 } = {}) {
   const neg = v => [-v[0], -v[1]];
   for (const { x, y, z, t } of list) {
     const isChest = t === '__chest';
-    const faces = isChest ? blockFaces('chest') : t === '__shop' ? blockFaces('shop') : t === 'grass' ? blockFaces('grass')
+    const faces = isChest ? blockFaces('chest') : t === '__shop' ? blockFaces('shop') : t.startsWith('__shop:') ? shopFaces(teamColor(teams, t.slice(7)))
+      : t === 'grass' ? blockFaces('grass') : t.startsWith('grass:') ? grassLine(t.slice(6))
       : blockFaces(isDoor(t) ? doorKey(typeAt, x, y, z) : t);
     const glassy = !special(t) && isTransparent(t);
     const skip = (nx, ny, nz) => opaqueAt(nx, ny, nz) || (glassy && typeAt(nx, ny, nz) === t);

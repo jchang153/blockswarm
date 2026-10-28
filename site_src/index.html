@@ -7,6 +7,7 @@
 <meta name="description" content="Replays of LLM agents with bodies building a house together in a shared block world.">
 <link rel="icon" href="img/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="css/site.css">
+<link rel="stylesheet" href="css/gallery.css">
 </head>
 <body>
 <header class="topbar">
@@ -23,6 +24,11 @@
     <h1 id="heroTitle">BlockSwarm</h1>
     <p id="heroSub">Teams of LLM agents walk, buy blocks with a shared wallet and talk to each other while they build a house in a small block world. Pick a run to watch the replay.</p>
   </section>
+
+  <div class="cats">
+    <div class="cat-filter" id="catFilter" role="group" aria-label="Filter by variant" hidden></div>
+    <p class="cat-desc" id="catDesc" aria-live="polite"></p>
+  </div>
 
   <div class="toolbar" role="search">
     <label>Task <select id="fTask"><option value="">All</option></select></label>

@@ -63,6 +63,37 @@ when you change N on the command line). The world scales the shared wallet (`sta
 unless the config sets them. Cost
 scales roughly linearly with N; check the dry run.
 
+## Team battle (v5)
+
+Two teams build on opposite halves of one platform; design and rules in docs/team-battle.md.
+Same three steps:
+
+```bash
+python3 scripts/run_episode.py configs/teams-mock.json --mock          # offline, 2 x 5 mock agents, 120 s
+python3 scripts/run_episode.py configs/teams-glm53flash.json --dry-run  # validate + spending plan
+python3 scripts/run_episode.py configs/teams-glm53flash.json            # real run (paid)
+```
+
+`configs/teams-{dsv4flash,glm53flash,gpt6luna,haiku55}.json` are 2 x 5 configs (40 x 20 x 10
+platform, line at `divider_x` 20, shops red `[6, 10, 0]` / blue `[33, 10, 0]`, 1800 s,
+`budget_usd` 20; LLM settings and prices as the pilot2 configs). A team battle config sets
+`"variant": "team_battle"` and `"teams": {"red": [...], "blue": [...]}`; the agent list is the
+teams' members in order (`agents` / `n_agents` may be omitted, `--n-agents` is refused), plus
+`shops`, `divider_x` and the combat keys (`combat`, `max_health`, `sword_damage`,
+`attack_reach`, `attack_cooldown_s`). To pit two models against each other, replace `"model"`
+with `"team_models": {"red": "<model a>", "blue": "<model b>"}` and put both models' prices in
+`llm.prices`. Budget and cost control are unchanged (one shared `budget_usd` for all 10 agents,
+so expect about twice the spend of a 5-agent pilot).
+
+Agents get a separate prompt (prompts.py, `PROMPT_VERSION` v5.0): the brief, their team, the
+other team, the sides and the line, both shops, the team wallet, the channels (`say` = own team,
+`say_all` = everyone, `whisper` = one agent) and the sword/health rules as plain facts, with no
+hint either way about attacking or crossing. An agent that is killed stops its loop
+(`agent_stop` reason `dead`); its blocks stay. The `--mock` policy for team battle builds on
+its own side and now and then uses team say, `say_all`, raids across the line and `attack`, so
+a mock log shows every new mechanic in the viewer. The manifest adds `wallets`, `health`,
+`dead`, `kills` and per-team `teams` from `episode_end`.
+
 ## Outputs: `runs/<run_id>/` (git-ignored)
 
 | File | Contents |

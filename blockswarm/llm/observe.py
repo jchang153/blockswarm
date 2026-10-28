@@ -18,15 +18,22 @@ Design (see also prompts.py):
 - Scores appear only when the view has them (config show_leaderboard).
 - The agent's own tool results are not repeated here; the loop returns them as tool results
   (render_tool_result).
+- Team battle (view has `teams`; docs/team-battle.md): adds the agent's team and side, the line,
+  health and equipment, the team wallet, both shops, teammates and the other team's agents
+  (with their team; killed agents marked, from `dead` in the view or the kill notices), message
+  channel labels ([team], [all], [private], [system]) and the team's finished votes. Nothing of
+  this appears without `teams`, so v4 observations are unchanged.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import re
 from typing import Any, Iterable
 
 from blockswarm.catalog import CATALOG
+from blockswarm.tasks import DEFAULT_BRIEF
 from blockswarm.world import ray_cells
 
 MAX_NOTES_CHARS = 2000  # newest notes shown up to this many characters in total
@@ -144,6 +151,11 @@ class ObservationMemory:
         self.known: dict[Pos, dict[str, Any]] = {}
         self.agents_seen: dict[str, tuple[list[int], float]] = {}
         self._msg_keys: set = set()
+        # team battle: killed agents -> (killer or None, t), from the view or kill notices
+        self.dead: dict[str, tuple[str | None, float | None]] = {}
+
+
+KILL_RE = re.compile(r"^(\S+) was killed by (\S+?)\.?$")
 
 
 def _in_clear_view(eye: tuple[float, float, float], cell: Pos, radius: float,
@@ -172,6 +184,45 @@ def _message_line(m: dict, me: str) -> str | None:
             return None
         return f"[t={t:.1f}] SYSTEM: {text}"
     return None
+
+
+def _team_message_line(m: dict, me: str, my_team: str | None) -> str | None:
+    """Team-battle message line with a channel label: [team], [all], [private] or [system]."""
+    ch, frm, to = m.get("channel"), m.get("from"), m.get("to")
+    t = m.get("t", 0.0)
+    text = m.get("text", "")
+    who = "you" if frm == me else frm
+    if ch == "team":
+        if m.get("team") not in (None, my_team):
+            return None  # another team's channel
+        return f"[t={t:.1f}] [team] {who}: {text}"
+    if ch == "public":
+        return f"[t={t:.1f}] [all] {who}: {text}"
+    if ch == "private":
+        if me not in (frm, to):
+            return None
+        if frm == me:
+            return f"[t={t:.1f}] [private] you -> {to}: {text}"
+        return f"[t={t:.1f}] [private] {frm} -> you: {text}"
+    if ch == "system":
+        if to not in (None, me) or m.get("team") not in (None, my_team):
+            return None
+        return f"[t={t:.1f}] [system] {text}"
+    return None
+
+
+def _team_of(teams: dict, agent: str) -> str | None:
+    for team, members in teams.items():
+        if agent in members:
+            return team
+    return None
+
+
+def _shop_line(label: str, spos: Pos, pos: Pos, eye: tuple, in_reach: Any) -> str:
+    sdist = math.dist(eye, (spos[0] + 0.5, spos[1] + 0.5, spos[2] + 0.5))
+    reach_txt = {True: "within reach", False: "not within reach"}.get(in_reach, "")
+    return (f"{label} at {fmt_pos(spos)}, offset {_fmt_off(c - p for c, p in zip(spos, pos))}, "
+            f"{sdist:.1f} from your eyes" + (f"; {reach_txt}" if reach_txt else ""))
 
 
 def shop_pos(view: dict) -> Pos:
@@ -224,22 +275,56 @@ def render_observation(view: dict, memory: ObservationMemory) -> str:
         status.append(f"next action allowed at t={nxt:.1f}")
     out.append(f"=== OBSERVATION #{memory.count + 1} | t={t:.1f}s of {view['max_seconds']:g}s"
                f" ({max(0.0, view['max_seconds'] - t):.0f}s left) ===")
-    out.append(f"You: {me} | feet at {fmt_pos(pos)} (eyes at z={eye[2]:.2f})"
+    teams: dict = {k: list(v) for k, v in (view.get("teams") or {}).items()}
+    my_team = (view.get("team") or _team_of(teams, me)) if teams else None
+    if teams:
+        for m in view.get("messages", []):  # kill notices, also from messages not shown again
+            if m.get("channel") == "system":
+                km = KILL_RE.match(m.get("text", ""))
+                if km and km.group(1) in agents:
+                    memory.dead.setdefault(km.group(1), (km.group(2), m.get("t")))
+        for a in view.get("dead") or []:
+            memory.dead.setdefault(a, (None, None))
+        if me in memory.dead:
+            status.insert(0, "KILLED (you can no longer act)")
+    out.append(f"You: {me}" + (f" (team {my_team})" if teams else "") + f" | feet at {fmt_pos(pos)} (eyes at z={eye[2]:.2f})"
                + (" | " + "; ".join(status) if status else " | standing"))
+    if teams:
+        dx = int(view.get("divider_x") if view.get("divider_x") is not None else view["grid"]["width"] // 2)
+        order = list(teams)
+        side = order[0] if pos[0] < dx else (order[1] if len(order) > 1 else order[0])
+        out.append(f"Side: you are on the {side} side ({'your team' if side == my_team else 'the other team'}'s "
+                   f"side); the line runs between x = {dx - 1} and x = {dx} ({order[0]} side x < {dx}"
+                   + (f", {order[1]} side x >= {dx}" if len(order) > 1 else "") + ")")
+        if view.get("health") is not None:
+            eq = view.get("equipment") or []
+            out.append(f"Health: {view['health']}/{view.get('max_health', 20)}"
+                       + (f" | Equipment: {', '.join(eq)}" if eq else ""))
     out.append(f"Actions used: {view['actions_used']} ({view['actions_remaining']} left)")
     inv = view.get("inventory") or {}
     held = sum(inv.values())
     out.append(f"Inventory ({held}/{view['inventory_cap']}): {_counts(inv)}")
 
     # ---- wallet and shop
-    if view.get("wallet") is not None:
-        out.append(f"Wallet ({'shared by the whole team' if len(agents) > 1 else 'yours'}; no refunds): "
-                   f"{view['wallet']} coins")
-    spos = shop_pos(view)
-    sdist = math.dist(eye, (spos[0] + 0.5, spos[1] + 0.5, spos[2] + 0.5))
-    reach_txt = {True: "within reach", False: "not within reach"}.get(view.get("shop_in_reach"), "")
-    out.append(f"Shop at {fmt_pos(spos)}, offset {_fmt_off(c - p for c, p in zip(spos, pos))}, "
-               f"{sdist:.1f} from your eyes" + (f"; {reach_txt}" if reach_txt else ""))
+    if teams:
+        if view.get("wallet") is not None:
+            out.append(f"Team wallet ({my_team}; shared by your team; no refunds): {view['wallet']} coins")
+        shops = view.get("shops") or {}
+        sir = view.get("shops_in_reach")
+        for team, sp in shops.items():
+            flag = sir.get(team) if isinstance(sir, dict) else None
+            label = f"Shop of the {team} team" + (" (yours)" if team == my_team else "")
+            out.append(_shop_line(label, tuple(sp), pos, eye, flag))
+        if not isinstance(sir, dict) and view.get("shop_in_reach") is not None:
+            out.append("A shop is within reach" if view["shop_in_reach"] else "No shop is within reach")
+        shop_cells = {tuple(p) for p in shops.values()} or {shop_pos(view)}
+    else:
+        if view.get("wallet") is not None:
+            out.append(f"Wallet ({'shared by the whole team' if len(agents) > 1 else 'yours'}; no refunds): "
+                       f"{view['wallet']} coins")
+        spos = shop_pos(view)
+        out.append(_shop_line("Shop", spos, pos, eye, view.get("shop_in_reach")))
+        shop_cells = {spos}
 
     # ---- blocks: visible now, changes, remembered
     visible: dict[Pos, dict] = {}
@@ -253,7 +338,7 @@ def render_observation(view: dict, memory: ObservationMemory) -> str:
     gone: dict[Pos, str] = {}
     candidates = {p: k for p, k in memory.known.items() if p not in visible}
     solids = ({p for p, b in visible.items() if is_opaque(b["type"])}
-              | {p for p, k in candidates.items() if is_opaque(k["type"])} | {spos})
+              | {p for p, k in candidates.items() if is_opaque(k["type"])} | shop_cells)
     changed = True
     while changed:  # a removed near block can uncover a removed far one
         changed = False
@@ -305,12 +390,24 @@ def render_observation(view: dict, memory: ObservationMemory) -> str:
     # ---- agents
     others = [a for a in agents if a != me]
     vis = {o["id"]: o for o in view.get("agents_visible", [])}
-    if others:
+    if teams:
+        groups = [(f"TEAMMATES ({my_team}, {len(teams.get(my_team, [])) - 1})",
+                   [a for a in teams.get(my_team, []) if a != me])]
+        groups += [(f"OTHER TEAM ({t}, {len(m)})", list(m)) for t, m in teams.items() if t != my_team]
+    else:
+        groups = [(f"TEAMMATES ({len(others)})", others)] if others else []
+    for title, members in groups:
         out.append("")
-        out.append(f"TEAMMATES ({len(others)}):")
-        for a in others:
+        out.append(f"{title}:")
+        for a in members:
             o = vis.get(a)
             mark = agent_mark(agents, a)
+            if teams and a in memory.dead:
+                by, kt = memory.dead[a]
+                out.append(f"  {a}: killed" + (f" by {'you' if by == me else by}" if by else "")
+                           + (f" at t={kt:.1f}" if kt is not None else "") + " (can no longer act)")
+                memory.agents_seen.pop(a, None)
+                continue
             if o is not None:
                 p = tuple(o["pos"])
                 d = min(math.dist(eye, (p[0] + 0.5, p[1] + 0.5, p[2] + dz + 0.5)) for dz in (0, 1))
@@ -330,9 +427,13 @@ def render_observation(view: dict, memory: ObservationMemory) -> str:
 
     # ---- task
     task = view.get("task") or {}
-    if first and task.get("brief"):
+    brief = task.get("brief")
+    if teams and (not brief or brief == DEFAULT_BRIEF):  # world built without the team brief
+        from blockswarm.llm.prompts import TEAM_BRIEF
+        brief = TEAM_BRIEF
+    if first and brief:
         out.append("")
-        out.append(f"BRIEF: {task['brief']}")
+        out.append(f"BRIEF: {brief}")
 
     # ---- messages
     lines = []
@@ -340,7 +441,7 @@ def render_observation(view: dict, memory: ObservationMemory) -> str:
         key = (m.get("event_id"), m.get("channel"), m.get("t"), m.get("text"))
         if key in memory._msg_keys:
             continue
-        line = _message_line(m, me)
+        line = _team_message_line(m, me, my_team) if teams else _message_line(m, me)
         if line is not None:
             memory._msg_keys.add(key)
             lines.append(line)
@@ -352,8 +453,15 @@ def render_observation(view: dict, memory: ObservationMemory) -> str:
     # ---- votes
     votes = view.get("done_votes", [])
     out.append("")
-    out.append(f"FINISHED VOTES: {len(votes)} of {len(agents)}"
-               + (" (" + ", ".join("you" if v == me else v for v in votes) + ")" if votes else ""))
+    if teams:
+        if isinstance(votes, dict):
+            votes = votes.get(my_team) or []
+        living = [a for a in teams.get(my_team, []) if a not in memory.dead]
+        out.append(f"FINISHED VOTES (your team, {my_team}): {len(votes)} of {len(living)} living"
+                   + (" (" + ", ".join("you" if v == me else v for v in votes) + ")" if votes else ""))
+    else:
+        out.append(f"FINISHED VOTES: {len(votes)} of {len(agents)}"
+                   + (" (" + ", ".join("you" if v == me else v for v in votes) + ")" if votes else ""))
 
     # ---- notes
     notes = view.get("notes") or []
@@ -388,12 +496,14 @@ def _ascii_map(view: dict, visible: dict[Pos, dict], vis_agents: dict[str, dict]
     Item ids get letters in order of first appearance (reading the drawn layers bottom-up,
     each from the top row, left to right); the legend lists the ones drawn."""
     marks: dict[Pos, str] = {}
-    spos = shop_pos(view)
+    teams = view.get("teams")
+    shop_cells = [tuple(p) for p in (view.get("shops") or {}).values()] if teams else []
     pos = tuple(view["position"])
     radius = float(view["view_radius"])
     eye = tuple(view["eye"])
-    if math.dist(eye, (spos[0] + 0.5, spos[1] + 0.5, spos[2] + 0.5)) <= radius:
-        marks[spos] = SHOP_MARK
+    for spos in shop_cells or [shop_pos(view)]:
+        if math.dist(eye, (spos[0] + 0.5, spos[1] + 0.5, spos[2] + 0.5)) <= radius:
+            marks[spos] = SHOP_MARK
     for a, o in vis_agents.items():
         marks[tuple(o["pos"])] = agent_mark(agents, a)
     marks[pos] = "@"
@@ -423,8 +533,13 @@ def _ascii_map(view: dict, visible: dict[Pos, dict], vis_agents: dict[str, dict]
            "Map legend (letters are assigned for this map only): "
            + (items + " " if items else "")
            + f"{SHOP_MARK}=shop @=you "
-           + ("digits/letters=teammates (see TEAMMATES) " if len(agents) > 1 else "")
+           + ("digits/letters=other agents (see TEAMMATES and OTHER TEAM) " if teams else
+              "digits/letters=teammates (see TEAMMATES) " if len(agents) > 1 else "")
            + ".=no visible block"]
+    if teams:
+        dx = int(view.get("divider_x") if view.get("divider_x") is not None else g["width"] // 2)
+        if x0 < dx <= x1:
+            out.append(f"The line between the sides runs between columns x = {dx - 1} and x = {dx}.")
     if clipped:
         out.append(f"(showing the {MAX_MAP_LAYERS} lowest of {total} layers)")
     tens = "".join(str(x // 10) if x >= 10 else " " for x in range(x0, x1 + 1))

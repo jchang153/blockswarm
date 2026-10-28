@@ -386,6 +386,24 @@ const INTERNAL = {
     return { top, side, bottom: side };
   },
 };
+/** [v5] A team's market stall: the awning striped in the team colour (cached per colour). */
+export function shopFaces(color) {
+  const k = 'shop:' + color;
+  if (cache.has(k)) return cache.get(k);
+  const C = hex(color), WHITE = [244, 241, 234];
+  const P = [168, 122, 72];
+  const top = paint('shop-top-' + color, (x, y, r) => noisy(Math.floor(x / 4) % 2 ? WHITE : C, r, 0.05));
+  const side = paint('shop-side-' + color, (x, y, r) => {
+    if (y < 4) return noisy(Math.floor(x / 4) % 2 ? WHITE : C, r, 0.05);
+    if (y === 4) return mul(C, 0.7);
+    if (x < 2 || x > 13) return noisy(mul(P, 0.6), r, 0.08);
+    if (y > 8) return noisy(mul(P, y === 9 ? 0.75 : 1), r, 0.1);
+    return y === 8 && x > 3 && x < 7 ? [246, 208, 61] : [40, 34, 30];
+  });
+  const f = { top, side, bottom: side, awning: top };
+  cache.set(k, f);
+  return f;
+}
 function generic(type) {
   const base = hex(typeColor(type));
   const g = paint('generic-' + type, (x, y, r) => {

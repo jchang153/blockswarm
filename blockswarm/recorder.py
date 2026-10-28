@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import IO
 
-LOG_VERSION = 4
+LOG_VERSION = 5
 
 
 class Recorder:

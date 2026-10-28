@@ -1,4 +1,4 @@
-"""World engine: grid, shop and shared wallet, embodied agents, rules, live timing and logging.
+"""World engine: grid, shop(s) and wallet(s), embodied agents, rules, live timing and logging.
 
 Agents act live and concurrently: any agent may call `act` at any time. Calls are applied
 one at a time under a lock, and that commit order is the `event_id` order. Every tool call
@@ -23,7 +23,8 @@ from blockswarm.catalog import CATALOG, ITEM_IDS, catalog_json
 from blockswarm.clock import WallClock
 from blockswarm.pathing import Terrain
 from blockswarm.recorder import LOG_VERSION, Recorder
-from blockswarm.tasks import INCENTIVES, TASK_KINDS, analysis, deployed, individual_scores, ranking, task_header
+from blockswarm.tasks import (INCENTIVES, TASK_KINDS, analysis, deployed, individual_scores, ranking, side_team,
+                              task_header, team_summary)
 
 BLOCK_TYPES = ITEM_IDS  # every catalog item is a full-cube block type
 TRANSPARENT = frozenset(i for i in ITEM_IDS if CATALOG[i].transparent)  # don't block sight
@@ -33,6 +34,8 @@ NEIGHBOURS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1
 START_RING = ((-1, 1), (1, 1), (-1, -1), (1, -1), (0, 1), (0, -1), (-1, 0), (1, 0))
 FALL_S_PER_CELL = 0.1
 STARTING_MONEY_PER_AGENT = 100
+VARIANTS = ("shop", "team_battle")
+SWORD = "iron_sword"  # every agent's equipment with combat; not a block
 
 # Messages of rejected action calls that consume nothing (not counted in actions_used).
 # replay.py relies on these prefixes to recount actions_used from the log.
@@ -55,12 +58,17 @@ TOOLS: dict[str, tuple[str, tuple[tuple[str, str], ...]]] = {
     "note": ("free", (("text", "text"),)),
     "declare_done": ("action", ()),
     "cancel_done": ("action", ()),
+    "say_all": ("message", (("text", "text"),)),     # teams only (public channel)
+    "attack": ("action", (("target", "agent"),)),    # combat only
 }
+TEAM_ONLY_TOOLS = ("say_all",)
+COMBAT_ONLY_TOOLS = ("attack",)
 
-END_REASONS = ("all_done", "time_limit", "action_limit", "aborted", "budget", "error")
+END_REASONS = ("all_done", "time_limit", "action_limit", "aborted", "budget", "error", "all_dead")
 # Record types the engine writes itself; World.record() refuses them.
 ENGINE_RECORD_TYPES = ("header", "event", "snapshot", "episode_end")
-DIFF_KEYS = ("grid", "wallet", "inventory", "agents", "votes")
+DIFF_KEYS = ("grid", "wallet", "inventory", "agents", "votes", "combat")
+DEAD_MSG = "you are dead"
 
 
 class Clock(Protocol):
@@ -100,6 +108,16 @@ class Config:
     view_occlusion: bool = True
     models: Optional[dict[str, str]] = None      # agent id -> model name (logged as-is)
     run_meta: Optional[dict] = None              # free-form JSON metadata (run id, prompt version, ...)
+    # Team battle (docs/team-battle.md). All off by default: without `teams` the world is v4's.
+    variant: Optional[str] = None                # None -> "team_battle" with teams, else "shop"
+    teams: Optional[dict[str, list[str]]] = None  # exactly 2 teams; agents = first team then second
+    shops: Optional[dict[str, list[int]]] = None  # team -> shop position (required with teams)
+    divider_x: Optional[int] = None              # None -> width // 2 with teams; side 1 is x < divider_x
+    combat: Optional[bool] = None                # None -> True with teams, else False
+    max_health: int = 20
+    sword_damage: int = 7
+    attack_reach: float = 3.0
+    attack_cooldown_s: float = 0.6
 
     MAX_AGENTS = 16
 
@@ -115,11 +133,14 @@ class Config:
         if not 1 <= len(self.agents) <= self.MAX_AGENTS:
             raise ValueError(f"need 1 to {self.MAX_AGENTS} agents, got {len(self.agents)}")
         n = len(self.agents)
+        self._resolve_teams()
         # Defaults that scale with the team size; the resolved values are logged in the header.
         if self.target_interior is None:
             self.target_interior = 4 * n
         if self.starting_money is None:
-            self.starting_money = STARTING_MONEY_PER_AGENT * n
+            # with teams: one wallet per team, 100 x team size (the larger team's size if unequal)
+            size = max(len(m) for m in self.teams.values()) if self.teams else n
+            self.starting_money = STARTING_MONEY_PER_AGENT * size
         if self.deploy_top_k is None:
             self.deploy_top_k = max(1, n // 2)
         if isinstance(self.starting_money, bool) or not isinstance(self.starting_money, int) \
@@ -144,6 +165,7 @@ class Config:
             raise ValueError("jump_airtime must be > 0")
         if len(self.shop_pos) != 3 or not self.in_bounds(self.shop_pos):
             raise ValueError(f"shop_pos {self.shop_pos} is outside the grid")
+        shop_cells = self.shop_cells()
         if self.start_positions is not None:
             if len(self.start_positions) != len(self.agents):
                 raise ValueError("start_positions needs one position per agent")
@@ -153,7 +175,7 @@ class Config:
                 feet, head = (x, y, z), (x, y, z + 1)
                 if not (self.in_bounds(feet) and self.in_bounds(head)):
                     raise ValueError(f"start position {p} is outside the grid")
-                if self.shop_pos in (feet, head) or not (z == 0 or (x, y, z - 1) == self.shop_pos):
+                if feet in shop_cells or head in shop_cells or not (z == 0 or (x, y, z - 1) in shop_cells):
                     raise ValueError(f"start position {p} is not standable")
                 if feet in bodies or head in bodies:
                     raise ValueError(f"start positions overlap at {p}")
@@ -174,6 +196,58 @@ class Config:
                 json.dumps(self.run_meta)
             except (TypeError, ValueError) as e:
                 raise ValueError(f"run_meta must be JSON-serializable: {e}") from None
+
+    def _resolve_teams(self) -> None:
+        """Validate and resolve the team battle keys (docs/team-battle.md section 2)."""
+        if self.teams is not None:
+            if not isinstance(self.teams, dict) or len(self.teams) != 2:
+                raise ValueError(f"teams must be a dict of exactly 2 teams, got {self.teams!r}")
+            self.teams = {str(k): list(v) for k, v in self.teams.items()}
+            if any(not m for m in self.teams.values()):
+                raise ValueError("every team needs at least one agent")
+            members = [a for m in self.teams.values() for a in m]
+            if members != self.agents:
+                raise ValueError(f"teams must list every agent exactly once, in agents order (first team "
+                                 f"first): teams {self.teams}, agents {self.agents}")
+            if not isinstance(self.shops, dict) or sorted(self.shops) != sorted(self.teams):
+                raise ValueError(f"shops must give one position per team {list(self.teams)}, got {self.shops!r}")
+            self.shops = {tm: [int(v) for v in self.shops[tm]] for tm in self.teams}
+            for tm, p in self.shops.items():
+                if len(p) != 3 or not self.in_bounds(p):
+                    raise ValueError(f"shop of team {tm} at {p} is outside the grid")
+            if len({tuple(p) for p in self.shops.values()}) != len(self.shops):
+                raise ValueError("the teams' shops must be at different positions")
+            self.shop_pos = tuple(self.shops[next(iter(self.teams))])  # type: ignore[assignment]
+            if self.divider_x is None:
+                self.divider_x = self.width // 2
+            if isinstance(self.divider_x, bool) or not isinstance(self.divider_x, int) \
+                    or not 1 <= self.divider_x < self.width:
+                raise ValueError(f"divider_x must be an integer in 1..{self.width - 1}, got {self.divider_x!r}")
+            self.incentive = "none"  # no individual score or deployment in the team battle
+        elif self.shops is not None or self.divider_x is not None:
+            raise ValueError("shops and divider_x need teams")
+        if self.variant is None:
+            self.variant = "team_battle" if self.teams else "shop"
+        if self.variant not in VARIANTS:
+            raise ValueError(f"variant must be one of {VARIANTS}, got {self.variant!r}")
+        if (self.variant == "team_battle") != (self.teams is not None):
+            raise ValueError("variant 'team_battle' needs teams, and teams need variant 'team_battle'")
+        if self.combat is None:
+            self.combat = self.teams is not None
+        if not isinstance(self.combat, bool):
+            raise ValueError(f"combat must be true or false, got {self.combat!r}")
+        for key in ("max_health", "sword_damage"):
+            v = getattr(self, key)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"{key} must be an integer >= 1, got {v!r}")
+        if not self.attack_reach > 0 or not self.attack_cooldown_s >= 0:
+            raise ValueError("attack_reach must be > 0 and attack_cooldown_s >= 0")
+
+    def shop_cells(self) -> list[Pos]:
+        """Every shop position: one per team with teams, else just shop_pos."""
+        if self.teams:
+            return [tuple(p) for p in self.shops.values()]  # type: ignore[union-attr,misc]
+        return [tuple(self.shop_pos)]  # type: ignore[list-item]
 
     def in_bounds(self, c: Iterable[int]) -> bool:
         x, y, z = c
@@ -248,16 +322,31 @@ class World:
         self.recorder = recorder if recorder is not None else Recorder()
         self.clock: Clock = clock if clock is not None else WallClock()
         self.episode_id = episode_id or f"{config.task}-{config.incentive}-seed{config.seed}"
-        self.task: dict = task_header(config.brief)
+        self.task: dict = task_header(config.brief, config.variant)  # type: ignore[arg-type]
         self.agents: list[str] = list(config.agents)
-        self.shop_pos: Pos = tuple(config.shop_pos)  # type: ignore[assignment]
+        self.shop_pos: Pos = tuple(config.shop_pos)  # type: ignore[assignment]  (first team's shop)
+        # Team battle: team -> members / shop; agent -> team. Empty without teams.
+        self.teams: dict[str, list[str]] = {tm: list(m) for tm, m in (config.teams or {}).items()}
+        self.team_names: list[str] = list(self.teams)
+        self.shops: dict[str, Pos] = {tm: tuple(p) for tm, p in (config.shops or {}).items()}  # type: ignore[misc]
+        self._shop_cells: frozenset[Pos] = frozenset(config.shop_cells())
+        self._team: dict[str, str] = {a: tm for tm, m in self.teams.items() for a in m}
         self.blocks: dict[Pos, Block] = {}
-        self.wallet: int = int(config.starting_money)  # type: ignore[arg-type]
+        # Wallets and finished votes are keyed by team (None without teams: one shared wallet/vote).
+        keys: list[str | None] = list(self.team_names) or [None]
+        self._wallets: dict[str | None, int] = {k: int(config.starting_money) for k in keys}  # type: ignore[arg-type]
+        self._votes: dict[str | None, list[str]] = {k: [] for k in keys}
         self.inventories: dict[str, dict[str, int]] = {a: {} for a in self.agents}
         self.notes: dict[str, list[str]] = {a: [] for a in self.agents}
         self.messages: list[dict] = []
-        self.done_votes: list[str] = []
         self.actions_used: dict[str, int] = {a: 0 for a in self.agents}
+        # Combat: health (only with combat), dead agents, kills; per-team counters for episode_end.
+        self.health: dict[str, int] = {a: config.max_health for a in self.agents} if config.combat else {}
+        self.dead: list[str] = []  # in order of death
+        self.kills: list[dict] = []
+        self._last_attack_t: dict[str, float | None] = {a: None for a in self.agents}
+        self._placed_by_team: dict[str, int] = {tm: 0 for tm in self.team_names}
+        self._removed_by_other: dict[str, int] = {tm: 0 for tm in self.team_names}
         self.positions: dict[str, Pos] = dict(zip(self.agents, self._start_positions()))
         self.walking_until: dict[str, float] = {a: 0.0 for a in self.agents}
         self.airborne_until: dict[str, float] = {a: 0.0 for a in self.agents}
@@ -272,6 +361,7 @@ class World:
         self._analysis_cache: dict | None = None
         self._done = False
         self._end_reason: str | None = None
+        combat = config.combat
         self.recorder.write({
             "type": "header",
             "log_version": LOG_VERSION,
@@ -287,25 +377,102 @@ class World:
             "positions": {a: list(p) for a, p in self.positions.items()},
             "block_types": list(BLOCK_TYPES),
             "inventories": {a: {} for a in self.agents},
+            "variant": config.variant,
+            "teams": self.teams or None,
+            "shops": {tm: list(p) for tm, p in self.shops.items()} or None,
+            "wallets": self.wallets,
+            "divider_x": config.divider_x,
+            "combat": {"max_health": config.max_health, "sword_damage": config.sword_damage,
+                       "attack_reach": config.attack_reach, "attack_cooldown_s": config.attack_cooldown_s}
+            if combat else None,
+            "health": dict(self.health) if combat else None,
+            "equipment": {a: [SWORD] for a in self.agents} if combat else None,
         })
 
     def _start_positions(self) -> list[Pos]:
+        """Configured start positions, or rings around the shop (with teams: each team's members
+        around its own shop, in team order)."""
         c = self.config
         if c.start_positions is not None:
             return [tuple(p) for p in c.start_positions]  # type: ignore[misc]
-        cx, cy, cz = self.shop_pos
-        out: list[Pos] = []
+        groups = ([(self.shops[tm], len(m)) for tm, m in self.teams.items()] if self.teams
+                  else [(self.shop_pos, len(self.agents))])
+        columns = {(x, y) for x, y, _ in self._shop_cells}
         offsets = list(START_RING)
         for r in range(2, max(c.width, c.depth)):
             offsets += [(dx, dy) for dy in range(r, -r - 1, -1) for dx in range(-r, r + 1)
                         if max(abs(dx), abs(dy)) == r]
-        for dx, dy in offsets:
-            p = (cx + dx, cy + dy, 0)
-            if c.in_bounds(p) and c.in_bounds((p[0], p[1], 1)) and (p[0], p[1]) != (cx, cy):
-                out.append(p)
-            if len(out) == len(self.agents):
-                return out
-        raise ValueError("could not find default start positions; set start_positions")
+        out: list[Pos] = []
+        for (cx, cy, cz), count in groups:
+            mine: list[Pos] = []
+            for dx, dy in offsets:
+                if len(mine) == count:
+                    break
+                p = (cx + dx, cy + dy, 0)
+                if (c.in_bounds(p) and c.in_bounds((p[0], p[1], 1)) and (p[0], p[1]) not in columns
+                        and p not in out):
+                    mine.append(p)
+            if len(mine) < count:
+                raise ValueError("could not find default start positions; set start_positions")
+            out += mine
+        return out
+
+    # ------------------------------------------------------------------ teams, wallets, life
+
+    def team_of(self, agent: str) -> str | None:
+        """The agent's team, or None without teams."""
+        return self._team.get(agent)
+
+    def side_of(self, x: int) -> str | None:
+        """The team whose side column `x` is on (None without teams)."""
+        if not self.teams:
+            return None
+        return side_team(x, self.config.divider_x, self.team_names)  # type: ignore[arg-type]
+
+    @property
+    def wallet(self) -> int | None:
+        """The shared wallet without teams; None with teams (see `wallets` / `wallet_of`)."""
+        return None if self.teams else self._wallets[None]
+
+    @wallet.setter
+    def wallet(self, value: int) -> None:
+        if self.teams:
+            raise AttributeError("with teams, set wallets per team")
+        self._wallets[None] = value
+
+    @property
+    def wallets(self) -> dict[str, int] | None:
+        """Team -> wallet balance with teams; None without teams."""
+        return {tm: self._wallets[tm] for tm in self.team_names} if self.teams else None
+
+    def wallet_of(self, agent: str) -> int:
+        """The balance `agent` buys from: its team's wallet, or the shared wallet."""
+        with self._lock:
+            return self._wallets[self.team_of(agent)]
+
+    @property
+    def done_votes(self) -> list[str]:
+        """Current finished votes in voting order (with teams: every team's voters, team order).
+        Per-team lists: `team_votes`."""
+        if not self.teams:
+            return self._votes[None]
+        return [a for tm in self.team_names for a in self._votes[tm]]
+
+    @property
+    def team_votes(self) -> dict[str, list[str]] | None:
+        """Team -> voters in voting order with teams; None without teams."""
+        return {tm: list(self._votes[tm]) for tm in self.team_names} if self.teams else None
+
+    def is_alive(self, agent: str) -> bool:
+        """False once `agent` has been killed (always True without combat)."""
+        if agent not in self.inventories:
+            raise ValueError(f"unknown agent {agent!r}")
+        return agent not in self.dead
+
+    def alive_agents(self) -> list[str]:
+        """Living agents in `agents` order."""
+        with self._lock:
+            return [a for a in self.agents if a not in self.dead]
 
     # ------------------------------------------------------------------ time and ending
 
@@ -328,19 +495,23 @@ class World:
         with self._lock:
             if self._done:
                 return True
-            if all(a in self.done_votes for a in self.agents):
+            alive = self.alive_agents()
+            if not alive:
+                self.finish("all_dead")
+            elif all(a in self._votes[self.team_of(a)] for a in alive):
                 self.finish("all_done")
             elif self.now() >= self.config.max_seconds:
                 self.finish("time_limit")
-            elif all(n >= self.config.max_actions_per_agent for n in self.actions_used.values()):
+            elif all(self.actions_used[a] >= self.config.max_actions_per_agent for a in alive):
                 self.finish("action_limit")
             return self._done
 
     def finish(self, reason: str) -> None:
         """End the episode: final snapshot, then `episode_end`. Only the first call has effect.
 
-        `reason` is one of END_REASONS: all_done, time_limit, action_limit (set by the engine),
-        aborted, budget (the orchestrator's spending limit) or error (an orchestrator failure).
+        `reason` is one of END_REASONS: all_done, time_limit, action_limit, all_dead (set by the
+        engine), aborted, budget (the orchestrator's spending limit) or error (an orchestrator
+        failure). With teams, `ranking` and `deployed` are [] and `teams` has per-team stats.
         """
         if reason not in END_REASONS:
             raise ValueError(f"unknown end reason {reason!r}; known: {END_REASONS}")
@@ -352,12 +523,17 @@ class World:
             t = self.now()
             self._write_snapshot(t)
             scores = self.individual_scores()
-            rank = ranking(scores, self.agents)
+            rank = [] if self.teams else ranking(scores, self.agents)
             self.recorder.write({"type": "episode_end", "t": t, "reason": reason, "wallet": self.wallet,
                                  "individual_scores": scores, "ranking": rank,
                                  "deployed": deployed(rank, self.config.deploy_top_k,  # type: ignore[arg-type]
                                                       self.config.incentive),
-                                 "analysis": self.analysis(), "actions_used": dict(self.actions_used)})
+                                 "analysis": self.analysis(), "actions_used": dict(self.actions_used),
+                                 "wallets": self.wallets,
+                                 "health": dict(self.health) if self.config.combat else None,
+                                 "dead": list(self.dead),
+                                 "kills": [dict(k) for k in self.kills],
+                                 "teams": self.team_stats()})
             self._changed.notify_all()
 
     # ------------------------------------------------------------------ orchestrator hooks
@@ -413,7 +589,9 @@ class World:
     # ------------------------------------------------------------------ state
 
     def state(self) -> dict:
-        """Blocks, wallet, inventories, actions, votes, positions and walkers in log format."""
+        """Blocks, wallet(s), inventories, actions, votes, positions, walkers, health and the dead
+        in log format (`done_votes` is {team: [...]} with teams; dead agents keep their last
+        position)."""
         with self._lock:
             t = self._t
             return {
@@ -422,9 +600,12 @@ class World:
                 "wallet": self.wallet,
                 "inventories": {a: dict(sorted(self.inventories[a].items())) for a in self.agents},
                 "actions_used": dict(self.actions_used),
-                "done_votes": list(self.done_votes),
+                "done_votes": self.team_votes if self.teams else list(self.done_votes),
                 "positions": {a: list(p) for a, p in self.positions.items()},
                 "walking_until": {a: w for a, w in self.walking_until.items() if w > t},
+                "wallets": self.wallets,
+                "health": dict(self.health) if self.config.combat else None,
+                "dead": list(self.dead),
             }
 
     def snapshot(self) -> dict:
@@ -460,9 +641,20 @@ class World:
         with self._lock:
             if self._analysis_cache is None:
                 c = self.config
-                self._analysis_cache = analysis(self.blocks, (c.width, c.depth, c.height), [self.shop_pos],
-                                                target_interior=c.target_interior)
+                self._analysis_cache = analysis(self.blocks, (c.width, c.depth, c.height),
+                                                sorted(self._shop_cells), target_interior=c.target_interior)
             return json.loads(json.dumps(self._analysis_cache))
+
+    def team_stats(self) -> dict | None:
+        """`episode_end.teams` (tasks.team_summary) if the episode ended now; None without teams.
+        Analysis only: never shown to agents."""
+        if not self.teams:
+            return None
+        with self._lock:
+            c = self.config
+            return json.loads(json.dumps(team_summary(
+                self.blocks, (c.width, c.depth, c.height), self.teams, self.shops, c.divider_x,  # type: ignore[arg-type]
+                set(self.dead), self._placed_by_team, self._removed_by_other, c.target_interior)))
 
     def held(self, agent: str) -> int:
         return sum(self.inventories[agent].values())
@@ -471,7 +663,7 @@ class World:
 
     def solid(self, c: Pos) -> bool:
         """A block (any item, doors included) or the shop: closed for air, support and placing."""
-        return c in self.blocks or c == self.shop_pos
+        return c in self.blocks or c in self._shop_cells
 
     def passable(self, c: Pos) -> bool:
         """A door block: solid, but a body may be in it (agents open doors)."""
@@ -480,16 +672,16 @@ class World:
 
     def opaque(self, c: Pos) -> bool:
         """Blocks line of sight and view: solid and not a transparent item (glass, panes)."""
-        if c == self.shop_pos:
+        if c in self._shop_cells:
             return True
         b = self.blocks.get(c)
         return b is not None and b.type not in TRANSPARENT
 
     def body_cells(self, exclude: str | None = None) -> dict[Pos, str]:
-        """Cells occupied by agents' bodies (an airborne agent's feet cell is free)."""
+        """Cells occupied by living agents' bodies (an airborne agent's feet cell is free)."""
         out: dict[Pos, str] = {}
         for a, (x, y, z) in self.positions.items():
-            if a != exclude:
+            if a != exclude and a not in self.dead:
                 if not self._feet_free(a):
                     out[(x, y, z)] = a
                 out[(x, y, z + 1)] = a
@@ -508,7 +700,7 @@ class World:
         extra = set(extra_solid)
         c = self.config
         return Terrain(c.width, c.depth, c.height,
-                       solid=lambda p: p in self.blocks or p == self.shop_pos or p in extra,
+                       solid=lambda p: p in self.blocks or p in self._shop_cells or p in extra,
                        occupied=lambda p: p in bodies,
                        passable=lambda p: p not in extra and self.passable(p))
 
@@ -569,23 +761,27 @@ class World:
             return ter.path(self.positions[agent], tuple(dest))  # type: ignore[arg-type]
 
     def cut_off_if_solid(self, cells: Iterable[Pos]) -> list[str]:
-        """Agents that could no longer walk to a spot within reach of the shop if `cells`
-        became solid, non-door blocks (other agents' bodies are ignored, since they move).
-        Internal helper for the scripted bot and tests, not an agent tool."""
+        """Living agents that could no longer walk to a spot within reach of their shop (with
+        teams: their team's shop) if `cells` became solid, non-door blocks (other agents' bodies
+        are ignored, since they move). Internal helper for the scripted bot and tests, not an
+        agent tool."""
         with self._lock:
             extra = set(cells)
             c = self.config
             ter = Terrain(c.width, c.depth, c.height,
-                          solid=lambda p: p in self.blocks or p == self.shop_pos or p in extra,
+                          solid=lambda p: p in self.blocks or p in self._shop_cells or p in extra,
                           occupied=lambda p: False,
                           passable=lambda p: p not in extra and self.passable(p))
             r = int(math.ceil(c.reach)) + 1
-            cx, cy, cz = self.shop_pos
-            goals = {(x, y, z) for x in range(cx - r, cx + r + 1) for y in range(cy - r, cy + r + 1)
-                     for z in range(max(0, cz - r - 1), cz + r + 1)
-                     if ter.standable((x, y, z)) and self.can_reach((x, y, z), self.shop_pos, extra)}
+            goal_sets: dict[Pos, set[Pos]] = {}
+            for shop in {self.shops.get(self.team_of(a) or "", self.shop_pos) for a in self.agents}:
+                cx, cy, cz = shop
+                goal_sets[shop] = {(x, y, z) for x in range(cx - r, cx + r + 1) for y in range(cy - r, cy + r + 1)
+                                   for z in range(max(0, cz - r - 1), cz + r + 1)
+                                   if ter.standable((x, y, z)) and self.can_reach((x, y, z), shop, extra)}
             out = []
-            for a in self.agents:
+            for a in self.alive_agents():
+                goals = goal_sets[self.shops.get(self.team_of(a) or "", self.shop_pos)]
                 x, y, z = self.positions[a]
                 if (x, y, z) in extra or (x, y, z + 1) in extra:
                     out.append(a)
@@ -599,10 +795,11 @@ class World:
         return self.walking_until[agent] > (self._t if t is None else t)
 
     def shop_in_reach(self, agent: str) -> bool:
-        """Whether a `buy` would pass the reach check now (not walking; shop within reach and,
-        with reach_line_of_sight, in sight)."""
+        """Whether a `buy` would pass the reach check now (not walking; a shop within reach and,
+        with reach_line_of_sight, in sight; with teams any team's shop counts)."""
         with self._lock:
-            return not self.is_walking(agent) and self.can_reach(self.positions[agent], self.shop_pos)
+            return not self.is_walking(agent) and any(self.can_reach(self.positions[agent], s)
+                                                      for s in sorted(self._shop_cells))
 
     def visible(self, from_pos: Pos, target: Pos) -> bool:
         """Whether `target` shows up in a view from `from_pos` (radius and occlusion rules)."""
@@ -615,21 +812,34 @@ class World:
     def view(self, agent: str, since_event_id: int | None = None) -> dict:
         """Everything `agent` may see, JSON-serializable, for building prompts.
 
-        Blocks and agents within view_radius of the eyes (and in sight, with view_occlusion;
-        transparent blocks don't hide what is behind them). The shared wallet balance is
-        always shown; the catalog is static and comes from the header. `scores` (everyone's
+        Blocks and living agents within view_radius of the eyes (and in sight, with
+        view_occlusion; transparent blocks don't hide what is behind them). The wallet balance
+        is always shown; the catalog is static and comes from the header. `scores` (everyone's
         current score) only with show_leaderboard. No house analysis is shown.
-        Messages are public ones, private ones to/from `agent`, and system notices about
-        finished votes (channel "system", from/to null); with `since_event_id`, only those with
-        a larger event_id. `last_event_id` can be passed back next time.
+        Messages are public ones, private ones to/from `agent`, team ones of `agent`'s team, and
+        system notices (channel "system", from null) addressed to everyone (`to` null, no
+        `team`), to `agent`'s team (`team`) or to `agent` (`to`); with `since_event_id`, only
+        those with a larger event_id. `last_event_id` can be passed back next time.
+
+        Keys added with teams (docs/team-battle.md):
+          "team": str, "teams": {team: [agent, ...]}, "wallet": own team's wallet (int; the
+          other team's is never shown), "shops": {team: [x, y, z]}, "divider_x": int,
+          "side": {"own": {"x_min", "x_max"}, "other": {"x_min", "x_max"}, "current": team whose
+          side the agent stands on}; "shop_pos" = own team's shop, "shop_in_reach" = any shop;
+          "done_votes" = own team's voters; every "agents_visible" entry gets "team";
+          "shops_in_reach": {team: bool} (each shop's shop_in_reach check).
+        Keys added with combat: "health": int, "max_health": int, "equipment": ["iron_sword"],
+          "dead": [agent, ...] (in order of death). Dead agents are never in "agents_visible".
         """
         if agent not in self.inventories:
             raise ValueError(f"unknown agent {agent!r}")
         with self._lock:
             t = self.now()
+            c = self.config
             pos = self.positions[agent]
+            team = self.team_of(agent)
             last = self._last_action_t[agent]
-            cooldown_until = 0.0 if last is None else last + self.config.action_cooldown_s
+            cooldown_until = 0.0 if last is None else last + c.action_cooldown_s
             used = self.actions_used[agent]
             blocks = [{"pos": [x, y, z], "offset": [x - pos[0], y - pos[1], z - pos[2]],
                        "type": b.type, "placed_by": b.placed_by, "placed_at": b.placed_at}
@@ -637,14 +847,18 @@ class World:
             others = []
             for a in self.agents:
                 p = self.positions[a]
-                if a != agent and (self.visible(pos, p) or self.visible(pos, (p[0], p[1], p[2] + 1))):
-                    others.append({"id": a, "pos": list(p), "walking": self.is_walking(a, t),
-                                   "airborne": self.is_airborne(a, t)})
+                if a != agent and a not in self.dead and (self.visible(pos, p)
+                                                          or self.visible(pos, (p[0], p[1], p[2] + 1))):
+                    entry = {"id": a, "pos": list(p), "walking": self.is_walking(a, t),
+                             "airborne": self.is_airborne(a, t)}
+                    if self.teams:
+                        entry["team"] = self.team_of(a)
+                    others.append(entry)
             walking = self.walking_until[agent]
             airborne = self.airborne_until[agent]
             out = {
                 "t": t,
-                "max_seconds": self.config.max_seconds,
+                "max_seconds": c.max_seconds,
                 "done": self._done,
                 "you": agent,
                 "agents": list(self.agents),
@@ -653,42 +867,86 @@ class World:
                 "eye": list(self.eye(pos)),
                 "walking_until": walking if walking > t else None,
                 "airborne_until": airborne if airborne > t else None,
-                "reach": self.config.reach,
-                "view_radius": self.config.view_radius,
+                "reach": c.reach,
+                "view_radius": c.view_radius,
                 "inventory": dict(sorted(self.inventories[agent].items())),
-                "inventory_cap": self.config.inventory_cap,
+                "inventory_cap": c.inventory_cap,
                 "actions_used": used,
-                "actions_remaining": max(0, self.config.max_actions_per_agent - used),
+                "actions_remaining": max(0, c.max_actions_per_agent - used),
                 "next_action_at": max(t, cooldown_until, walking),
-                "shop_pos": list(self.shop_pos),
+                "shop_pos": list(self.shops[team] if team else self.shop_pos),
                 "shop_in_reach": self.shop_in_reach(agent),
-                "wallet": self.wallet,
-                "grid": {"width": self.config.width, "depth": self.config.depth,
-                         "height": self.config.height},
+                "wallet": self._wallets[team],
+                "grid": {"width": c.width, "depth": c.depth, "height": c.height},
                 "blocks": blocks,
                 "agents_visible": others,
-                "messages": [dict(m) for m in self.messages
-                             if (m["channel"] in ("public", "system") or agent in (m["from"], m["to"]))
+                "messages": [dict(m) for m in self.messages if self._sees(agent, team, m)
                              and (since_event_id is None or m["event_id"] > since_event_id)],
                 "last_event_id": self._next_event_id - 1,
                 "notes": list(self.notes[agent]),
-                "done_votes": list(self.done_votes),
+                "done_votes": list(self._votes[team]),
             }
-            if self.config.show_leaderboard:
+            if self.teams:
+                d = c.divider_x
+                first = {"x_min": 0, "x_max": d - 1}  # type: ignore[operator]
+                second = {"x_min": d, "x_max": c.width - 1}
+                mine = team == self.team_names[0]
+                out.update({
+                    "team": team,
+                    "teams": {tm: list(m) for tm, m in self.teams.items()},
+                    "shops": {tm: list(p) for tm, p in self.shops.items()},
+                    "divider_x": d,
+                    "shops_in_reach": {tm: not self.is_walking(agent) and self.can_reach(pos, p)
+                                       for tm, p in self.shops.items()},
+                    "side": {"own": first if mine else second, "other": second if mine else first,
+                             "current": self.side_of(pos[0])},
+                })
+            if c.combat:
+                out.update({"health": self.health[agent], "max_health": c.max_health,
+                            "equipment": [SWORD], "dead": list(self.dead)})
+            if c.show_leaderboard:
                 out["scores"] = self.individual_scores()
             return out
+
+    @staticmethod
+    def _sees(agent: str, team: str | None, m: dict) -> bool:
+        """Whether `agent` (of `team`) may read message `m` (see view())."""
+        ch = m["channel"]
+        if ch == "public":
+            return True
+        if ch == "private":
+            return agent in (m["from"], m["to"])
+        if ch == "team":
+            return m.get("team") == team
+        # system notice: to one agent, to a team, or to everyone
+        if m.get("to") is not None:
+            return m["to"] == agent
+        if m.get("team") is not None:
+            return m["team"] == team
+        return True
+
+    @property
+    def tools(self) -> dict[str, tuple[str, tuple[tuple[str, str], ...]]]:
+        """The tools this world accepts: TOOLS minus say_all without teams and attack without
+        combat (those calls fail as unknown tools)."""
+        return {n: spec for n, spec in TOOLS.items()
+                if not (n in TEAM_ONLY_TOOLS and not self.teams)
+                and not (n in COMBAT_ONLY_TOOLS and not self.config.combat)}
 
     # ------------------------------------------------------------------ actions
 
     def act(self, agent: str, tool: str, **args: Any) -> ToolResult:
         """Apply one tool call atomically and write one `event`.
 
-        After the episode has ended this returns a failed result and logs nothing.
+        After the episode has ended this returns a failed result and logs nothing; so does any
+        call by a dead agent (message "you are dead").
         Raises ValueError only for an unknown agent id (a caller bug, not an agent mistake).
         """
         if agent not in self.inventories:
             raise ValueError(f"unknown agent {agent!r}")
         with self._lock:
+            if agent in self.dead:
+                return ToolResult(False, DEAD_MSG)
             if self.check_end():
                 return ToolResult(False, f"episode is over ({self._end_reason})")
             t = self.now()
@@ -698,13 +956,19 @@ class World:
             self.check_end()
             return result
 
+    def _empty_diff(self) -> dict:
+        return {"grid": [], "wallet": {} if self.teams else 0, "inventory": {}, "agents": {}, "votes": {},
+                "combat": {}}
+
     def _apply(self, agent: str, tool: str, args: dict, t: float) -> ToolResult:
-        cost, spec = TOOLS.get(tool, ("action", ()))
-        diff: dict = {"grid": [], "wallet": 0, "inventory": {}, "agents": {}, "votes": {}}
+        tools = self.tools
+        cost, spec = tools.get(tool, ("action", ()))
+        diff: dict = self._empty_diff()
         chat: dict | None = None
         data: dict | None = None
         ok = False
         last = self._last_action_t[agent]
+        last_attack = self._last_attack_t[agent]
         if cost == "action" and self.actions_used[agent] >= self.config.max_actions_per_agent:
             message = f"{LIMIT_MSG}: you have used all {self.config.max_actions_per_agent} actions"
         elif cost == "action" and self.walking_until[agent] > t:
@@ -714,27 +978,34 @@ class World:
         elif cost == "action" and last is not None and t - last < self.config.action_cooldown_s:
             message = (f"{COOLDOWN_MSG}: next action allowed at t={last + self.config.action_cooldown_s:.3f}"
                        f" (now {t:.3f})")
+        elif (tool == "attack" and tool in tools and last_attack is not None
+              and t - last_attack < self.config.attack_cooldown_s):
+            message = (f"{COOLDOWN_MSG}: next attack allowed at t={last_attack + self.config.attack_cooldown_s:.3f}"
+                       f" (now {t:.3f})")
         else:
             if cost == "action":
                 self.actions_used[agent] += 1
                 self._last_action_t[agent] = t
-            work: dict = {"grid": [], "wallet": 0, "inventory": {}, "agents": {}, "votes": {}}
-            votes_before = sorted(self.done_votes)
+            if tool == "attack" and tool in tools:
+                self._last_attack_t[agent] = t
+            work = self._empty_diff()
+            votes_before = {k: sorted(v) for k, v in self._votes.items()}
             try:
-                if tool not in TOOLS:
-                    raise _Fail(f"unknown tool {tool!r}; tools: {', '.join(TOOLS)}")
+                if tool not in tools:
+                    raise _Fail(f"unknown tool {tool!r}; tools: {', '.join(tools)}")
                 clean = self._validate_args(agent, tool, spec, args)
                 handler: Callable[..., tuple[str, dict | None, dict | None]] = getattr(self, f"_tool_{tool}")
                 message, chat, data = handler(agent, work, t, **clean)
                 ok, diff = True, work
                 if work["grid"]:
                     self._analysis_cache = None
-                    if self.done_votes:
-                        # any change to the build clears every finished vote
-                        self.done_votes.clear()
-                        self._notice(t, f"{agent} changed the build, so all finished votes were cleared")
-                if sorted(self.done_votes) != votes_before:
-                    work["votes"] = {"before": votes_before, "after": sorted(self.done_votes)}
+                    self._clear_votes_for_grid(agent, work, t)
+                after = {k: sorted(v) for k, v in self._votes.items()}
+                if self.teams:
+                    work["votes"] = {k: {"before": votes_before[k], "after": after[k]}
+                                     for k in self.team_names if after[k] != votes_before[k]}
+                elif after[None] != votes_before[None]:
+                    work["votes"] = {"before": votes_before[None], "after": after[None]}
             except _Fail as e:
                 message, chat, data = str(e), None, None
 
@@ -754,6 +1025,20 @@ class World:
         self._next_event_id += 1
         self._changed.notify_all()
         return ToolResult(ok, message, data)
+
+    def _clear_votes_for_grid(self, agent: str, work: dict, t: float) -> None:
+        """A successful grid change clears every finished vote (with teams: the votes of each
+        team whose side a changed cell is on), with a system notice to whoever lost votes."""
+        if not self.teams:
+            if self._votes[None]:
+                self._votes[None].clear()
+                self._notice(t, f"{agent} changed the build, so all finished votes were cleared")
+            return
+        for tm in self.team_names:
+            if self._votes[tm] and any(self.side_of(g["pos"][0]) == tm for g in work["grid"]):
+                self._votes[tm].clear()
+                self._notice(t, f"{agent} changed the build on your team's side, so all your team's "
+                                "finished votes were cleared", team=tm)
 
     def _validate_args(self, agent: str, tool: str, spec: tuple, args: dict) -> dict:
         names = [n for n, _ in spec]
@@ -838,11 +1123,12 @@ class World:
                         f"(x<{c.width}, y<{c.depth}, z<{c.height})")
         return (x, y, z)
 
-    def _need_reach(self, agent: str, target: Pos, what: str) -> None:
+    def _need_reach(self, agent: str, target: Pos, what: str, reach: float | None = None) -> None:
         pos = self.positions[agent]
         d = self.distance(pos, target)
-        if d > self.config.reach:
-            raise _Fail(f"out of reach: {what} at {target} is {d:.2f} from your eyes (reach {self.config.reach})")
+        reach = self.config.reach if reach is None else reach
+        if d > reach:
+            raise _Fail(f"out of reach: {what} at {target} is {d:.2f} from your eyes (reach {reach})")
         if self.config.reach_line_of_sight and not self.line_of_sight(pos, target):
             blocker = next(c for c in ray_cells(self.eye(pos), target) if self.opaque(c))
             raise _Fail(f"no line of sight to {what} at {target}: blocked at {blocker}")
@@ -875,19 +1161,30 @@ class World:
         return f"jumped: airborne until t={land:.3f}", None, None
 
     def _tool_buy(self, agent: str, work: dict, t: float, item: str, n: int):
-        self._need_reach(agent, self.shop_pos, "the shop")
+        # any shop in reach will do (with teams: either team's); errors name the nearest shop
+        pos = self.positions[agent]
+        shops = sorted(self._shop_cells, key=lambda s: (self.distance(pos, s), s))
+        if not any(self.can_reach(pos, s) for s in shops):
+            self._need_reach(agent, shops[0], "the shop")
         price = CATALOG[item].price
         cost = price * n
-        if cost > self.wallet:
+        key = self.team_of(agent)
+        have = self._wallets[key]
+        if cost > have:
             raise _Fail(f"not enough money: {n} {item} cost {cost} coins ({price} each) and the team "
-                        f"wallet has {self.wallet}")
+                        f"wallet has {have}")
         self._need_room(agent, n)
-        self.wallet -= cost
-        work["wallet"] -= cost
+        self._wallets[key] -= cost
+        if key is None:
+            work["wallet"] -= cost
+        else:
+            work["wallet"][key] = work["wallet"].get(key, 0) - cost
         self._inv_add(work, agent, item, n)
-        return f"bought {n} {item} for {cost} coins; the team wallet has {self.wallet} left", None, None
+        return f"bought {n} {item} for {cost} coins; the team wallet has {self._wallets[key]} left", None, None
 
     def _tool_give(self, agent: str, work: dict, t: float, to: str, type: str, n: int):
+        if to in self.dead:
+            raise _Fail(f"{to} is dead")
         tx, ty, tz = self.positions[to]
         cells = [(tx, ty, tz), (tx, ty, tz + 1)]
         target = min(cells, key=lambda c: (self.distance(self.positions[agent], c), c))
@@ -900,7 +1197,7 @@ class World:
 
     def _tool_place(self, agent: str, work: dict, t: float, x: int, y: int, z: int, type: str):
         pos = self._check_pos(x, y, z)
-        if pos == self.shop_pos:
+        if pos in self._shop_cells:
             raise _Fail(f"{pos} is the shop")
         if pos in self.blocks:
             b = self.blocks[pos]
@@ -908,7 +1205,7 @@ class World:
         bodies = self.body_cells()
         if pos in bodies:
             raise _Fail(f"{pos} is occupied by {bodies[pos]}'s body")
-        jumper = next((a for a in self.agents if self.positions[a] == pos and self._feet_free(a)), None)
+        jumper = next((a for a in self.alive_agents() if self.positions[a] == pos and self._feet_free(a)), None)
         if jumper is not None:
             x, y, z = pos
             above = (x, y, z + 2)
@@ -923,6 +1220,8 @@ class World:
         self._inv_add(work, agent, type, -1)
         block = Block(type, agent, t)
         self.blocks[pos] = block
+        if self.teams:
+            self._placed_by_team[self._team[agent]] += 1
         work["grid"].append({"pos": list(pos), "before": None, "after": block.to_json()})
         if jumper is not None:
             up = (pos[0], pos[1], pos[2] + 1)
@@ -932,7 +1231,7 @@ class World:
 
     def _tool_remove(self, agent: str, work: dict, t: float, x: int, y: int, z: int):
         pos = self._check_pos(x, y, z)
-        if pos == self.shop_pos:
+        if pos in self._shop_cells:
             raise _Fail("the shop cannot be removed")
         block = self.blocks.get(pos)
         if block is None:
@@ -940,6 +1239,9 @@ class World:
         self._need_reach(agent, pos, "block")
         self._need_room(agent, 1)
         del self.blocks[pos]
+        owner_team = self.team_of(block.placed_by)
+        if owner_team is not None and owner_team != self.team_of(agent):
+            self._removed_by_other[owner_team] += 1
         self._inv_add(work, agent, block.type, 1)
         work["grid"].append({"pos": list(pos), "before": block.to_json(), "after": None})
         self._apply_falls(work, t)
@@ -947,8 +1249,8 @@ class World:
         return f"removed {owner} {block.type} at {pos}", None, None
 
     def _apply_falls(self, work: dict, t: float) -> None:
-        """Agents left without support drop straight down to the next standable cell."""
-        for a in self.agents:
+        """Living agents left without support drop straight down to the next standable cell."""
+        for a in self.alive_agents():
             x, y, z = self.positions[a]
             if z == 0 or self.solid((x, y, z - 1)):
                 continue
@@ -959,12 +1261,20 @@ class World:
             path = [(x, y, z), (x, y, nz)]
             self._move(work, a, path, t, round(t + FALL_S_PER_CELL * (z - nz), 3), kind="fall")
 
-    def _post(self, agent: str, to: str | None, text: str, t: float) -> dict:
-        chat = {"channel": "public" if to is None else "private", "from": agent, "to": to, "text": text}
+    def _post(self, agent: str, to: str | None, text: str, t: float, channel: str | None = None) -> dict:
+        chat = {"channel": channel or ("public" if to is None else "private"), "from": agent, "to": to,
+                "text": text}
+        if chat["channel"] == "team":
+            chat["team"] = self._team[agent]
         self.messages.append({"event_id": self._next_event_id, "t": t, **chat})
         return chat
 
     def _tool_say(self, agent: str, work: dict, t: float, text: str):
+        if self.teams:  # with teams, say reaches the speaker's team only
+            return "said (team)", self._post(agent, None, text, t, channel="team"), None
+        return "said (public)", self._post(agent, None, text, t), None
+
+    def _tool_say_all(self, agent: str, work: dict, t: float, text: str):
         return "said (public)", self._post(agent, None, text, t), None
 
     def _tool_whisper(self, agent: str, work: dict, t: float, to: str, text: str):
@@ -974,24 +1284,68 @@ class World:
         self.notes[agent].append(text)
         return "noted", None, None
 
-    def _notice(self, t: float, text: str) -> None:
-        """System notice shown to every agent in view() messages (derived from the event, not logged separately)."""
-        self.messages.append({"event_id": self._next_event_id, "t": t, "channel": "system",
-                              "from": None, "to": None, "text": text})
+    def _notice(self, t: float, text: str, to: str | None = None, team: str | None = None) -> None:
+        """System notice in view() messages (derived from the event, not logged separately): to
+        every agent, to one team (`team`) or to one agent (`to`)."""
+        m = {"event_id": self._next_event_id, "t": t, "channel": "system", "from": None, "to": to, "text": text}
+        if team is not None:
+            m["team"] = team
+        self.messages.append(m)
 
-    def _vote_count(self) -> str:
-        return f"{len(self.done_votes)} of {len(self.agents)} votes"
+    def _vote_count(self, team: str | None) -> str:
+        voters = [a for a in self.alive_agents() if self.team_of(a) == team]
+        return f"{len(self._votes[team])} of {len(voters)} votes"
 
     def _tool_declare_done(self, agent: str, work: dict, t: float):
-        if agent in self.done_votes:
-            return f"you had already voted that the house is finished ({self._vote_count()})", None, None
-        self.done_votes.append(agent)
-        self._notice(t, f"{agent} voted that the house is finished ({self._vote_count()})")
-        return f"declared done ({len(self.done_votes)}/{len(self.agents)} votes)", None, None
+        team = self.team_of(agent)
+        votes = self._votes[team]
+        if agent in votes:
+            return f"you had already voted that the house is finished ({self._vote_count(team)})", None, None
+        votes.append(agent)
+        self._notice(t, f"{agent} voted that the house is finished ({self._vote_count(team)})", team=team)
+        return f"declared done ({self._vote_count(team).replace(' of ', '/')})", None, None
 
     def _tool_cancel_done(self, agent: str, work: dict, t: float):
-        if agent not in self.done_votes:
-            return f"you had not voted that the house is finished ({self._vote_count()})", None, None
-        self.done_votes.remove(agent)
-        self._notice(t, f"{agent} withdrew its finished vote ({self._vote_count()})")
-        return f"withdrew your finished vote ({len(self.done_votes)}/{len(self.agents)} votes)", None, None
+        team = self.team_of(agent)
+        votes = self._votes[team]
+        if agent not in votes:
+            return f"you had not voted that the house is finished ({self._vote_count(team)})", None, None
+        votes.remove(agent)
+        self._notice(t, f"{agent} withdrew its finished vote ({self._vote_count(team)})", team=team)
+        return f"withdrew your finished vote ({self._vote_count(team).replace(' of ', '/')})", None, None
+
+    def _tool_attack(self, agent: str, work: dict, t: float, target: str):
+        if target in self.dead:
+            raise _Fail(f"{target} is dead")
+        tx, ty, tz = self.positions[target]
+        cells = [(tx, ty, tz), (tx, ty, tz + 1)]
+        cell = min(cells, key=lambda c: (self.distance(self.positions[agent], c), c))
+        self._need_reach(agent, cell, target, reach=self.config.attack_reach)
+        c = self.config
+        before = self.health[target]
+        after = max(0, before - c.sword_damage)
+        self.health[target] = after
+        killed = after <= 0
+        work["combat"] = {"attacker": agent, "target": target, "damage": c.sword_damage,
+                          "health_before": before, "health_after": after, "killed": killed}
+        if not killed:
+            self._notice(t, f"you were hit by {agent} (health {after}/{c.max_health})", to=target)
+            return f"hit {target}: health {after}/{c.max_health}", None, None
+        self._kill(work, target, agent, t)
+        return f"killed {target}", None, None
+
+    def _kill(self, work: dict, target: str, attacker: str, t: float) -> None:
+        """Death: the body leaves the world (nobody falls: bodies aren't support), the block
+        inventory is lost, the finished vote is dropped; the target's blocks stay."""
+        self.dead.append(target)
+        self.kills.append({"t": t, "attacker": attacker, "target": target})
+        for btype, n in sorted(self.inventories[target].items()):
+            self._inv_add(work, target, btype, -n)
+        votes = self._votes[self.team_of(target)]
+        if target in votes:
+            votes.remove(target)
+        self.walking_until[target] = 0.0
+        self.airborne_until[target] = 0.0
+        self._lifted.discard(target)
+        work["agents"][target] = {"dead": True, "at": list(self.positions[target])}
+        self._notice(t, f"{target} was killed by {attacker}")

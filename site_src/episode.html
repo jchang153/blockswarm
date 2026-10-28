@@ -74,7 +74,7 @@
     </div>
   </section>
 
-  <aside class="side" id="side" aria-label="Team, chat and events">
+  <aside class="side" id="side" aria-label="Agents, teams, chat and events">
     <div class="side-handle" id="sideHandle" role="separator" aria-orientation="vertical" aria-label="Resize the side panel" tabindex="0" title="Drag to resize · double-click to reset"></div>
     <div class="panel-sec team-sec" data-pane="team">
       <h2><button class="pane-tog" type="button" aria-expanded="true">Team</button>
@@ -92,6 +92,10 @@
         <h2 style="margin-top:10px">Leaderboard <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500" title="Blocks each agent placed that are still standing. At the end, the top agents are deployed.">blocks still standing</span></h2>
         <ol id="board" class="board"></ol>
       </div>
+    </div>
+    <div class="panel-sec v5sec" id="v5sec" data-pane="teams" hidden>
+      <h2><button class="pane-tog" type="button" aria-expanded="true">Team status</button> <span class="muted" id="teamNote" style="text-transform:none;letter-spacing:0;font-weight:500">at the playhead</span></h2>
+      <div class="pane-body" id="teamStatus"></div>
     </div>
     <div class="panel-sec chat-sec" data-pane="chat">
       <h2><button class="pane-tog" type="button" aria-expanded="true">Chat</button> <span class="muted" id="chatCount" style="text-transform:none;letter-spacing:0;font-weight:500"></span>

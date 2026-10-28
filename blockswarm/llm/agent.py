@@ -23,6 +23,9 @@ Logging (into the episode log via `world.record`, see docs/log-format.md):
   (content, reasoning, tool calls incl. raw argument strings), usage/cost, latency, error.
 - `tool_results`: the text returned to the model for each tool call of that response.
 - `agent_stop`: why the agent's loop ended.
+Team battle: an agent that has been killed (`World.is_alive` false) stops its loop with reason
+"dead" before its next model call and does not run the rest of a response's tool calls.
+`wait` also wakes on a team message to the agent's team and on an attack on or near it.
 Records produced after the episode ended (the world refuses them) go to `late_sink`.
 """
 
@@ -163,6 +166,11 @@ class LLMAgent:
     def stop(self) -> None:
         self._stop.set()
 
+    def alive(self) -> bool:
+        """False once the world says this agent was killed (team battle); True without combat."""
+        is_alive = getattr(self.world, "is_alive", None)
+        return True if is_alive is None else bool(is_alive(self.agent))
+
     def _sleep(self, s: float) -> None:
         end = time.monotonic() + s
         while not self.world.done and not self._stop.is_set() and time.monotonic() < end:
@@ -176,6 +184,9 @@ class LLMAgent:
             while True:
                 if self.world.check_end() or self._stop.is_set():
                     self.stop_reason = self.stop_reason or ("stopped" if self._stop.is_set() else "episode_over")
+                    break
+                if not self.alive():
+                    self.stop_reason = "dead"
                     break
                 if self.calls >= self.cfg.max_model_calls_per_agent:
                     self.stop_reason = "max_model_calls"
@@ -251,6 +262,11 @@ class LLMAgent:
         if res.tool_calls:
             self.consecutive_empty = 0
             for tc in res.tool_calls:
+                if not self.alive():
+                    text, ok = "not executed: you were killed", False
+                    results.append({"tool_call_id": tc["id"], "name": tc["name"], "ok": ok, "content": text})
+                    step.append({"role": "tool", "tool_call_id": tc["id"], "content": text})
+                    continue
                 text, ok = self._execute(tc)
                 results.append({"tool_call_id": tc["id"], "name": tc["name"], "ok": ok, "content": text})
                 step.append({"role": "tool", "tool_call_id": tc["id"], "content": text})
@@ -362,15 +378,28 @@ class LLMAgent:
         with w._lock:
             me = w.positions[self.agent]
             radius = w.config.view_radius
+            my_team = next((t for t, m in (getattr(w.config, "teams", None) or {}).items() if self.agent in m), None)
         near = lambda p: w.distance(me, tuple(p)) <= radius  # noqa: E731
         for e in reversed(events):
             if e["agent"] == self.agent or not e["ok"]:
                 continue
             chat = e.get("chat")
-            if chat and (chat["channel"] == "public" or chat.get("to") == self.agent):
+            if chat and (chat["channel"] == "public" or chat.get("to") == self.agent
+                         or (chat["channel"] == "team" and my_team is not None and chat.get("team") == my_team)):
                 return f"{e['agent']} sent a message"
             diff = e.get("diff") or {}
-            if diff.get("votes"):
+            fight = diff.get("combat") or {}
+            if fight:
+                if fight.get("target") == self.agent:
+                    return f"you were hit by {fight.get('attacker')}"
+                if fight.get("killed"):
+                    return f"{fight.get('target')} was killed"
+                if any(near(w.positions[a]) for a in (fight.get("attacker"), fight.get("target"))
+                       if a in w.positions):
+                    return f"{fight.get('attacker')} attacked {fight.get('target')} near you"
+            diff = e.get("diff") or {}
+            votes = diff.get("votes")
+            if votes and (my_team is None or "before" in votes or my_team in votes):
                 return "the finished votes changed"
             if any(near(g["pos"]) for g in diff.get("grid", [])):
                 return f"{e['agent']} changed a block near you"

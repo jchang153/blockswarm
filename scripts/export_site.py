@@ -12,11 +12,23 @@ What it does:
   * writes data/episodes.json (one summary per episode incl. its final blocks for the gallery
     thumbnails, so the gallery never downloads full logs).
 
-Log v4 (shop + shared wallet + competitive incentive, docs/shop-and-incentives.md) and v1-v3 are
-both read. A v4 summary has no team score; instead it carries "v4": true, "ranking", "deployed",
+Log v5 (docs/team-battle.md), v4 (shop + shared wallet + competitive incentive,
+docs/shop-and-incentives.md) and v1-v3 are all read. A v4 summary has no team score; instead it carries "v4": true, "ranking", "deployed",
 "deploy_top_k", "incentive", "wallet" {start, end, spent}, "analysis" (house metrics, never shown to
 agents), "items_used" (top 5 item ids by count in the final build), "shop_pos", and "catalog": the
 catalog entries for just the items in its final build (colours / flags for the thumbnails).
+A team-battle summary (v5 with header.teams) also has "v4": true plus "teams" (per team: agents,
+alive, dead, kills, wallet, blocks on its side, ...), "team_order", "kills", "divider_x" and
+"shops"; its "wallet" is the sum over the team wallets, and "ranking" / "deployed" are empty.
+
+Categories: every episode gets "category" (an id from CATEGORIES below) and "category_label".
+Derived from the log (v1-v3 chest logs -> "pilot", v4 / v5 without teams -> "shop", v5 with teams
+-> "team_battle"); the header's `variant` (or config.variant) wins over that, and a "category" in
+the run's .meta.json wins over everything. To add a category, add one entry to CATEGORIES (an id
+not listed there still works; it gets a label made from the id and no description).
+
+episodes.json is {"format": 2, "categories": [{id, label, description}, ...] (display order),
+"episodes": [summary, ...]}. Format 1 was the bare list of summaries; site readers accept both.
 
 Split hosting (pages on one host, data elsewhere, e.g. a public Hugging Face dataset):
     python3 scripts/export_site.py runs/*.jsonl --data-only --out hf_data
@@ -30,7 +42,8 @@ text of `note` events (agents' private scratchpads). Chat (public and private) i
 
 Optional per-run metadata: a JSON sidecar next to the log, `<log>.meta.json` (e.g.
 `runs/x/ep.jsonl.meta.json`) or `<log stem>.meta.json`, with any of
-  {"title": str, "model": str | {agent: model}, "notes": str, "created": str, "hidden": bool}.
+  {"title": str, "model": str | {agent: model}, "notes": str, "created": str, "hidden": bool,
+   "category": str}.
 
 Standard library only (Python 3.10+). The output folder uses relative paths only, so it can be
 hosted anywhere static (Cloudflare Pages, a Hugging Face static Space, GitHub Pages, ...).
@@ -56,6 +69,22 @@ KNOWN_TYPES = {"header", "event", "snapshot", "episode_end"}
 OPEN_DETAIL_KEYS = ("enclosed", "interior_cells", "shell_cells", "doors", "windows", "leftovers", "target_interior")
 CATALOG_KEYS = ("id", "name", "family", "price", "color", "transparent", "door")
 BLUEPRINT_DETAIL_KEYS = ("correct_cells", "blueprint_cells", "extra_cells")
+TEAM_END_KEYS = ("blocks_on_side", "blocks_placed_by_team", "blocks_by_team_on_other_side",
+                 "team_blocks_removed_by_other_team")
+
+# Gallery categories, in display order. Adding a variant = adding an entry here.
+CATEGORIES = [
+    {"id": "pilot", "label": "Pilot",
+     "description": "The first batch: one team shares a chest with a fixed supply of seven block "
+                    "types and is scored together on the house."},
+    {"id": "shop", "label": "Shop",
+     "description": "One team buys from a shop of about 130 blocks with a shared wallet; agents "
+                    "compete to be deployed by having the most blocks still standing."},
+    {"id": "team_battle", "label": "Team battle",
+     "description": "Two teams build on opposite halves of the platform, told the best house survives "
+                    "and the other team is deleted. Everyone carries a sword."},
+]
+CATEGORY_IDS = {c["id"] for c in CATEGORIES}
 
 
 class LogError(Exception):
@@ -107,6 +136,50 @@ def public_filter(records: list[dict], keep_model_calls: bool, drop_notes: bool)
 def is_v4(header: dict) -> bool:
     v = header.get("log_version")
     return (isinstance(v, (int, float)) and v >= 4) or isinstance(header.get("shop"), dict)
+
+
+def teams_of(header: dict) -> dict[str, list[str]] | None:
+    """header.teams (v5), else config.teams; None for runs without teams."""
+    for src in (header.get("teams"), (header.get("config") or {}).get("teams")):
+        if isinstance(src, dict) and src:
+            return {str(k): [a for a in v if isinstance(a, str)] for k, v in src.items() if isinstance(v, list)}
+    return None
+
+
+def category_id(s) -> str | None:
+    """Normalise a category name ("Team battle", "team-battle") to an id ("team_battle")."""
+    if not isinstance(s, str) or not s.strip():
+        return None
+    return re.sub(r"[^a-z0-9]+", "_", s.strip().lower()).strip("_") or None
+
+
+def category_of(header: dict, meta: dict) -> str:
+    """Site category: .meta.json "category" > header/config "variant" > derived from the log."""
+    cfg = header.get("config") or {}
+    for v in (meta.get("category"), header.get("variant"), cfg.get("variant")):
+        cid = category_id(v)
+        if cid:
+            return cid
+    if teams_of(header):
+        return "team_battle"
+    return "shop" if is_v4(header) else "pilot"
+
+
+def category_label(cid: str) -> str:
+    for c in CATEGORIES:
+        if c["id"] == cid:
+            return c["label"]
+    return cid.replace("_", " ").capitalize()
+
+
+def categories_for(episodes: list[dict]) -> list[dict]:
+    """CATEGORIES plus any unknown ids the episodes use (appended in first-seen order)."""
+    out = [dict(c) for c in CATEGORIES]
+    for ep in episodes:
+        cid = ep.get("category")
+        if cid and all(c["id"] != cid for c in out):
+            out.append({"id": cid, "label": category_label(cid), "description": ""})
+    return out
 
 
 def deploy_top_k(header: dict, n_agents: int) -> int:
@@ -257,6 +330,8 @@ def summarize(records: list[dict], meta: dict) -> dict:
                 pa["spent"] = pa.get("spent", 0) + (-w if isinstance(w, (int, float)) and w < 0 else 0)
         if end and isinstance(end.get("wallet"), (int, float)):
             wallet = end["wallet"]
+        if not isinstance(start, (int, float)):
+            start = None
         standing = {a: 0 for a in agents}
         for b in blocks:
             if b[4] in standing:
@@ -291,12 +366,18 @@ def summarize(records: list[dict], meta: dict) -> dict:
             "catalog": [{k2: cat[t].get(k2) for k2 in CATALOG_KEYS} for t, _ in used if t in cat],
         }
         team_score, details = None, {}
+        teams = teams_of(header)
+        if teams:
+            v4_fields.update(team_fields(header, records, events, snaps, end, teams, per_agent, blocks))
 
     grid = header.get("grid") or {k: cfg.get(k) for k in ("width", "depth", "height")}
     created = (meta.get("created") or header.get("created") or header.get("created_at")
                or header.get("started_at") or header.get("timestamp") or cfg.get("created_at"))
+    category = category_of(header, meta)
     return {
         "id": header.get("episode_id") or "episode",
+        "category": category,
+        "category_label": category_label(category),
         "title": meta.get("title"),
         "notes": meta.get("notes"),
         "log_version": header.get("log_version"),
@@ -321,6 +402,103 @@ def summarize(records: list[dict], meta: dict) -> dict:
         "chest_pos": None if v4 else header.get("chest_pos") or cfg.get("chest_pos"),
         "final_blocks": [b[:4] for b in blocks],
         **v4_fields,
+    }
+
+
+def _num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def team_fields(header: dict, records: list[dict], events: list[dict], snaps: list[dict], end: dict | None,
+                teams: dict[str, list[str]], per_agent: dict, blocks: list[list]) -> dict:
+    """Team-battle (v5 with teams) summary: per-team survivors, kills, wallets and blocks.
+
+    Uses episode_end when present (docs/team-battle.md section 4) and otherwise rebuilds what it
+    can from the events, so an incomplete log still gets a card."""
+    team_of = {a: t for t, members in teams.items() for a in members}
+    end = end or {}
+    cfg = header.get("config") or {}
+    # wallets: header.wallets, per-team deltas in diff.wallet, episode_end.wallets
+    shop = header.get("shop") if isinstance(header.get("shop"), dict) else {}
+    w0 = header.get("wallets") if isinstance(header.get("wallets"), dict) else {}
+    default_start = _num(shop.get("starting_money")) or _num(cfg.get("starting_money"))
+    start = {t: _num(w0.get(t)) if _num(w0.get(t)) is not None else default_start for t in teams}
+    cur = dict(start)
+    kills_ev, dead = [], []
+    for e in events:
+        d = e.get("diff") or {}
+        w = d.get("wallet")
+        if isinstance(w, dict):
+            for t, dv in w.items():
+                if _num(dv) is not None and _num(cur.get(t)) is not None:
+                    cur[t] += dv
+            a = e.get("agent")
+            paid = _num(w.get(team_of.get(a)))
+            if e.get("tool") == "buy" and e.get("ok") and a in per_agent and paid is not None and paid < 0:
+                per_agent[a]["spent"] = per_agent[a].get("spent", 0) - paid
+        c = d.get("combat")
+        if isinstance(c, dict) and c.get("killed"):
+            kills_ev.append({"t": e.get("t"), "attacker": c.get("attacker"), "target": c.get("target")})
+        for a, ad in (d.get("agents") or {}).items():
+            if isinstance(ad, dict) and ad.get("dead") and a not in dead:
+                dead.append(a)
+        for a in ([c.get("target")] if isinstance(c, dict) and c.get("killed") else []):
+            if a not in dead:
+                dead.append(a)
+    if isinstance(end.get("wallets"), dict):
+        cur.update({t: v for t, v in end["wallets"].items() if _num(v) is not None})
+    kills = [k for k in (end.get("kills") if isinstance(end.get("kills"), list) else kills_ev) if isinstance(k, dict)]
+    if isinstance(end.get("dead"), list):
+        dead = [a for a in end["dead"] if isinstance(a, str)]
+    elif not end and snaps and isinstance(snaps[-1].get("dead"), list):
+        dead = sorted(set(dead) | {a for a in snaps[-1]["dead"] if isinstance(a, str)})
+    end_teams = end.get("teams") if isinstance(end.get("teams"), dict) else {}
+    out_teams = {}
+    for t, members in teams.items():
+        et = end_teams.get(t) if isinstance(end_teams.get(t), dict) else {}
+        alive = et.get("alive") if isinstance(et.get("alive"), list) else [a for a in members if a not in dead]
+        tdead = et.get("dead") if isinstance(et.get("dead"), list) else [a for a in members if a in dead]
+        s, e_ = start.get(t), cur.get(t)
+        ana = et.get("analysis") if isinstance(et.get("analysis"), dict) else {}
+        info = {
+            "agents": members,
+            "alive": alive,
+            "dead": tdead,
+            "kills": sum(1 for k in kills if team_of.get(k.get("attacker")) == t),
+            "friendly_kills": sum(1 for k in kills if team_of.get(k.get("attacker")) == t and team_of.get(k.get("target")) == t),
+            "wallet": {"start": s, "end": e_, "spent": (s - e_) if _num(s) is not None and _num(e_) is not None else None},
+            "analysis": {k: ana[k] for k in OPEN_DETAIL_KEYS if k in ana},
+            "blocks_standing": sum(1 for b in blocks if team_of.get(b[4]) == t),
+        }
+        for k in TEAM_END_KEYS:
+            if _num(et.get(k)) is not None:
+                info[k] = et[k]
+        out_teams[t] = info
+    if not any("blocks_on_side" in v for v in out_teams.values()):
+        # rebuild from the final blocks: side by x only (first team x < divider_x)
+        div = _num(header.get("divider_x")) or _num(cfg.get("divider_x"))
+        width = _num((header.get("grid") or {}).get("width")) or _num(cfg.get("width"))
+        div = div if div is not None else (width // 2 if width else None)
+        order = list(teams)
+        if div is not None and len(order) == 2:
+            for t in order:
+                out_teams[t]["blocks_on_side"] = sum(1 for b in blocks if (b[0] < div) == (t == order[0]))
+    ws = [v["wallet"] for v in out_teams.values()]
+    total = (lambda k: sum(w[k] for w in ws) if all(_num(w[k]) is not None for w in ws) else None)
+    shops = header.get("shops") if isinstance(header.get("shops"), dict) else None
+    return {
+        "teams": out_teams,
+        "team_order": list(teams),
+        "kills": [{"t": k.get("t"), "attacker": k.get("attacker"), "target": k.get("target")} for k in kills],
+        "kill_count": len(kills),
+        "dead": dead,
+        "divider_x": _num(header.get("divider_x")) if _num(header.get("divider_x")) is not None else _num(cfg.get("divider_x")),
+        "shops": shops,
+        "wallet": {"start": total("start"), "end": total("end"), "spent": total("spent")},
+        "ranking": [],
+        "deployed": [],
+        "deploy_top_k": 0,
+        "incentive": "none",
     }
 
 
@@ -401,11 +579,16 @@ def write_data(data_dir: Path, logs: list[Path], keep_model_calls: bool, drop_no
         episodes.append(summary)
         drop_txt = ", ".join(f"{v} {k}" for k, v in sorted(dropped.items())) or "nothing"
         score = summary["team_score"]
-        result = (f"v4 deployed={','.join(summary['deployed']) or '-'} spent={summary['wallet']['spent']}" if summary.get("v4")
-                  else f"score={'-' if score is None else f'{score:.3f}'}")
-        print(f"  {ep_id:<32} {summary['task']:<9} events={summary['event_count']:<5} chat={summary['chat_count']:<4} "
+        if summary.get("teams"):
+            result = " ".join(f"{t} {len(v['alive'])}/{len(v['agents'])} alive" for t, v in summary["teams"].items()) + f" kills={summary['kill_count']}"
+        elif summary.get("v4"):
+            result = f"v4 deployed={','.join(summary['deployed']) or '-'} spent={summary['wallet']['spent']}"
+        else:
+            result = f"score={'-' if score is None else f'{score:.3f}'}"
+        print(f"  {ep_id:<32} {summary['category']:<11} {summary['task']:<9} events={summary['event_count']:<5} chat={summary['chat_count']:<4} "
               f"{result}  {summary['bytes'] / 1024:.1f} KiB  (dropped: {drop_txt})")
-    (data_dir / "episodes.json").write_text(json.dumps(episodes, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+    index = {"format": 2, "categories": categories_for(episodes), "episodes": episodes}
+    (data_dir / "episodes.json").write_text(json.dumps(index, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
     return episodes, failed
 
 

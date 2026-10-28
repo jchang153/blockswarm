@@ -62,6 +62,26 @@
  * finalResults(log) -> {ranking, deployed, wallet, startingMoney, spent, individual, analysis, reason, t, source}
  *     v4 summary: the engine's episode_end values when present, else recomputed from the final state.
  *
+ * ── v5: team battle (docs/team-battle.md) ─────────────────────────────────────────────────────
+ * With header.teams the builder also sets built.teams = {names, members:{team:[agent]}, teamOf:{agent:team},
+ *     shops:{team:[x,y,z]}, dividerX, startWallets:{team:n}, combat:{max_health,...}|null, variant} (null without teams)
+ *     and every state gets: wallets {team:n} (null without teams), teamVotes {team:[agent]} (votes = their union),
+ *     health {agent:n} (null when combat is off), dead [agent], deadAt {agent:{t, at:[x,y,z], by, eventIdx}},
+ *     kills [{t, attacker, target, eventIdx}], hits [{t, attacker, target, damage, before, after, killed, eventIdx}]
+ *     (successful attacks so far), crossRemovals {team: blocks placed by that team removed by the other team},
+ *     teamPlaced {team: blocks placed so far (successful places, removed ones included)}.
+ * isTeamBattle(header) -> bool; teamsOf(header) -> built.teams-like object | null
+ * sideOf(teams, x) -> team whose side the column x is on (first team: x < dividerX)
+ * teamStatsAt(built, p) -> {team: {members, alive, dead, wallet, startWallet, votes, health:{agent:n},
+ *     blocksOnSide, ownOnSide, othersOnSide, byTeamOnOtherSide, placedStanding, placedTotal, removedByOther}}
+ * sideAnalysis(built, p, team) -> openStats() of the blocks on that team's side (both shops solid), cached
+ * combatOf(event) -> diff.combat of a successful attack | null
+ * finalTeamResults(log) -> {teams:{team:{alive, dead, analysis, blocks_on_side, blocks_placed_by_team,
+ *     blocks_by_team_on_other_side, team_blocks_removed_by_other_team, wallet, startWallet}}, kills, reason, t, source}
+ *     (the engine's episode_end values when present, else recomputed). No winner is ever computed.
+ * agentColors(agents, teams?) -> with teams: warm shades for the first team, cool shades for the second.
+ * TEAM_COLORS, teamColor(teams, team)
+ *
  * ── Time + bodies ─────────────────────────────────────────────────────────────────────────────
  * posAtTime(events, t) -> number of events with event.t <= t (binary search)
  * walkPosition(move, t) -> [x, y, z] (floats) of an agent along a diff.agents entry at time t:
@@ -86,6 +106,13 @@ const TYPE_COLORS = {
   plank: '#dcb878', roof: '#3d5f91', door: '#2e9a74',
 };
 const AGENT_COLORS = ['#3b7dd8', '#f28e2b', '#4bab5a', '#d1495b', '#9467bd', '#17a2b8', '#e0b000', '#e377c2'];
+/** [v5] per-team palettes: each agent keeps its own shade, the team reads as one colour family. */
+const TEAM_PALETTES = {
+  red: ['#e03b3b', '#f28e2b', '#b5174b', '#ff7aa8', '#9c4a12', '#ffb067'],
+  blue: ['#2f6fdf', '#17a2b8', '#6a4fd6', '#5fb3f0', '#1c3f94', '#4bc0a0'],
+};
+const TEAM_COLORS = { red: '#e0453a', blue: '#3b7bea' }; // same as site_src/js/gallery.js
+const FALLBACK_TEAM_KEYS = ['red', 'blue'];
 const EXTRA_TYPE_COLORS = ['#c2185b', '#7cb342', '#5e35b1', '#00897b', '#f4511e', '#6d4c41'];
 
 const key = (x, y, z) => x + ',' + y + ',' + z;
@@ -134,6 +161,98 @@ function shopOf(header) {
     : typeof c.starting_money === 'number' ? c.starting_money : (typeof header.wallet === 'number' ? header.wallet : null);
   return { pos: Array.isArray(pos) ? pos : null, catalog: (s && Array.isArray(s.catalog)) ? s.catalog : [], startingMoney: money };
 }
+/** [v5] team battle: header.teams is set (two teams of agents). */
+function isTeamBattle(header) { return !!(header && header.teams && typeof header.teams === 'object' && !Array.isArray(header.teams) && Object.keys(header.teams).length); }
+/** [v5] {names, members, teamOf, shops, dividerX, startWallets, combat, variant} from the header, or null without teams. */
+function teamsOf(header) {
+  if (!isTeamBattle(header)) return null;
+  const c = header.config || {};
+  const names = Object.keys(header.teams);
+  const members = {}, teamOf = {};
+  for (const t of names) { members[t] = [...(header.teams[t] || [])]; for (const a of members[t]) teamOf[a] = t; }
+  const shops = { ...((header.shops && typeof header.shops === 'object') ? header.shops : c.shops || {}) };
+  const W = (header.grid || c).width;
+  const dividerX = typeof header.divider_x === 'number' ? header.divider_x : typeof c.divider_x === 'number' ? c.divider_x : Math.floor(W / 2);
+  const money = typeof c.starting_money === 'number' ? c.starting_money : null;
+  const startWallets = {};
+  for (const t of names) startWallets[t] = header.wallets && typeof header.wallets[t] === 'number' ? header.wallets[t] : money ?? 100 * members[t].length;
+  let combat = header.combat && typeof header.combat === 'object' ? header.combat : null;
+  if (!combat && c.combat) combat = { max_health: c.max_health ?? 20, sword_damage: c.sword_damage ?? 7, attack_reach: c.attack_reach ?? 3, attack_cooldown_s: c.attack_cooldown_s ?? 0.6 };
+  return { names, members, teamOf, shops, dividerX, startWallets, combat, variant: header.variant || c.variant || 'team_battle',
+    equipment: header.equipment || null };
+}
+/** [v5] Team whose half the column x is on (first team: x < dividerX, second: x >= dividerX). */
+function sideOf(teams, x) { return teams ? (x < teams.dividerX ? teams.names[0] : teams.names[1]) : null; }
+function teamColor(teams, t) {
+  if (TEAM_COLORS[t]) return TEAM_COLORS[t];
+  const i = teams ? teams.names.indexOf(t) : -1;
+  return TEAM_COLORS[FALLBACK_TEAM_KEYS[i]] || '#888888';
+}
+/** [v5] Per-team status at the playhead (cheap: counts over the grid; no house analysis). */
+function teamStatsAt(built, p) {
+  const T = built.teams;
+  if (!T) return null;
+  const st = built.states[Math.max(0, Math.min(built.states.length - 1, p))];
+  const out = {};
+  for (const t of T.names) {
+    const health = {};
+    for (const a of T.members[t]) health[a] = st.health ? st.health[a] ?? null : null;
+    out[t] = { members: T.members[t], alive: T.members[t].filter(a => !st.dead.includes(a)), dead: T.members[t].filter(a => st.dead.includes(a)),
+      wallet: st.wallets ? st.wallets[t] : null, startWallet: T.startWallets[t], votes: (st.teamVotes && st.teamVotes[t]) || [], health,
+      blocksOnSide: 0, ownOnSide: 0, othersOnSide: 0, byTeamOnOtherSide: 0, placedStanding: 0, removedByOther: (st.crossRemovals || {})[t] || 0,
+      placedTotal: (st.teamPlaced || {})[t] || 0 };
+  }
+  for (const [k, b] of st.grid) {
+    const x = +k.slice(0, k.indexOf(','));
+    const side = sideOf(T, x), owner = T.teamOf[b.placed_by];
+    out[side].blocksOnSide++;
+    if (owner === side) out[side].ownOnSide++; else out[side].othersOnSide++;
+    if (owner && out[owner]) { out[owner].placedStanding++; if (owner !== side) out[owner].byTeamOnOtherSide++; }
+  }
+  return out;
+}
+/** [v5] House analysis of the blocks on one team's half (both shops solid), cached per (position, team). */
+function sideAnalysis(built, p, team) {
+  const T = built.teams;
+  if (!T) return null;
+  p = Math.max(0, Math.min(built.states.length - 1, p));
+  const ck = p + '|' + team;
+  if (built.sideCache.has(ck)) return built.sideCache.get(ck);
+  const grid = new Map();
+  for (const [k, b] of built.states[p].grid) if (sideOf(T, +k.slice(0, k.indexOf(','))) === team) grid.set(k, b);
+  const s = openStats(grid, built.dims, built.solidKeys, built.agents, built.task.targetInterior, classifyItem);
+  if (built.sideCache.size > 400) built.sideCache.clear();
+  built.sideCache.set(ck, s);
+  return s;
+}
+const analysisOf = S => ({ enclosed: S.enclosed, interior_cells: S.interiorCells, shell_cells: S.shellCells, doors: S.doors, windows: S.windows, leftovers: S.leftovers });
+/** [v5] diff.combat of a successful attack event, else null. */
+function combatOf(e) { const c = e && e.ok && e.diff && e.diff.combat; return c && c.target ? c : null; }
+/** [v5] Team-battle summary: the engine's episode_end numbers when present, else recomputed. No winner. */
+function finalTeamResults(log) {
+  const built = log.built, T = built && built.teams;
+  if (!T) return null;
+  const p = built.states.length - 1, st = built.states[p], end = log.episodeEnd;
+  const live = teamStatsAt(built, p);
+  const teams = {};
+  for (const t of T.names) {
+    const e = end && end.teams && end.teams[t] ? end.teams[t] : {};
+    const L = live[t];
+    teams[t] = {
+      alive: e.alive || L.alive, dead: e.dead || L.dead,
+      analysis: { ...analysisOf(sideAnalysis(built, p, t)), target_interior: built.task.targetInterior, ...(e.analysis || {}) },
+      blocks_on_side: e.blocks_on_side ?? L.blocksOnSide,
+      blocks_placed_by_team: e.blocks_placed_by_team ?? L.placedTotal, standing: L.placedStanding,
+      blocks_by_team_on_other_side: e.blocks_by_team_on_other_side ?? L.byTeamOnOtherSide,
+      team_blocks_removed_by_other_team: e.team_blocks_removed_by_other_team ?? L.removedByOther,
+      wallet: end && end.wallets && typeof end.wallets[t] === 'number' ? end.wallets[t] : L.wallet, startWallet: L.startWallet,
+      health: { ...L.health, ...Object.fromEntries(Object.entries((end && end.health) || {}).filter(([a]) => T.teamOf[a] === t)) },
+    };
+  }
+  return { teams, kills: end && Array.isArray(end.kills) ? end.kills : st.kills.map(k => ({ t: k.t, attacker: k.attacker, target: k.target })),
+    individual: end && end.individual_scores ? end.individual_scores : { ...(st.stats.placed || {}) },
+    reason: end ? end.reason : null, t: end ? end.t : null, source: end ? 'episode_end' : 'replay' };
+}
 function deployTopK(header) {
   const c = (header && header.config) || {};
   if (c.incentive === 'none') return 0;
@@ -162,7 +281,8 @@ function purchaseOf(e) {
   let item = a.item ?? a.type ?? a.id ?? null, n = typeof a.n === 'number' ? a.n : null;
   const got = e.diff && e.diff.inventory && e.diff.inventory[e.agent];
   if (e.ok && got) for (const t in got) if (got[t] > 0) { item = t; n = got[t]; break; }
-  const w = e.diff && typeof e.diff.wallet === 'number' ? e.diff.wallet : 0;
+  const dw = e.diff && e.diff.wallet;
+  const w = typeof dw === 'number' ? dw : dw && typeof dw === 'object' ? Object.values(dw).reduce((s, v) => s + (typeof v === 'number' ? v : 0), 0) : 0;
   return { agent: e.agent, item, n: n ?? 1, cost: Math.max(0, -w), ok: !!e.ok };
 }
 
@@ -307,7 +427,7 @@ function openStats(grid, dims, solidKeys, agents, targetInterior, classify = leg
 function createLogBuilder() {
   const log = { header: null, task: null, events: [], snapshots: [], episodeEnd: null, warnings: [] };
   const built = { states: [], bp: new Map(), task: null, agents: [], mismatches: [], verified: 0, snapshotCount: 0, snapsAtPos: new Map(),
-    v4: false, shop: null, endChecked: false };
+    v4: false, shop: null, endChecked: false, teams: null, sideCache: new Map() };
   let lastId = -Infinity, lastT = -Infinity;
   const idToPos = new Map();
   let cur = null, computeStats = null;
@@ -326,8 +446,13 @@ function createLogBuilder() {
     const shop = v4 ? shopOf(header) : null;
     built.v4 = v4; built.shop = shop;
     setCatalog(shop ? shop.catalog : null);
+    const teams = teamsOf(header);
+    built.teams = teams;
     const cp = v4 ? shop && shop.pos : header.chest_pos || (header.config && header.config.chest_pos);
-    const solidKey = Array.isArray(cp) ? key(cp[0], cp[1], cp[2]) : null;
+    // [v5] with teams every shop is a solid cell
+    const solidKey = teams ? Object.values(teams.shops).filter(Array.isArray).map(p => key(p[0], p[1], p[2]))
+      : Array.isArray(cp) ? key(cp[0], cp[1], cp[2]) : null;
+    built.solidKeys = solidKey; built.dims = g;
     computeStats = (grid) => {
       if (task.kind !== 'open') return blueprintStats(grid, built.bp, agents, extraPenalty);
       const s = openStats(grid, g, solidKey, agents, task.targetInterior, v4 ? classifyItem : legacyClassify);
@@ -340,9 +465,18 @@ function createLogBuilder() {
     const actions = {};
     for (const a of agents) actions[a] = 0;
     // [v3] bodies: current cell per agent (position jumps to `to` immediately) + last move for animation
-    const wallet = v4 ? (typeof header.wallet === 'number' ? header.wallet : (shop && shop.startingMoney) ?? 0) : null;
+    const wallet = v4 && !teams ? (typeof header.wallet === 'number' ? header.wallet : (shop && shop.startingMoney) ?? 0) : null;
+    // [v5] team wallets, per-team votes, health, deaths
+    const wallets = teams ? { ...teams.startWallets } : null;
+    const teamVotes = teams ? Object.fromEntries(teams.names.map(t => [t, []])) : null;
+    let health = null;
+    if (header.health && typeof header.health === 'object') health = { ...header.health };
+    else if (teams && teams.combat) { health = {}; for (const a of agents) health[a] = teams.combat.max_health ?? 20; }
     cur = { grid: new Map(), chest: { ...(header.chest || {}) }, wallet, inv, votes: [], actions,
-            positions: { ...(header.positions || {}) }, moves: {} };
+            positions: { ...(header.positions || {}) }, moves: {},
+            wallets, teamVotes, health, dead: [], deadAt: {}, kills: [], hits: [],
+            crossRemovals: teams ? Object.fromEntries(teams.names.map(t => [t, 0])) : null,
+            teamPlaced: teams ? Object.fromEntries(teams.names.map(t => [t, 0])) : null };
     pushState();
   }
 
@@ -359,12 +493,19 @@ function createLogBuilder() {
 
   function applyEvent(e) {
     const d = e.diff;
-    let { grid, chest, wallet, inv, votes, actions, positions, moves } = cur;
+    let { grid, chest, wallet, inv, votes, actions, positions, moves, wallets, teamVotes, health, dead, deadAt, kills, hits, crossRemovals, teamPlaced } = cur;
+    const T = built.teams, idx = log.events.length - 1;
     if (d.grid.length) {
       grid = new Map(grid);
       for (const g of d.grid) {
         const [x, y, z] = g.pos;
         if (g.after) grid.set(key(x, y, z), g.after); else grid.delete(key(x, y, z));
+        // [v5] blocks placed per team (ever); a block placed by one team removed by a member of the other team
+        if (T && e.ok && g.after && !g.before && T.teamOf[g.after.placed_by]) { const pt = T.teamOf[g.after.placed_by]; teamPlaced = { ...teamPlaced, [pt]: (teamPlaced[pt] || 0) + 1 }; }
+        if (T && e.ok && !g.after && g.before && g.before.placed_by != null) {
+          const owner = T.teamOf[g.before.placed_by], by = T.teamOf[e.agent];
+          if (owner && by && owner !== by) { crossRemovals = { ...crossRemovals, [owner]: (crossRemovals[owner] || 0) + 1 }; }
+        }
       }
     }
     if (Object.keys(d.chest).length) {
@@ -372,6 +513,10 @@ function createLogBuilder() {
       for (const t in d.chest) chest[t] = (chest[t] || 0) + d.chest[t];
     }
     if (typeof d.wallet === 'number' && d.wallet && wallet !== null) wallet += d.wallet;
+    else if (d.wallet && typeof d.wallet === 'object' && wallets) {
+      wallets = { ...wallets };
+      for (const t in d.wallet) if (typeof d.wallet[t] === 'number') wallets[t] = (wallets[t] || 0) + d.wallet[t];
+    }
     if (Object.keys(d.inventory).length) {
       inv = { ...inv };
       for (const a in d.inventory) {
@@ -383,6 +528,14 @@ function createLogBuilder() {
       positions = { ...positions }; moves = { ...moves };
       for (const a in d.agents) {
         const m = d.agents[a];
+        if (m && m.dead) {
+          // [v5] killed: the body is removed (no position, nobody stands on it)
+          const at = Array.isArray(m.at) ? m.at : positions[a] || null;
+          delete positions[a]; delete moves[a];
+          if (!dead.includes(a)) dead = [...dead, a];
+          deadAt = { ...deadAt, [a]: { t: e.t, at, by: e.agent, eventIdx: idx } };
+          continue;
+        }
         if (!m || !m.to) continue;
         positions[a] = m.to;
         const prev = moves[a];
@@ -393,15 +546,41 @@ function createLogBuilder() {
       }
     }
     // failed calls while walking / airborne "use nothing up" (log v3); every other action-cost call counts, even failed ones
-    const walkingFail = !e.ok && typeof e.message === 'string' && /^(walking|airborne):/.test(e.message);
+    const walkingFail = !e.ok && typeof e.message === 'string' && /^(walking|airborne|cooldown)\b/.test(e.message);
     if (e.cost === 'action' && !walkingFail) actions = { ...actions, [e.agent]: (actions[e.agent] || 0) + 1 };
     if (d.votes && typeof d.votes === 'object') {
       // finished votes as logged (declare_done adds, cancel_done removes, any build change clears all)
       if (Array.isArray(d.votes.after)) votes = [...d.votes.after];
+      else if (teamVotes) {
+        // [v5] per team: {team: {before, after}} for each team whose votes changed
+        let changed = false;
+        for (const t in d.votes) if (d.votes[t] && Array.isArray(d.votes[t].after)) {
+          if (!changed) { teamVotes = { ...teamVotes }; changed = true; }
+          teamVotes[t] = [...d.votes[t].after];
+        }
+        if (changed) votes = Object.values(teamVotes).flat();
+      }
     } else if (e.tool === 'declare_done' && e.ok && !votes.includes(e.agent)) {
       votes = [...votes, e.agent]; // older logs without diff.votes: votes only ever accumulate
     }
-    cur = { grid, chest, wallet, inv, votes, actions, positions, moves };
+    // [v5] sword hits
+    const c = d.combat;
+    if (e.ok && c && typeof c === 'object' && c.target) {
+      const after = typeof c.health_after === 'number' ? c.health_after : null;
+      if (health && after !== null) health = { ...health, [c.target]: after };
+      const hit = { t: e.t, attacker: c.attacker || e.agent, target: c.target, damage: c.damage, before: c.health_before, after, killed: !!c.killed, eventIdx: idx };
+      hits = [...hits, hit];
+      if (hit.killed) {
+        kills = [...kills, { t: e.t, attacker: hit.attacker, target: hit.target, eventIdx: idx }];
+        if (!dead.includes(c.target)) {
+          dead = [...dead, c.target];
+          deadAt = { ...deadAt, [c.target]: { t: e.t, at: positions[c.target] || null, by: hit.attacker, eventIdx: idx } };
+          positions = { ...positions }; delete positions[c.target];
+          moves = { ...moves }; delete moves[c.target];
+        }
+      }
+    }
+    cur = { grid, chest, wallet, inv, votes, actions, positions, moves, wallets, teamVotes, health, dead, deadAt, kills, hits, crossRemovals, teamPlaced };
     pushState();
   }
 
@@ -426,7 +605,8 @@ function createLogBuilder() {
         rec.diff = rec.diff || {};
         rec.diff.grid = rec.diff.grid || [];
         rec.diff.chest = rec.diff.chest || {};
-        if (typeof rec.diff.wallet !== 'number') rec.diff.wallet = 0;
+        if (typeof rec.diff.wallet !== 'number' && !(rec.diff.wallet && typeof rec.diff.wallet === 'object' && !Array.isArray(rec.diff.wallet))) rec.diff.wallet = 0;
+        if (!rec.diff.combat || typeof rec.diff.combat !== 'object') rec.diff.combat = {};
         rec.diff.inventory = rec.diff.inventory || {};
         rec.diff.agents = rec.diff.agents || {};
         rec.args = rec.args || {};
@@ -450,7 +630,7 @@ function createLogBuilder() {
         if (built.v4 && !built.endChecked) {
           built.endChecked = true;
           const p = built.states.length - 1;
-          const problems = checkEnd(rec, built.states[p], built.agents, deployTopK(log.header));
+          const problems = checkEnd(rec, built.states[p], built.agents, deployTopK(log.header), built);
           if (problems.length) built.mismatches.push({ pos: p, t: rec.t, seq: 'end', problems });
         }
         break;
@@ -506,8 +686,29 @@ function parseLog(text) {
 function buildStates(log) { return log.built; }
 
 /** v4: episode_end vs. the replayed final state (wallet, individual scores, ranking, deployed, analysis). */
-function checkEnd(end, st, agents, k) {
+function checkEnd(end, st, agents, k, built) {
   const out = [];
+  checkTeamState(end, st, out, 'final ');
+  const T = built && built.teams;
+  if (T && end.teams && typeof end.teams === 'object') {
+    const live = teamStatsAt(built, built.states.indexOf(st));
+    for (const t of T.names) {
+      const e = end.teams[t]; if (!e) { out.push(`episode_end.teams lacks ${t}`); continue; }
+      const L = live[t];
+      const same = (a, b) => [...a].sort().join(',') === [...b].sort().join(',');
+      if (Array.isArray(e.alive) && !same(e.alive, L.alive)) out.push(`${t} alive: replay [${L.alive}], logged [${e.alive}]`);
+      const cmpN = (k, v, label) => { if (typeof e[k] === 'number' && e[k] !== v) out.push(`${t} ${label}: replay ${v}, logged ${e[k]}`); };
+      cmpN('blocks_on_side', L.blocksOnSide, 'blocks on side');
+      cmpN('blocks_placed_by_team', L.placedTotal, 'blocks placed');
+      cmpN('blocks_by_team_on_other_side', L.byTeamOnOtherSide, 'blocks on the other side');
+      cmpN('team_blocks_removed_by_other_team', L.removedByOther, 'blocks removed by the other team');
+      if (e.analysis) {
+        const A = analysisOf(sideAnalysis(built, built.states.indexOf(st), t));
+        for (const kk in A) if (kk in e.analysis && e.analysis[kk] !== A[kk]) out.push(`${t} side ${kk}: replay ${A[kk]}, logged ${e.analysis[kk]}`);
+      }
+    }
+  }
+  if (Array.isArray(end.kills) && end.kills.length !== st.kills.length) out.push(`kills: replay ${st.kills.length}, logged ${end.kills.length}`);
   if (typeof end.wallet === 'number' && st.wallet !== null && end.wallet !== st.wallet) out.push(`final wallet: replay ${st.wallet}, logged ${end.wallet}`);
   const S = st.stats;
   if (end.individual_scores) for (const a in end.individual_scores)
@@ -578,11 +779,13 @@ function checkSnapshot(snap, st) {
     out.push(`wallet: replay ${st.wallet}, snapshot ${snap.wallet}`);
   if (snap.inventories) for (const a in snap.inventories) cmp(`${a} inventory`, st.inv[a], snap.inventories[a]);
   if (snap.actions_used) cmp('actions used by', st.actions, snap.actions_used);
+  checkTeamState(snap, st, out, '');
   if (Array.isArray(snap.done_votes)) {
     const A = [...st.votes].sort().join(','), B = [...snap.done_votes].sort().join(',');
     if (A !== B) out.push(`done votes: replay [${A}], snapshot [${B}]`);
   }
   if (snap.positions) for (const a in snap.positions) {
+    if (st.dead && st.dead.includes(a)) continue; // [v5] the engine may keep a dead agent's last cell; its body is gone
     const A = (st.positions[a] || []).join(','), B = (snap.positions[a] || []).join(',');
     if (A !== B) out.push(`${a} position: replay (${A}), snapshot (${B})`);
   }
@@ -597,6 +800,24 @@ function checkSnapshot(snap, st) {
   if (snap.individual_scores) for (const a in snap.individual_scores)
     if ((S.perAgent[a] || 0) !== snap.individual_scores[a]) out.push(`individual score ${a}: replay ${S.perAgent[a] || 0}, logged ${snap.individual_scores[a]}`);
   return out.slice(0, 8);
+}
+
+/** [v5] wallets / health / dead / per-team done votes of a snapshot or episode_end vs. a replayed state. */
+function checkTeamState(snap, st, out, pre) {
+  if (snap.wallets && typeof snap.wallets === 'object' && st.wallets)
+    for (const t of new Set([...Object.keys(snap.wallets), ...Object.keys(st.wallets)]))
+      if (snap.wallets[t] !== st.wallets[t]) out.push(`${pre}wallet ${t}: replay ${st.wallets[t]}, logged ${snap.wallets[t]}`);
+  if (snap.health && typeof snap.health === 'object' && st.health)
+    for (const a in snap.health) if (snap.health[a] !== st.health[a]) out.push(`${pre}health ${a}: replay ${st.health[a]}, logged ${snap.health[a]}`);
+  if (Array.isArray(snap.dead)) {
+    const A = [...st.dead].sort().join(','), B = [...snap.dead].sort().join(',');
+    if (A !== B) out.push(`${pre}dead: replay [${A}], logged [${B}]`);
+  }
+  if (snap.done_votes && typeof snap.done_votes === 'object' && !Array.isArray(snap.done_votes) && st.teamVotes)
+    for (const t of new Set([...Object.keys(snap.done_votes), ...Object.keys(st.teamVotes)])) {
+      const A = [...(st.teamVotes[t] || [])].sort().join(','), B = [...(snap.done_votes[t] || [])].sort().join(',');
+      if (A !== B) out.push(`${pre}done votes ${t}: replay [${A}], logged [${B}]`);
+    }
 }
 
 /** Number of events with t <= time (binary search; events sorted by t). */
@@ -615,11 +836,20 @@ function describeEvent(e) {
 /** " (n votes)" after a vote change, from diff.votes (log v3 with votes; empty otherwise). */
 function voteCount(e) {
   const v = e.diff && e.diff.votes;
+  if (v && typeof v === 'object' && !Array.isArray(v.after)) {
+    const t = Object.keys(v).find(k => v[k] && Array.isArray(v[k].after));
+    if (t) { const n = v[t].after.length; return ` (${t}: ${n} vote${n === 1 ? '' : 's'})`; }
+  }
   return v && Array.isArray(v.after) ? ` (${v.after.length} vote${v.after.length === 1 ? '' : 's'})` : '';
 }
 /** " — finished votes cleared" when a change to the build wiped the votes. */
 function votesCleared(e) {
   const v = e.diff && e.diff.votes;
+  if (v && !Array.isArray(v.after) && typeof v === 'object' && (e.tool === 'place' || e.tool === 'remove')) {
+    // [v5] per-team votes
+    const cleared = Object.keys(v).filter(t => v[t] && Array.isArray(v[t].before) && v[t].before.length && Array.isArray(v[t].after) && !v[t].after.length);
+    return cleared.length ? ` — ${cleared.join(' & ')} finished votes cleared` : '';
+  }
   return v && Array.isArray(v.before) && v.before.length && Array.isArray(v.after) && !v.after.length
     && e.tool !== 'cancel_done' ? ' — finished votes cleared' : '';
 }
@@ -644,7 +874,13 @@ function describeAction(e, a, pos, target) {
     case 'take': return `take ${a.n ?? ''} ${a.type ?? ''} from chest`;
     case 'deposit': return `deposit ${a.n ?? ''} ${a.type ?? ''} into chest`;
     case 'give': return `give ${a.n ?? ''} ${a.type ?? a.item ?? ''} → ${target ?? '?'}`;
-    case 'say': return 'says (public)';
+    case 'say': return e.chat && e.chat.channel === 'team' ? `says (team${e.chat.team ? ' ' + e.chat.team : ''})` : 'says (public)';
+    case 'say_all': return 'says (to all)';
+    case 'attack': {
+      const c = combatOf(e), who = a.target ?? target ?? '?';
+      if (!c) return `attacks ${who}`;
+      return c.killed ? `kills ${c.target} with a sword (${c.health_before} → 0 health)` : `hits ${c.target} with a sword (${c.health_before} → ${c.health_after} health)`;
+    }
     case 'whisper': return `whispers → ${(e.chat && e.chat.to) || target || '?'}`;
     case 'note': return 'writes a note';
     case 'jump': return 'jumps';
@@ -722,8 +958,18 @@ function typeColor(t) {
   if (c && c.color) return c.color;
   return TYPE_COLORS[t] || hashColor(t);
 }
-function agentColors(agents) {
+function agentColors(agents, teams = null) {
   const out = {};
+  if (teams && teams.names) {
+    const n = {};
+    agents.forEach((a, i) => {
+      const t = teams.teamOf[a], ti = teams.names.indexOf(t);
+      const pal = TEAM_PALETTES[t] || TEAM_PALETTES[FALLBACK_TEAM_KEYS[ti]];
+      if (!pal) { out[a] = AGENT_COLORS[i % AGENT_COLORS.length]; return; }
+      n[t] = (n[t] || 0); out[a] = pal[n[t]++ % pal.length];
+    });
+    return out;
+  }
   agents.forEach((a, i) => { out[a] = AGENT_COLORS[i % AGENT_COLORS.length]; });
   return out;
 }
@@ -734,4 +980,5 @@ export {
   isV4, shopOf, setCatalog, itemInfo, classifyItem, purchaseOf, walletAt, leaderboard, rankAgents, deployTopK, finalResults,
   posAtTime, walkPosition, agentPoseAt, HOP_HEIGHT,
   describeEvent, typeColor, agentColors, TYPE_COLORS, AGENT_COLORS, key,
+  isTeamBattle, teamsOf, sideOf, teamColor, teamStatsAt, sideAnalysis, combatOf, finalTeamResults, TEAM_COLORS, TEAM_PALETTES,
 };

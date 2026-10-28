@@ -148,6 +148,9 @@ select { background: var(--panel); border: 1px solid var(--border); border-radiu
 .badge.priv { background: #7c3aed22; color: #8b5cf6; }
 .badge.pub { background: #2f6fdf22; color: var(--accent); }
 .badge.bad { background: #d92d2022; color: var(--danger); }
+.badge.team { background: color-mix(in srgb, var(--tc) 18%, transparent); color: var(--tc); }
+.ev.hit { background: #d92d2014; }
+.ev.kill { background: #d92d2030; font-weight: 600; }
 .ev.move { padding-top: 1px; padding-bottom: 1px; }
 .ev.move .meta { display: inline; margin-right: 6px; }
 .ev .note { font-style: italic; color: var(--muted); white-space: pre-wrap; word-break: break-word; }
@@ -303,6 +306,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import {
   createLogBuilder, parseLog, buildStates, posAtTime, walkPosition, describeEvent,
   typeColor, agentColors, key, itemInfo, purchaseOf, leaderboard, finalResults, deployTopK,
+  teamStatsAt, sideAnalysis, combatOf, teamColor, finalTeamResults,
 } from './core.js';
 
 
@@ -407,6 +411,12 @@ function buildStaticScene() {
   lbl('x →', new THREE.Vector3(W + 1.2, 0.2, 0), '#e5484d');
   lbl('y ↑', new THREE.Vector3(0, 0.2, -(D + 1.2)), '#30a46c');
   lbl('0', new THREE.Vector3(-0.6, 0.2, 0.6), '#8b95a1');
+  // [v5] team battle: the line between the halves (x = divider_x), tinted on each side
+  const T = R.built.teams;
+  if (T) {
+    const strip = (w, color, op, cx) => { const m = new THREE.Mesh(new THREE.PlaneGeometry(w, D), new THREE.MeshBasicMaterial({ color, transparent: op < 1, opacity: op, depthWrite: false })); m.rotation.x = -Math.PI / 2; m.position.set(cx, 0.006, -D / 2); world.group.add(m); };
+    strip(0.5, teamColor(T, T.names[0]), 0.3, T.dividerX - 0.25); strip(0.5, teamColor(T, T.names[1]), 0.3, T.dividerX + 0.25); strip(0.12, '#f2c200', 1, T.dividerX);
+  }
   buildBodies();
   applyTheme();
 }
@@ -429,7 +439,7 @@ function cfgNum(name, dflt) {
   return typeof c[name] === 'number' ? c[name] : dflt;
 }
 /** [v4] the shop: a small market stall (counter, posts, striped awning, crates) on the shop cell. */
-function marketStall(pos) {
+function marketStall(pos, color = '#d1495b', text = 'shop') {
   const g = new THREE.Group(); g.position.copy(feetToThree(pos[0], pos[1], pos[2]));
   const M = (color, o = {}) => new THREE.MeshStandardMaterial({ color, roughness: 0.8, ...o });
   const box = (w, hgt, d, mat, x, y, z) => { const m = new THREE.Mesh(new THREE.BoxGeometry(w, hgt, d), mat); m.position.set(x, y, z); g.add(m); return m; };
@@ -439,7 +449,7 @@ function marketStall(pos) {
   for (const [x, z] of [[-0.44, -0.44], [0.44, -0.44], [-0.44, 0.44], [0.44, 0.44]]) box(0.07, 1.45, 0.07, dark, x, 0.725, z);
   // striped awning (canvas texture), sloping towards the south (+three z)
   const c = document.createElement('canvas'); c.width = 64; c.height = 8;
-  const cg = c.getContext('2d'); for (let i = 0; i < 8; i++) { cg.fillStyle = i % 2 ? '#f4f1ea' : '#d1495b'; cg.fillRect(i * 8, 0, 8, 8); }
+  const cg = c.getContext('2d'); for (let i = 0; i < 8; i++) { cg.fillStyle = i % 2 ? '#f4f1ea' : color; cg.fillRect(i * 8, 0, 8, 8); }
   const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
   const aw = new THREE.Mesh(new THREE.BoxGeometry(1.16, 0.05, 1.16), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9 }));
   aw.position.set(0, 1.47, 0.04); aw.rotation.x = 0.16; g.add(aw);
@@ -450,7 +460,7 @@ function marketStall(pos) {
   box(0.12, 0.12, 0.12, M('#f6d03d', { metalness: 0.5, roughness: 0.3 }), 0.24, 0.68, -0.22);
   const e = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(0.94, 0.55, 0.94)), lineMat('#3a2410', 0.6));
   e.position.y = 0.275; g.add(e);
-  const l = textSprite('shop', '#a1272f', 0.32); l.position.y = 1.85; g.add(l);
+  const l = textSprite(text, color === '#d1495b' ? '#a1272f' : color, 0.32); l.position.y = 1.85; g.add(l);
   return g;
 }
 function buildBodies() {
@@ -459,7 +469,9 @@ function buildBodies() {
   world.avatars.clear();
   const h = R.log.header;
   const shop = R.built.v4 ? R.built.shop : null;
-  if (shop && Array.isArray(shop.pos)) world.bodies.add(marketStall(shop.pos));
+  const T = R.built.teams;
+  if (T) { for (const t of T.names) if (Array.isArray(T.shops[t])) world.bodies.add(marketStall(T.shops[t], teamColor(T, t), `${t} shop`)); }
+  else if (shop && Array.isArray(shop.pos)) world.bodies.add(marketStall(shop.pos));
   const cp = R.built.v4 ? null : h.chest_pos || (h.config && h.config.chest_pos);
   if (Array.isArray(cp)) {
     const g = new THREE.Group(); g.position.copy(toThree(cp[0], cp[1], cp[2]));
@@ -487,7 +499,16 @@ function buildBodies() {
     const head = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 0.4), new THREE.MeshStandardMaterial({ color: '#f1d3b3', roughness: 0.7 }));
     head.position.y = 1.6; g.add(head);
     const band = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.1, 0.42), mat); band.position.y = 1.78; g.add(band);
-    const label = textSprite(a, col); label.position.y = 2.25; g.add(label);
+    const team = T ? T.teamOf[a] : null;
+    const label = textSprite(a, team ? teamColor(T, team) : col); label.position.y = 2.25; g.add(label);
+    // [v5] where the agent died: a red cross on the ground
+    let grave = null;
+    if (T) {
+      grave = new THREE.Group();
+      for (const r of [Math.PI / 4, -Math.PI / 4]) { const m = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.04, 0.14), new THREE.MeshBasicMaterial({ color: '#d92d20' })); m.rotation.y = r; m.position.y = 0.03; grave.add(m); }
+      const gl = textSprite(`✕ ${a}`, '#d92d20', 0.26); gl.position.y = 0.45; grave.add(gl);
+      grave.visible = false; world.bodies.add(grave);
+    }
     // reach sphere (around the eye) + view radius ring on the ground
     const reachM = new THREE.Mesh(new THREE.SphereGeometry(reach, 32, 16), new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.07, depthWrite: false }));
     reachM.position.y = eye; reachM.visible = false; g.add(reachM);
@@ -500,7 +521,7 @@ function buildBodies() {
     trail.renderOrder = 9; trail.visible = false; world.bodies.add(trail);
     g.visible = false;
     world.bodies.add(g);
-    world.avatars.set(a, { g, reachM, reachW, ring, trail, trailFor: null });
+    world.avatars.set(a, { g, reachM, reachW, ring, trail, trailFor: null, grave });
   }
 }
 /** Place figures at playback time R.time (called every frame). */
@@ -509,8 +530,10 @@ function updateBodies() {
   world.bodies.visible = R.showAgents;
   const st = R.built.states[R.pos];
   for (const [a, av] of world.avatars) {
+    const died = st.deadAt && st.deadAt[a];
+    if (av.grave) { av.grave.visible = !!(died && died.at); if (died && died.at) av.grave.position.copy(feetToThree(died.at[0], died.at[1], died.at[2])); }
     const m = st.moves[a];
-    const p = m ? walkPosition(m, R.time) : st.positions[a];
+    const p = died ? null : m ? walkPosition(m, R.time) : st.positions[a];
     if (!p) { av.g.visible = false; av.trail.visible = false; continue; }
     av.g.visible = true;
     av.g.position.copy(feetToThree(p[0], p[1], p[2]));
@@ -595,7 +618,7 @@ function initView(log, built, sourceName) {
   R.log = log; R.built = built; R.pos = -1;
   R.liveT = lastEventT();
   updateTEnd();
-  agentColorMap = agentColors(built.agents);
+  agentColorMap = agentColors(built.agents, built.teams);
   const { height: H } = gridDims();
   $('cut').max = H - 1; $('cut').value = H - 1; R.cut = H - 1; updateCutLabel();
   $('empty').style.display = 'none'; $('err').style.display = 'none'; hideBanner();
@@ -786,7 +809,10 @@ function renderInfo() {
     R.built.task.kind === 'open'
       ? ['Task', `open-ended${c.reference_design ? ` <span class="muted">(reference design: ${esc(c.reference_design)})</span>` : ''}<div style="margin-top:3px;padding:6px 8px;border-radius:6px;background:var(--panel-2);border:1px solid var(--border);white-space:pre-wrap">${esc(R.built.task.brief || '(no brief in log)')}</div>`]
       : ['Blueprint', `${esc(R.built.task.blueprint.name ?? c.blueprint ?? '–')} <span class="muted">(${R.built.task.blueprint.cells.length} cells)</span>`],
-    ...(v4 ? [
+    ...(R.built.teams ? [
+      ['Teams', R.built.teams.names.map(t => `<div><b style="color:${teamColor(R.built.teams, t)}">${esc(t)}</b>: ${R.built.teams.members[t].map(agentTag).join(' ')} · shop at (${(R.built.teams.shops[t] || []).join(', ')}) · ${R.built.teams.startWallets[t]} coins</div>`).join('')
+        + `<div class="muted">divider between x = ${R.built.teams.dividerX - 1} and x = ${R.built.teams.dividerX}${R.built.teams.combat ? ` · swords: ${R.built.teams.combat.sword_damage} damage, ${R.built.teams.combat.max_health} health, reach ${R.built.teams.combat.attack_reach}, cooldown ${R.built.teams.combat.attack_cooldown_s} s` : ''}</div>`],
+    ] : v4 ? [
       ['Shop', `${R.built.shop.pos ? `at (${R.built.shop.pos.join(', ')}) · ` : ''}${R.built.shop.catalog.length} items · starting money <b>${fmt(R.built.shop.startingMoney)}</b> coins (shared wallet)`],
       ['Incentive', c.incentive === 'none' ? 'none' : `competitive: the top ${deployTopK(h)} by blocks still standing are deployed (ties at the boundary too)${c.show_leaderboard ? ' · agents see the leaderboard' : ''}`],
     ] : [
@@ -803,7 +829,8 @@ function renderInfo() {
   if (c.action_cooldown_s) lim.push(`cooldown ${c.action_cooldown_s} s`);
   if (c.walk_speed != null) lim.push(`walk ${c.walk_speed} blocks/s · reach ${c.reach} · view ${c.view_radius}`);
   if (lim.length) rows.push(['Limits', lim.join(' · ')]);
-  if (end && v4) { const fr = finalResults(R.log); rows.push(['Ended', `${esc(end.reason)} at ${fmtT(end.t)} · deployed: ${fr.deployed.length ? fr.deployed.map(agentTag).join(' ') : '<span class="muted">nobody</span>'}`]); }
+  if (end && R.built.teams) { const fr = finalTeamResults(R.log); rows.push(['Ended', `${esc(end.reason)} at ${fmtT(end.t)} · ${R.built.teams.names.map(t => `${esc(t)} ${fr.teams[t].alive.length} alive`).join(' · ')} · ${fr.kills.length} kill${fr.kills.length === 1 ? '' : 's'} · no judge`]); }
+  else if (end && v4) { const fr = finalResults(R.log); rows.push(['Ended', `${esc(end.reason)} at ${fmtT(end.t)} · deployed: ${fr.deployed.length ? fr.deployed.map(agentTag).join(' ') : '<span class="muted">nobody</span>'}`]); }
   else if (end) rows.push(['Ended', `${esc(end.reason)} at ${fmtT(end.t)} · team score ${fmt(end.team_score)}`]);
   else if (F.active) rows.push(['Ended', '<span style="color:var(--danger)">not yet — following live</span>']);
   else rows.push(['Ended', '<span class="warnbox">no episode_end record (incomplete log?)</span>']);
@@ -840,7 +867,7 @@ function renderLeaderboard() {
   const maxA = Math.max(1, ...lb.map(r => r.score));
   const atEnd = R.pos === N && !!R.log.episodeEnd;
   const fr = atEnd ? finalResults(R.log) : null;
-  const dep = fr ? new Set(fr.deployed) : null;
+  const dep = fr && !R.built.teams ? new Set(fr.deployed) : null; // [v5] team battles deploy nobody
   const k = deployTopK(R.log.header);
   let html = `<div class="muted" style="font-size:11px;margin-bottom:4px">Blocks each agent placed that are still in the world${k ? ` · top ${k} get deployed` : ''}</div>`;
   for (const r of lb) {
@@ -848,6 +875,16 @@ function renderLeaderboard() {
     html += `<div class="lbrow"><span class="rk">#${r.rank}</span><span>${agentTag(r.agent)}</span><div class="bar"><i style="width:${r.score / maxA * 100}%;background:${agentColor(r.agent)}"></i></div><span class="n">${r.score}</span></div>${badge ? `<div style="margin:-2px 0 3px 28px">${badge}</div>` : ''}`;
   }
   if (fr && fr.source === 'episode_end') html += `<div class="muted" style="font-size:11px;margin-top:3px">Final ranking from episode_end (${esc(R.log.episodeEnd.reason)}).</div>`;
+  if (R.built.teams) {
+    // [v5] per team: alive, blocks per side, the house analysis of its half
+    const ts = teamStatsAt(R.built, R.pos);
+    for (const t of R.built.teams.names) {
+      const x = ts[t], A = sideAnalysis(R.built, R.pos, t);
+      html += `<div class="analysis" style="border-left:3px solid ${teamColor(R.built.teams, t)}"><div class="t">${esc(t)} · ${x.alive.length}/${x.members.length} alive${x.votes.length ? ` · votes: ${x.votes.join(', ')}` : ''}</div>
+        <div class="muted">on its half <b>${x.blocksOnSide}</b> (${x.othersOnSide} by the other team) · placed on the other half <b>${x.byTeamOnOtherSide}</b> · its blocks removed by the other team <b>${x.removedByOther}</b></div>
+        <div class="muted">${A.enclosed ? '<b style="color:var(--ok)">enclosed</b>' : 'not enclosed'} · interior <b>${A.interiorCells}</b> · doors <b>${A.doors}</b> · windows <b>${A.windows}</b> · shell <b>${A.shellCells}</b></div></div>`;
+    }
+  }
   if (s.kind === 'open') {
     const tick = (ok, label) => `<span class="chip" style="${ok ? 'outline:1.5px solid var(--ok)' : 'opacity:.6'}">${ok ? '✓' : '✗'} ${label}</span>`;
     html += `<div class="analysis"><div class="t">House analysis · not shown to agents</div>
@@ -914,7 +951,17 @@ function renderScores() {
 
 /** [v4] shared wallet: balance vs starting money + the latest purchases up to here. */
 function renderWallet() {
-  const st = R.built.states[R.pos], start = R.built.shop.startingMoney ?? R.built.states[0].wallet ?? 0;
+  const st = R.built.states[R.pos], T = R.built.teams;
+  if (T) {
+    // [v5] one wallet per team
+    $('chest').innerHTML = T.names.map(t => {
+      const start = T.startWallets[t] || 0, bal = (st.wallets || {})[t] ?? 0, pct = start ? Math.max(0, Math.min(1, bal / start)) : 0;
+      return `<div class="wallet"><div style="display:flex;align-items:baseline;gap:8px"><b style="color:${teamColor(T, t)}">${esc(t)}</b><span class="big">${bal}</span><span class="muted">of ${start} coins left</span></div>
+        <div class="bar" style="margin:4px 0 6px"><i style="width:${pct * 100}%;background:${teamColor(T, t)}"></i></div></div>`;
+    }).join('');
+    return;
+  }
+  const start = R.built.shop.startingMoney ?? R.built.states[0].wallet ?? 0;
   const bal = st.wallet ?? 0, pct = start ? Math.max(0, Math.min(1, bal / start)) : 0;
   const buys = [];
   let spent = 0, nBuys = 0;
@@ -951,12 +998,17 @@ function renderInvs() {
     const total = Object.values(inv).reduce((s, v) => s + v, 0);
     const used = st.actions[a] || 0;
     const done = st.votes.includes(a);
+    const dead = st.deadAt && st.deadAt[a];
+    const hp = st.health && typeof st.health[a] === 'number' ? st.health[a] : null;
+    const team = R.built.teams ? R.built.teams.teamOf[a] : null;
     const items = Object.entries(inv).filter(([, v]) => v).map(([t, v]) => `<span class="chip"><span class="sw" style="background:${typeColor(t)}"></span>${esc(t)} ${v}</span>`).join('');
     const pos = st.positions[a], mv = st.moves[a];
     const walking = mv && typeof mv.arrive_t === 'number' && R.time < mv.arrive_t;
     const posLine = pos ? `<div class="cnt" style="margin:1px 0 2px">at (${pos.join(', ')})${walking ? ` · <b style="color:${agentColor(a)}">${mv.jump ? 'airborne' : mv.fall ? 'falling' : 'walking'} until t = ${mv.arrive_t.toFixed(1)} s</b>` : ''}</div>` : '';
     const actBar = maxAct ? `<div class="bar" style="height:4px;margin:2px 0 3px"><i style="width:${Math.min(1, used / maxAct) * 100}%;background:${agentColor(a)}"></i></div>` : '';
     return `<div class="inv"><div style="display:flex;align-items:center;gap:6px"><span class="who">${agentTag(a)}</span>
+      ${team ? `<span class="badge team" style="--tc:${teamColor(R.built.teams, team)}">${esc(team)}</span>` : ''}
+      ${dead ? `<span class="badge bad">dead (killed by ${esc(dead.by)} at ${dead.t.toFixed(1)} s)</span>` : hp !== null ? `<span class="badge" style="${hp < 20 ? 'color:var(--danger)' : ''}">health ${hp}</span>` : ''}
       ${done ? '<span class="badge" style="background:#12805c22;color:var(--ok)">voted done</span>' : ''}
       <span class="cnt" style="margin-left:auto">actions ${used}${maxAct ? ' / ' + maxAct : ''}</span></div>${actBar}${posLine}
       <div class="chips"><span class="cnt" style="margin:0 4px 0 0">holding ${total}${cap != null ? ' / ' + cap : ''}</span>${items || '<span class="muted" style="font-size:12px">nothing</span>'}</div></div>`;
@@ -985,7 +1037,8 @@ function appendFeed(from) {
     el.style.setProperty('--c', agentColor(e.agent));
     let body = `<span class="who">${esc(e.agent)}</span> ${esc(describeEvent(e))}`;
     if (isChat) {
-      const badge = e.chat.channel === 'private' ? `<span class="badge priv">private → ${esc(e.chat.to)}</span>` : '<span class="badge pub">public</span>';
+      const badge = e.chat.channel === 'private' ? `<span class="badge priv">private → ${esc(e.chat.to)}</span>`
+        : e.chat.channel === 'team' ? `<span class="badge team" style="--tc:${teamColor(R.built.teams, e.chat.team)}">team ${esc(e.chat.team || '')}</span>` : '<span class="badge pub">public</span>';
       body = `<span class="who">${esc(e.chat.from || e.agent)}</span> ${badge}<div class="bubble">${esc(e.chat.text)}</div>`;
     } else if (e.tool === 'move_to') {
       el.classList.add('move');
@@ -993,6 +1046,8 @@ function appendFeed(from) {
       body += `<div class="note">“${esc(e.args.text)}”</div>`;
     }
     if (e.tool === 'buy' && e.ok) { const b = purchaseOf(e); el.classList.add('buy'); body = `<span class="who">${esc(e.agent)}</span> buys <span class="sw" style="background:${typeColor(b.item)}"></span><b>${b.n} × ${esc(b.item)}</b> <span style="color:var(--warn)">(−${b.cost})</span>`; }
+    const cb = combatOf(e);
+    if (cb) el.classList.add(cb.killed ? 'kill' : 'hit');
     if (!e.ok) body += `<span class="badge bad">failed</span><div class="err">${esc(e.message)}</div>`;
     if (e.ok && e.tool === 'remove') { const b = e.diff.grid[0] && e.diff.grid[0].before; if (b && b.placed_by && b.placed_by !== e.agent) body += `<span class="badge bad">other's block</span>`; }
     el.innerHTML = `<div class="meta">t = ${e.t.toFixed(2)} s · #${e.event_id ?? i}${e.cost ? ' · ' + esc(e.cost) : ''}</div>${body}`;

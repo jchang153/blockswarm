@@ -1,9 +1,17 @@
-# Episode log format (v4: shop, shared wallet, competitive incentive)
+# Episode log format (v5: v4's shop plus the team battle variant)
 
-v4 replaces v3's physical chest with a shop and a shared wallet, makes block types the shop's
-catalog items, drops the team score and the blueprint task, and adds the competitive
+v5 adds the **team battle** variant (design: [team-battle.md](team-battle.md)): two teams,
+one shop and one wallet per team, per-team finished votes, team / public / private chat,
+swords, health and death. Without `teams` a v5 log is a v4 log plus a few always-present
+keys (`diff.combat` = `{}`, and the null/empty v5 header, snapshot and `episode_end` keys);
+readers decide by `header.teams` (null = shop variant). The v5 additions are collected in
+"Log v5: team battle" below and marked **[v5]** inline.
+
+v4 replaced v3's physical chest with a shop and a shared wallet, made block types the shop's
+catalog items, dropped the team score and the blueprint task, and added the competitive
 incentive (design: [shop-and-incentives.md](shop-and-incentives.md)). Changes from v3 are
-marked **[v4]**; v3 is described at the end ("Reading v3 logs"). Readers must still read v3.
+marked **[v4]**; v4 and v3 are described at the end ("Reading v4 logs", "Reading v3 logs").
+Readers must still read v3 and v4 (`blockswarm/replay.py` verifies all three).
 
 One episode = one JSONL file (one JSON object per line). The engine writes it; the
 viewer and analysis tools read it. It is the ground truth for everything that happened.
@@ -23,7 +31,7 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
 
 ### `header` (exactly one, first line)
 ```json
-{"type": "header", "log_version": 4, "episode_id": "demo-open_house",
+{"type": "header", "log_version": 5, "episode_id": "demo-open_house",
  "config": {"width": 24, "depth": 24, "height": 10, "agents": ["agent_1", "agent_2", "agent_3"],
             "inventory_cap": 12, "max_seconds": 600, "max_actions_per_agent": 300,
             "action_cooldown_s": 0.0, "snapshot_interval_s": 10, "seed": 0,
@@ -33,7 +41,9 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
             "target_interior": 12, "incentive": "competitive", "deploy_top_k": 1,
             "show_leaderboard": false, "reach_line_of_sight": true, "view_occlusion": true,
             "models": null | {"agent_1": "provider/model-name", ...},
-            "run_meta": null | {"run_id": "...", "prompt_version": "...", ...}},
+            "run_meta": null | {"run_id": "...", "prompt_version": "...", ...},
+            "variant": "shop", "teams": null, "shops": null, "divider_x": null, "combat": false,
+            "max_health": 20, "sword_damage": 7, "attack_reach": 3.0, "attack_cooldown_s": 0.6},
  "task": {"kind": "open", "brief": "Work together to build a house that all of you could live in. Agree on a design together."},
  "clock": "simulated" | "wall",
  "grid": {"width": 24, "depth": 24, "height": 10},
@@ -44,8 +54,12 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
  "wallet": 300,
  "positions": {"agent_1": [11, 5, 0], "agent_2": [13, 5, 0], "agent_3": [11, 3, 0]},
  "block_types": ["dirt", "cobblestone", ...],
- "inventories": {"agent_1": {}, "agent_2": {}, "agent_3": {}}}
+ "inventories": {"agent_1": {}, "agent_2": {}, "agent_3": {}},
+ "variant": "shop", "teams": null, "shops": null, "wallets": null, "divider_x": null,
+ "combat": null, "health": null, "equipment": null}
 ```
+- **[v5]** `variant`, `teams`, `shops`, `wallets`, `divider_x`, `combat`, `health`,
+  `equipment`: null without teams / combat (`variant` = `"shop"`); see "Log v5: team battle".
 - **[v4]** No `chest` / `chest_pos`. `shop` = position, the full catalog (`blockswarm/catalog.py`;
   every item a full cube; `transparent` items don't block sight, `door` items can be walked
   through but are closed for air) and `starting_money`; `wallet` = the shared wallet's
@@ -72,10 +86,13 @@ is the ground layer. `event_id` is 0-based and strictly increasing; `t` never de
    "wallet": 0,
    "inventory": {"agent_2": {"stone": -1}},
    "agents": {},
-   "votes": {"before": ["agent_1", "agent_3"], "after": []}
+   "votes": {"before": ["agent_1", "agent_3"], "after": []},
+   "combat": {}
  },
  "chat": null}
 ```
+- **[v5]** `diff.combat` is always present (`{}` except on a successful `attack`); with
+  teams `wallet` and `votes` are per team (see "Log v5: team battle").
 - `cost`: `"action"` (move_to, jump, buy, give, place, remove, declare_done, cancel_done),
   `"message"` (say, whisper) or `"free"` (observe, note). Any other tool name (e.g. v3's
   `take` / `deposit`) fails as an unknown tool and costs an action.
@@ -163,7 +180,7 @@ ignore these records; the public site export strips them.
 ### `episode_end` (exactly one, last line)
 ```json
 {"type": "episode_end", "t": 187.402,
- "reason": "all_done" | "time_limit" | "action_limit" | "aborted" | "budget" | "error",
+ "reason": "all_done" | "time_limit" | "action_limit" | "aborted" | "budget" | "error" | "all_dead",
  "wallet": 12,
  "individual_scores": {"agent_1": 47, "agent_2": 43, "agent_3": 40},
  "ranking": [{"agent": "agent_1", "score": 47, "rank": 1},
@@ -173,10 +190,79 @@ ignore these records; the public site export strips them.
  "analysis": {...},
  "actions_used": {...}}
 ```
-`all_done` = every agent's finished vote is present at once. `time_limit` = `max_seconds`
+`all_done` = every (living, **[v5]**) agent's finished vote is present at once. **[v5]** `all_dead` = every agent is dead. `time_limit` = `max_seconds`
 reached. `action_limit` = every agent has used `max_actions_per_agent`. `aborted` = stopped
 early (e.g. every agent quit, or a runner gave up). `budget` = the orchestrator's spending
 limit (tokens / cost) was reached. `error` = the orchestrator stopped on an unrecoverable error.
+
+## Log v5: team battle
+Present when `header.teams` is non-null (combat parts when `header.combat` is non-null;
+combat defaults on with teams). Rules: [team-battle.md](team-battle.md).
+
+**Header.** `variant: "team_battle"`; `teams: {team: [agent, ...]}` (exactly 2; `agents` =
+first team then second); `shops: {team: [x, y, z]}` (both are solid cells like v4's shop;
+`shop.pos` = the first team's shop, `shop.starting_money` = each team's starting balance);
+`wallets: {team: int}` and `wallet: null`; `divider_x` (the first team's side is
+`x < divider_x`, the second's `x >= divider_x`); `combat: {"max_health", "sword_damage",
+"attack_reach", "attack_cooldown_s"}`; `health: {agent: max_health}`;
+`equipment: {agent: ["iron_sword"]}`. `config.incentive` is `"none"`. `task.brief` defaults to
+the team battle brief (`tasks.TEAM_BATTLE_BRIEF`) when `config.brief` is null.
+
+**Events.**
+- Tools: adds `say_all(text)` (cost `"message"`, teams only) and `attack(target)` (cost
+  `"action"`, combat only). In a world without teams / combat these fail as unknown tools.
+- `diff.wallet`: `{team: delta}` (`{}` when unchanged). A successful `buy` (at any shop in
+  reach) is `{<buyer's team>: -price*n}`.
+- `diff.votes`: `{team: {"before": [...], "after": [...]}}` for each team whose voters
+  changed, `{}` otherwise. `declare_done` / `cancel_done` change the caller's team's votes; a
+  successful grid change clears the votes of the team on whose side (by x) a changed cell is;
+  a killed agent's vote is removed. The episode ends `all_done` when every living agent has
+  voted (dead agents never count).
+- `diff.combat`: on a successful attack `{"attacker", "target", "damage", "health_before",
+  "health_after", "killed"}` (`health_after = max(0, health_before - damage)`, `killed` =
+  `health_after <= 0`). Failed attacks (`out of reach`, `no line of sight`, `<target> is dead`,
+  ...) have an empty diff like any failure; an attack within `attack_cooldown_s` of the
+  attacker's previous counted attack fails with a message starting `"cooldown"` and is not
+  counted in `actions_used` (like the action cooldown).
+- A kill also has `diff.agents: {<target>: {"dead": true, "at": [x, y, z]}}` (no path; `at` =
+  the position it died at; snapshots and `episode_end` keep it under `positions` as the dead
+  agent's last cell, so readers must skip agents listed in `dead`), the target's whole
+  inventory as negative deltas in `diff.inventory`, and its vote removal in `diff.votes`. A
+  dead agent's body leaves the world (its cells are free; nobody falls), its blocks stay, and
+  **it never appears in another event** (the engine refuses its calls without logging them).
+- `chat`: `{"channel": "team", "from", "to": null, "text", "team": <speaker's team>}` for
+  `say`; `{"channel": "public", ...}` for `say_all`; `{"channel": "private", ...}` for
+  `whisper`. System notices (not logged; derived from events, shown in views) may carry
+  `"to": <agent>` or `"team": <team>`: vote and vote-clearing notices go to the team,
+  `"<target> was killed by <attacker>"` to everyone, `"you were hit by <attacker> (health
+  H/M)"` to the target only.
+
+**Snapshots** add `wallets` (`{team: int}`; `wallet` is null), `health` (`{agent: int}`, null
+without combat), `dead` (agents in order of death, `[]` if none); `done_votes` becomes
+`{team: [agents in voting order]}`. Without teams `wallets` is null and `done_votes` a list.
+
+**`episode_end`** adds `wallets`, `health`, `dead`, `kills: [{"t", "attacker", "target"}]` and
+`teams` (null without teams):
+```json
+"teams": {"red": {"alive": ["red_1", "red_3"], "dead": ["red_2"],
+                  "analysis": {...},
+                  "blocks_on_side": 2, "blocks_placed_by_team": 3,
+                  "blocks_by_team_on_other_side": 1, "team_blocks_removed_by_other_team": 0},
+          "blue": {...}}
+```
+- `analysis` = the "Analysis" below run on only the blocks on that team's side (the shops on
+  that side count as solids).
+- `blocks_on_side` = blocks on that side now. `blocks_placed_by_team` = successful `place`
+  events by team members over the whole episode (removed blocks included).
+  `blocks_by_team_on_other_side` = blocks placed by team members that stand on the other side
+  now. `team_blocks_removed_by_other_team` = `remove` events by the other team's agents of
+  blocks placed by this team's agents, over the whole episode.
+- `ranking` and `deployed` are `[]`; `individual_scores` stays. No winner is declared.
+- End reason `"all_dead"`: every agent is dead (possible with combat, with or without teams).
+  `action_limit` counts only living agents.
+
+Sample log: `tests/data/v5_team_battle_sample.jsonl` (regenerate with
+`python3 -m tests.make_v5_fixture`).
 
 ## Incentive and analysis
 Computed by `blockswarm/tasks.py`. There is **no team score**.
@@ -208,6 +294,13 @@ LLM runs add `agent_prompt` (each agent's system prompt, logged once and referen
 from `model_call`), `model_call`, `tool_results`, `implicit_wait`, `agent_stop` and
 `orchestrator_error` records. They are described in [running.md](running.md). Replay and the
 viewers ignore them; the public site export drops them by default.
+
+## Reading v4 logs
+v4 logs (`log_version: 4`) are v5 logs without teams, minus: the v5 header keys (`variant`
+... `equipment`) and config keys (`variant` ... `attack_cooldown_s`), `diff.combat` (five diff
+keys), the snapshot keys `wallets` / `health` / `dead`, and the `episode_end` keys `wallets`,
+`health`, `dead`, `kills`, `teams`. There was no `say_all` / `attack`. Treat a v4 log as
+variant `"shop"`.
 
 ## Reading v3 logs
 v3 logs (`log_version: 3`) differ as follows; `blockswarm/replay.py` reads both.

@@ -10,6 +10,10 @@ Outputs go to runs/<run_id>/ (see docs/running.md):
 Config keys: any World Config field (width, starting_money, incentive, max_seconds, ...), plus
   "n_agents": N (ids agent_1..agent_N) and/or "agents": [...] (must agree),
   "model": "id" or "models": {agent: id} | [id, ...] (one per agent),
+  team battle (docs/team-battle.md): the world keys "variant", "teams" ({team: [agent ids]}; the
+  agent list is then the teams' members in order, and agents/n_agents may be omitted), "shops",
+  "divider_x", "combat", "max_health", "sword_damage", "attack_reach", "attack_cooldown_s", and
+  "team_models": {team: model id} instead of "model"/"models" (e.g. one model per team),
   "llm": LLMConfig fields (max_tokens, temperature, reasoning, provider, history_steps,
          max_model_calls_per_agent, prices, ...),
   "budget_usd", "episode_id", "client": {"timeout_s", "max_retries"},
@@ -20,6 +24,7 @@ Config keys: any World Config field (width, starting_money, incentive, max_secon
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import random
@@ -37,14 +42,15 @@ from blockswarm.catalog import CATALOG
 from blockswarm.clock import WallClock
 from blockswarm.llm.agent import LLMAgent, LLMConfig
 from blockswarm.llm.budget import Budget, UnknownPrice, estimate_cost, price_for
+from blockswarm.llm.prompts import TEAM_BRIEF
 from blockswarm.llm.client import ChatResult, MockClient, OpenRouterClient, mock_result, tool_call
 from blockswarm.recorder import Recorder
 from blockswarm.world import Config, World
 
 REPO = Path(__file__).resolve().parents[2]
 PLACEHOLDER_MODEL = "CHOOSE_MODEL"
-META_KEYS = {"episode_id", "model", "models", "llm", "budget_usd", "n_agents", "agents", "client",
-             "mock", "comment", "model_candidates"}
+META_KEYS = {"episode_id", "model", "models", "team_models", "llm", "budget_usd", "n_agents", "agents",
+             "client", "mock", "comment", "model_candidates"}
 WORLD_KEYS = {f.name for f in fields(Config)} - {"agents", "models", "run_meta"}
 # Rough prompt size used for the dry-run spend estimate (system + tools + window), in tokens.
 TYPICAL_PROMPT_TOKENS = 8000
@@ -69,6 +75,20 @@ def resolve_config(raw: dict, *, n_agents: int | None = None, budget_usd: float 
     # agents
     agents = raw.get("agents")
     n = raw.get("n_agents")
+    teams = raw.get("teams")
+    if teams is not None:
+        if not isinstance(teams, dict) or not teams or not all(
+                isinstance(t, str) and t and isinstance(m, list) and m and all(isinstance(a, str) and a for a in m)
+                for t, m in teams.items()):
+            raise ConfigError("teams must be a dict team -> non-empty list of agent ids")
+        if n_agents is not None:
+            raise ConfigError("--n-agents cannot be used with teams; edit the teams in the config")
+        members = [a for m in teams.values() for a in m]
+        if agents is not None and agents != members:
+            raise ConfigError(f"agents {agents} must equal the teams' members in order {members}")
+        if n is not None and n != len(members):
+            raise ConfigError(f"n_agents={n} disagrees with the teams' {len(members)} members")
+        agents, n = members, None
     if n_agents is not None:  # CLI override wins over both
         n, agents = n_agents, None
     if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n < 1):
@@ -84,9 +104,16 @@ def resolve_config(raw: dict, *, n_agents: int | None = None, budget_usd: float 
         agents = list(Config().agents)
 
     # models
-    if "model" in raw and "models" in raw:
-        raise ConfigError("give either 'model' or 'models', not both")
-    if "models" in raw:
+    if sum(k in raw for k in ("model", "models", "team_models")) > 1:
+        raise ConfigError("give only one of 'model', 'models' and 'team_models'")
+    if "team_models" in raw:
+        tm = raw["team_models"]
+        if teams is None:
+            raise ConfigError("team_models needs teams")
+        if not isinstance(tm, dict) or set(tm) != set(teams):
+            raise ConfigError(f"team_models keys must equal the teams {sorted(teams)}")
+        models = {a: tm[t] for t, m in teams.items() for a in m}
+    elif "models" in raw:
         m = raw["models"]
         if isinstance(m, list):
             if len(m) != len(agents):
@@ -125,6 +152,8 @@ def resolve_config(raw: dict, *, n_agents: int | None = None, budget_usd: float 
         raise ConfigError(f"budget_usd must be a number > 0, got {b!r}")
 
     world_kwargs = {k: raw[k] for k in WORLD_KEYS if k in raw}
+    if teams is not None and raw.get("brief") is None:  # the team-battle brief, logged in the header
+        world_kwargs["brief"] = TEAM_BRIEF
     try:
         world_cfg = Config(agents=agents, models=dict(models), **world_kwargs)
     except (TypeError, ValueError) as e:
@@ -170,6 +199,13 @@ class MockPolicy:
     Fetches blocks, walks near the reference house, places blocks on empty supported cells of
     that design, sometimes jumps and places under itself, says things, waits while walking.
     Usage tokens are estimated from message size; cost from the configured prices.
+
+    Team battle (world config `teams`): each team builds the reference house shifted next to its
+    own shop, buys at its own shop from its team wallet, and the policy also uses every new
+    mechanic now and then so offline runs exercise them for the viewer: team `say` and `say_all`,
+    raids (walk to the other side and remove one of the other team's blocks) and `attack` on an
+    agent within sword reach (mostly the other team's, rarely a teammate). This is a test
+    fixture, not a model of behaviour.
     """
 
     def __init__(self, world: World, prices: dict[str, dict], seed: int = 0):
@@ -178,13 +214,70 @@ class MockPolicy:
         self.seed = seed
         self.design = sorted(BLUEPRINTS["house"].cells)
         self.design_types = sorted(set(BLUEPRINTS["house"].cells.values()))
+        self.teams: dict[str, list[str]] = dict(getattr(world.config, "teams", None) or {})
+        self.team_design: dict[str, list[tuple[int, int, int]]] = {t: self._shifted_design(t) for t in self.teams}
+
+    # -- team battle helpers
+    def team_of(self, agent: str | None) -> str | None:
+        return next((t for t, m in self.teams.items() if agent in m), None)
+
+    def _shops(self) -> dict[str, tuple[int, int, int]]:
+        shops = getattr(self.world.config, "shops", None) or {}
+        return {t: tuple(p) for t, p in shops.items()}
+
+    def _divider(self) -> int:
+        d = getattr(self.world.config, "divider_x", None)
+        return int(d) if d is not None else self.world.config.width // 2
+
+    def _on_side(self, team: str, x: int) -> bool:
+        first = next(iter(self.teams))
+        return (x < self._divider()) == (team == first)
+
+    def _shifted_design(self, team: str) -> list[tuple[int, int, int]]:
+        """The reference house moved next to the team's shop and inside its side of the line."""
+        cfg = self.world.config
+        shop = self._shops().get(team) or tuple(cfg.shop_pos)
+        xs = [c[0] for c in self.design]
+        ys = [c[1] for c in self.design]
+        wx, wy = max(xs) - min(xs), max(ys) - min(ys)
+        lo, hi = (0, self._divider() - 1) if team == next(iter(self.teams)) else (self._divider(), cfg.width - 1)
+        x0 = min(max(shop[0] - wx // 2, lo), hi - wx)
+        y0 = shop[1] + 2 if shop[1] + 2 + wy < cfg.depth else max(0, shop[1] - 2 - wy)
+        out = [(x - min(xs) + x0, y - min(ys) + y0, z) for x, y, z in self.design]
+        return sorted(c for c in out if cfg.in_bounds(c) and c != shop)
+
+    def _alive(self, agent: str) -> bool:
+        f = getattr(self.world, "is_alive", None)
+        return True if f is None else bool(f(agent))
+
+    def _sword_reach(self, pos, target: str) -> bool:
+        w = self.world
+        if target not in w.positions:
+            return False
+        reach = float(getattr(w.config, "attack_reach", 3.0) or 3.0)
+        tx, ty, tz = w.positions[target]
+        eye = w.eye(pos)
+        for cell in sorted(((tx, ty, tz), (tx, ty, tz + 1)),
+                           key=lambda c: math.dist(eye, (c[0] + 0.5, c[1] + 0.5, c[2] + 0.5)))[:1]:
+            if math.dist(eye, (cell[0] + 0.5, cell[1] + 0.5, cell[2] + 0.5)) > reach:
+                return False
+            return not w.config.reach_line_of_sight or w.line_of_sight(pos, cell)
+        return False
 
     def __call__(self, state: dict, messages: list) -> ChatResult:
         agent = state["agent"]
         rng = state.setdefault("rng", random.Random(f"{self.seed}-{agent}"))
-        calls = self._decide(agent, rng)
-        if rng.random() < 0.08:
-            calls.append(tool_call("say", text=f"{agent}: working on the house, t={self.world.now():.0f}"))
+        if self.teams:
+            calls = self._decide_team(agent, rng, state)
+            r = rng.random()
+            if r < 0.05:
+                calls.append(tool_call("say", text=f"{agent} to my team: working on our house, t={self.world.now():.0f}"))
+            elif r < 0.08:
+                calls.append(tool_call("say_all", text=f"{agent} to everyone: hello, t={self.world.now():.0f}"))
+        else:
+            calls = self._decide(agent, rng)
+            if rng.random() < 0.08:
+                calls.append(tool_call("say", text=f"{agent}: working on the house, t={self.world.now():.0f}"))
         chars = len(json.dumps(messages))
         pt, ctoks = chars // 4, 40 + 20 * len(calls)
         p = self.prices.get(state["model"]) or {"input_per_m": 0.0, "output_per_m": 0.0}
@@ -220,6 +313,77 @@ class MockPolicy:
                 return [tool_call("declare_done")]
             if rng.random() < 0.1 and pos[2] < 2 and w.supported(pos):
                 return [tool_call("jump"), tool_call("place", x=pos[0], y=pos[1], z=pos[2], type=btype)]
+            near = [c for c in cands if w.can_reach(pos, c)]
+            if near:
+                c = rng.choice(near[:6])
+                return [tool_call("place", x=c[0], y=c[1], z=c[2], type=btype)]
+            c = rng.choice(cands[:12])
+            stands = w.reachable_stand_cells(c, agent)
+            if not stands:
+                return [tool_call("observe")]
+            s = stands[0]
+            return [tool_call("move_to", x=s[0], y=s[1], z=s[2])]
+
+
+    def _decide_team(self, agent: str, rng: random.Random, state: dict) -> list[dict]:
+        w = self.world
+        team = self.team_of(agent)
+        other = next(t for t in self.teams if t != team)
+        shop = self._shops().get(team) or tuple(w.config.shop_pos)
+        wallets = getattr(w, "wallets", None) or {}
+        with w._lock:
+            t = w.now()
+            if w.is_walking(agent, t):
+                return [tool_call("wait", seconds=max(1, min(30, int(w.walking_until[agent] - t) + 1)))]
+            pos = w.positions[agent]
+            inv = dict(w.inventories[agent])
+            held = sum(inv.values())
+            # sword: anyone within reach, mostly the other team
+            if rng.random() < 0.15:
+                near = [a for a in w.agents if a != agent and self._alive(a) and self._sword_reach(pos, a)]
+                opp = [a for a in near if self.team_of(a) == other]
+                if opp:
+                    return [tool_call("attack", target=rng.choice(opp))]
+                if near and rng.random() < 0.1:
+                    return [tool_call("attack", target=rng.choice(near))]
+            # raid: cross the line and remove one of the other team's blocks
+            if not state.get("raid") and rng.random() < 0.03:
+                state["raid"] = True
+            if state.get("raid"):
+                theirs = sorted(p for p, b in w.blocks.items()
+                                if not self._on_side(team, p[0]) and self.team_of(b.placed_by) == other)
+                if not theirs or held >= w.config.inventory_cap:
+                    state["raid"] = False
+                else:
+                    near = [p for p in theirs if w.can_reach(pos, p)]
+                    if near:
+                        state["raid"] = rng.random() < 0.3
+                        c = rng.choice(near)
+                        return [tool_call("remove", x=c[0], y=c[1], z=c[2])]
+                    c = rng.choice(theirs[:10])
+                    stands = w.reachable_stand_cells(c, agent)
+                    if stands:
+                        s = stands[0]
+                        return [tool_call("move_to", x=s[0], y=s[1], z=s[2])]
+                    state["raid"] = False
+            # build the team's house on its own side, buying at the team's own shop
+            if not inv:
+                if w.can_reach(pos, shop):
+                    money = wallets.get(team, 0)
+                    avail = [(CATALOG[k].price, k) for k in self.design_types if CATALOG[k].price <= money]
+                    if not avail:
+                        return [tool_call("declare_done")]
+                    p, k = rng.choice(avail)
+                    return [tool_call("buy", item=k, n=max(1, min(money // p, rng.randint(2, 5))))]
+                stands = w.reachable_stand_cells(shop, agent)
+                if not stands:
+                    return [tool_call("wait", seconds=2)]
+                return [tool_call("move_to", x=stands[0][0], y=stands[0][1], z=stands[0][2])]
+            btype = rng.choice(sorted(inv))
+            bodies = w.body_cells()
+            cands = [c for c in self.team_design[team] if c not in w.blocks and c not in bodies and w.supported(c)]
+            if not cands:
+                return [tool_call("declare_done")]
             near = [c for c in cands if w.can_reach(pos, c)]
             if near:
                 c = rng.choice(near[:6])
@@ -321,6 +485,10 @@ def run_episode(config_path: str | Path, *, run_dir: str | Path | None = None, d
         say(f"  world: task={c.task} grid={c.width}x{c.depth}x{c.height} shop_pos={list(c.shop_pos)} "
             f"starting_money={c.starting_money} incentive={c.incentive} deploy_top_k={c.deploy_top_k} "
             f"show_leaderboard={c.show_leaderboard} max_seconds={c.max_seconds}")
+        if getattr(c, "teams", None):
+            say(f"  teams: " + "; ".join(f"{t}: {', '.join(m)}" for t, m in c.teams.items())
+                + f"  shops={getattr(c, 'shops', None)} divider_x={getattr(c, 'divider_x', None)} "
+                f"variant={getattr(c, 'variant', None)}")
         say(f"  llm: max_tokens={llm.max_tokens} temperature={llm.temperature} reasoning={llm.reasoning} "
             f"history_steps={llm.history_steps} max_calls/agent={llm.max_model_calls_per_agent}")
         say(f"  max spend without budget: ~${plan['max_spend_if_uncapped_usd~']:.2f} = {plan['formula']}")
@@ -433,13 +601,18 @@ def run_episode(config_path: str | Path, *, run_dir: str | Path | None = None, d
         "cost": {**bsum, "provider_reported_usd": round(sum(a.stats["cost_usd"] for a in agents), 8)},
         "agents": {a.agent: {"model": a.model, "stop_reason": results.get(a.agent, "still_running"), **a.stats}
                    for a in agents},
+        **{k: end[k] for k in ("variant", "wallets", "health", "dead", "kills", "teams") if k in end},
         "record_counts": counts, "late_records": late_count[0],
         "threads_still_running": [th.name for th in threads if th.is_alive()],
     })
     _write_json(out / "manifest.json", manifest)
     say(f"\nepisode over: {world.end_reason}  (episode t={end.get('t')} s, wall {manifest['wall_seconds']} s)")
-    say(f"  wallet left {end.get('wallet')}  individual {end.get('individual_scores')}  "
-        f"deployed {end.get('deployed')}")
+    if end.get("teams"):
+        say(f"  wallets left {end.get('wallets')}  dead {end.get('dead')}  kills {len(end.get('kills') or [])}  "
+            f"individual {end.get('individual_scores')}")
+    else:
+        say(f"  wallet left {end.get('wallet')}  individual {end.get('individual_scores')}  "
+            f"deployed {end.get('deployed')}")
     say(f"  cost ${bsum['spent_usd']:.4f} of ${bsum['limit_usd']:.2f} (provider-reported "
         f"${manifest['cost']['provider_reported_usd']:.4f}; uncertain ${bsum['uncertain_usd']:.4f}; "
         f"open reservations {bsum['open_reservations']})")
